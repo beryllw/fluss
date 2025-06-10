@@ -507,6 +507,14 @@ public class ConfigOptions {
                                     + "This allows each ZooKeeper client instance to load its own configuration file, "
                                     + "instead of relying on shared JVM-level environment settings. "
                                     + "This enables fine-grained control over ZooKeeper client behavior.");
+
+    public static final ConfigOption<String> ZOOKEEPER_AUTH_DIGEST =
+            key("zookeeper.client.auth.digest")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "TThe digest auth string is used for ZooKeeper authentication, like: username:password.");
+
     // ------------------------------------------------------------------------
     //  ConfigOptions for Log
     // ------------------------------------------------------------------------
