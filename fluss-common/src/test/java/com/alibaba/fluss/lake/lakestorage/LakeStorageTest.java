@@ -37,7 +37,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Tests for the {@link LakeStorage} base class. */
 public class LakeStorageTest {
-    private static String TEST_LAKE_PLUGIN_FORMAT = "test-plugin";
+    private static final String TEST_LAKE_PLUGIN_FORMAT = "test-plugin";
 
     @Test
     void testInvalidPlugin(@TempDir Path tempDir) throws Exception {
@@ -55,7 +55,6 @@ public class LakeStorageTest {
                                         new TestingPluginManager(lakeStoragePlugins)))
                 .isInstanceOf(UnsupportedOperationException.class)
                 .hasMessageContaining("No LakeStoragePlugin can be found for datalake format: ");
-        ;
     }
 
     @Test

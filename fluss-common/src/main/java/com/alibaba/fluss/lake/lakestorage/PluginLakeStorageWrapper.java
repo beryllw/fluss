@@ -25,6 +25,10 @@ import com.alibaba.fluss.metadata.TablePath;
 import com.alibaba.fluss.utils.TemporaryClassLoaderContext;
 import com.alibaba.fluss.utils.WrappingProxy;
 
+/**
+ * A wrapper around {@link LakeStoragePlugin} that ensures the plugin classloader is used for all
+ * {@link LakeCatalog} and {@link LakeStorage} operations.
+ */
 public class PluginLakeStorageWrapper implements LakeStoragePlugin {
     private final LakeStoragePlugin inner;
     private final ClassLoader loader;

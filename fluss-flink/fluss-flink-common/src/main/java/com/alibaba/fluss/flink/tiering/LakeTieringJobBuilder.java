@@ -72,7 +72,6 @@ public class LakeTieringJobBuilder {
         // get the lake storage plugin
         LakeStoragePlugin lakeStoragePlugin =
                 LakeStoragePluginSetUp.fromDataLakeFormat(dataLakeFormat, null);
-
         // create lake storage from configurations
         LakeStorage lakeStorage = checkNotNull(lakeStoragePlugin).createLakeStorage(dataLakeConfig);
 
