@@ -250,7 +250,8 @@ public class CoordinatorServer extends ServerBase {
     private LakeCatalog createLakeCatalog() {
         DataLakeFormat dataLakeFormat = conf.get(ConfigOptions.DATALAKE_FORMAT);
         LakeStoragePlugin lakeStoragePlugin =
-                LakeStoragePluginSetUp.fromDataLakeFormat(dataLakeFormat.toString(), pluginManager);
+                LakeStoragePluginSetUp.fromDataLakeFormat(
+                        dataLakeFormat == null ? null : dataLakeFormat.toString(), pluginManager);
         if (lakeStoragePlugin == null) {
             return null;
         }
