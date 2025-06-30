@@ -32,12 +32,8 @@ import java.util.ServiceLoader;
  */
 public class LakeStoragePluginSetUp {
 
-    @Nullable
     public static LakeStoragePlugin fromDataLakeFormat(
             final String dataLakeFormat, @Nullable final PluginManager pluginManager) {
-        if (dataLakeFormat == null) {
-            return null;
-        }
         // now, load lake storage plugin
         Iterator<LakeStoragePlugin> lakeStoragePluginIterator =
                 getAllLakeStoragePlugins(pluginManager);

@@ -24,9 +24,7 @@ import com.alibaba.fluss.metadata.TablePath;
 import com.alibaba.fluss.plugin.PluginManager;
 
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.io.TempDir;
 
-import java.nio.file.Path;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
@@ -36,13 +34,12 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Tests for the {@link LakeStorage} base class. */
-public class LakeStorageTest {
+class LakeStorageTest {
     private static final String TEST_LAKE_PLUGIN_FORMAT = "test-plugin";
 
     @Test
-    void testInvalidPlugin(@TempDir Path tempDir) throws Exception {
+    void testInvalidPlugin() throws Exception {
         final Map<Class<?>, Iterator<?>> lakeStoragePlugins = new HashMap<>();
-        // use LocalFileSystem as the filesystem of schema 'testPluginSchema'
         lakeStoragePlugins.put(
                 LakeStoragePlugin.class,
                 Collections.singletonList(new LakeStorageTest.TestPluginLakeStoragePlugin())
@@ -54,12 +51,11 @@ public class LakeStorageTest {
                                         TEST_LAKE_PLUGIN_FORMAT + "1",
                                         new TestingPluginManager(lakeStoragePlugins)))
                 .isInstanceOf(UnsupportedOperationException.class)
-                .hasMessageContaining("No LakeStoragePlugin can be found for datalake format: ");
+                .hasMessage("No LakeStoragePlugin can be found for datalake format: test-plugin1");
     }
 
     @Test
-    void testWithPluginManager(@TempDir Path tempDir) throws Exception {
-
+    void testWithPluginManager() throws Exception {
         final Map<Class<?>, Iterator<?>> lakeStoragePlugins = new HashMap<>();
 
         lakeStoragePlugins.put(

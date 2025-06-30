@@ -249,12 +249,11 @@ public class CoordinatorServer extends ServerBase {
     @Nullable
     private LakeCatalog createLakeCatalog() {
         DataLakeFormat dataLakeFormat = conf.get(ConfigOptions.DATALAKE_FORMAT);
-        LakeStoragePlugin lakeStoragePlugin =
-                LakeStoragePluginSetUp.fromDataLakeFormat(
-                        dataLakeFormat == null ? null : dataLakeFormat.toString(), pluginManager);
-        if (lakeStoragePlugin == null) {
+        if (dataLakeFormat == null) {
             return null;
         }
+        LakeStoragePlugin lakeStoragePlugin =
+                LakeStoragePluginSetUp.fromDataLakeFormat(dataLakeFormat.toString(), pluginManager);
         Map<String, String> lakeProperties = extractLakeProperties(conf);
         LakeStorage lakeStorage =
                 lakeStoragePlugin.createLakeStorage(
