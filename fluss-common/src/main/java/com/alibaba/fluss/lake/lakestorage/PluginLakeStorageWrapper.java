@@ -27,7 +27,7 @@ import com.alibaba.fluss.utils.WrappingProxy;
 
 /**
  * A wrapper around {@link LakeStoragePlugin} that ensures the plugin classloader is used for all
- * {@link LakeCatalog} and {@link LakeStorage} operations.
+ * {@link LakeCatalog} operations.
  */
 public class PluginLakeStorageWrapper implements LakeStoragePlugin {
     private final LakeStoragePlugin inner;
@@ -107,9 +107,7 @@ public class PluginLakeStorageWrapper implements LakeStoragePlugin {
 
         @Override
         public LakeTieringFactory<?, ?> createLakeTieringFactory() {
-            try (TemporaryClassLoaderContext ignored = TemporaryClassLoaderContext.of(loader)) {
-                return inner.createLakeTieringFactory();
-            }
+            return inner.createLakeTieringFactory();
         }
 
         @Override
