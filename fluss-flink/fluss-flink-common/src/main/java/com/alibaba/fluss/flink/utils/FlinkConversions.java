@@ -23,6 +23,7 @@ import com.alibaba.fluss.config.MemorySize;
 import com.alibaba.fluss.config.Password;
 import com.alibaba.fluss.flink.FlinkConnectorOptions;
 import com.alibaba.fluss.flink.catalog.FlinkCatalogFactory;
+import com.alibaba.fluss.metadata.DataLakeFormat;
 import com.alibaba.fluss.metadata.DatabaseDescriptor;
 import com.alibaba.fluss.metadata.Schema;
 import com.alibaba.fluss.metadata.TableDescriptor;
@@ -32,7 +33,6 @@ import com.alibaba.fluss.types.DataType;
 import com.alibaba.fluss.types.RowType;
 import com.alibaba.fluss.utils.StringUtils;
 import com.alibaba.fluss.utils.TimeUtils;
-
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.table.catalog.CatalogDatabase;
 import org.apache.flink.table.catalog.CatalogTable;
@@ -50,6 +50,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.stream.Collectors;
 
 import static com.alibaba.fluss.flink.FlinkConnectorOptions.BUCKET_KEY;
@@ -92,6 +93,21 @@ public class FlinkConversions {
 
         // put fluss table properties into flink options, to make the properties visible to users
         convertFlussTablePropertiesToFlinkOptions(tableInfo.getProperties().toMap(), newOptions);
+
+        // put lake related options to table options
+
+        Optional<DataLakeFormat> optDataLakeFormat = tableInfo.getTableConfig().getDataLakeFormat();
+        if (optDataLakeFormat.isPresent()) {
+            DataLakeFormat dataLakeFormat = optDataLakeFormat.get();
+            String dataLakePrefix = "table.datalake." + dataLakeFormat + ".";
+
+            for (Map.Entry<String, String> tableProperty :
+                    tableInfo.getProperties().toMap().entrySet()) {
+                if (tableProperty.getKey().startsWith(dataLakePrefix)) {
+                    newOptions.put(tableProperty.getKey(), tableProperty.getValue());
+                }
+            }
+        }
 
         org.apache.flink.table.api.Schema.Builder schemaBuilder =
                 org.apache.flink.table.api.Schema.newBuilder();

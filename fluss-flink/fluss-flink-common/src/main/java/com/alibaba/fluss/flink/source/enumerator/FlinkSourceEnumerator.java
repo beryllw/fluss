@@ -22,7 +22,7 @@ import com.alibaba.fluss.client.admin.Admin;
 import com.alibaba.fluss.client.metadata.KvSnapshots;
 import com.alibaba.fluss.config.ConfigOptions;
 import com.alibaba.fluss.config.Configuration;
-import com.alibaba.fluss.flink.lakehouse.LakeSplitGenerator;
+import com.alibaba.fluss.flink.lake.LakeSplitGenerator;
 import com.alibaba.fluss.flink.source.enumerator.initializer.BucketOffsetsRetrieverImpl;
 import com.alibaba.fluss.flink.source.enumerator.initializer.NoStoppingOffsetsInitializer;
 import com.alibaba.fluss.flink.source.enumerator.initializer.OffsetsInitializer;
@@ -35,13 +35,14 @@ import com.alibaba.fluss.flink.source.split.LogSplit;
 import com.alibaba.fluss.flink.source.split.SourceSplitBase;
 import com.alibaba.fluss.flink.source.state.SourceEnumeratorState;
 import com.alibaba.fluss.flink.utils.PushdownUtils.FieldEqual;
+import com.alibaba.fluss.lake.source1.LakeSource;
+import com.alibaba.fluss.lake.source1.LakeSplit;
 import com.alibaba.fluss.metadata.PartitionInfo;
 import com.alibaba.fluss.metadata.TableBucket;
 import com.alibaba.fluss.metadata.TableInfo;
 import com.alibaba.fluss.metadata.TablePath;
 import com.alibaba.fluss.types.DataField;
 import com.alibaba.fluss.utils.ExceptionUtils;
-
 import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.connector.source.SourceEvent;
 import org.apache.flink.api.connector.source.SplitEnumerator;
@@ -52,7 +53,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
-
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -129,6 +129,8 @@ public class FlinkSourceEnumerator
 
     private final List<FieldEqual> partitionFilters;
 
+    @Nullable private final LakeSource<LakeSplit> lakeSource;
+
     public FlinkSourceEnumerator(
             TablePath tablePath,
             Configuration flussConf,
@@ -145,12 +147,37 @@ public class FlinkSourceEnumerator
                 hasPrimaryKey,
                 isPartitioned,
                 context,
+                startingOffsetsInitializer,
+                scanPartitionDiscoveryIntervalMs,
+                streaming,
+                partitionFilters,
+                null);
+    }
+
+    public FlinkSourceEnumerator(
+            TablePath tablePath,
+            Configuration flussConf,
+            boolean hasPrimaryKey,
+            boolean isPartitioned,
+            SplitEnumeratorContext<SourceSplitBase> context,
+            OffsetsInitializer startingOffsetsInitializer,
+            long scanPartitionDiscoveryIntervalMs,
+            boolean streaming,
+            List<FieldEqual> partitionFilters,
+            LakeSource<LakeSplit> lakeSource) {
+        this(
+                tablePath,
+                flussConf,
+                hasPrimaryKey,
+                isPartitioned,
+                context,
                 Collections.emptySet(),
                 Collections.emptyMap(),
                 startingOffsetsInitializer,
                 scanPartitionDiscoveryIntervalMs,
                 streaming,
-                partitionFilters);
+                partitionFilters,
+                lakeSource);
     }
 
     public FlinkSourceEnumerator(
@@ -164,7 +191,8 @@ public class FlinkSourceEnumerator
             OffsetsInitializer startingOffsetsInitializer,
             long scanPartitionDiscoveryIntervalMs,
             boolean streaming,
-            List<FieldEqual> partitionFilters) {
+            List<FieldEqual> partitionFilters,
+            @Nullable LakeSource<LakeSplit> lakeSource) {
         this.tablePath = checkNotNull(tablePath);
         this.flussConf = checkNotNull(flussConf);
         this.hasPrimaryKey = hasPrimaryKey;
@@ -179,6 +207,7 @@ public class FlinkSourceEnumerator
         this.partitionFilters = checkNotNull(partitionFilters);
         this.stoppingOffsetsInitializer =
                 streaming ? new NoStoppingOffsetsInitializer() : OffsetsInitializer.latest();
+        this.lakeSource = lakeSource;
     }
 
     @Override
@@ -484,10 +513,13 @@ public class FlinkSourceEnumerator
                 new LakeSplitGenerator(
                         tableInfo,
                         flussAdmin,
+                        lakeSource,
                         bucketOffsetsRetriever,
                         stoppingOffsetsInitializer,
                         tableInfo.getNumBuckets());
-        return lakeSplitGenerator.generateLakeSplits();
+        List<SourceSplitBase> lakeSplits = lakeSplitGenerator.generateHybridLakeSplits();
+        System.out.println(lakeSplits);
+        return lakeSplits;
     }
 
     private boolean ignoreTableBucket(TableBucket tableBucket) {

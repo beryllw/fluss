@@ -16,6 +16,10 @@
 
 package com.alibaba.fluss.flink.lakehouse;
 
+import com.alibaba.fluss.flink.lake.LakeSnapshotAndFlussLogSplit;
+import com.alibaba.fluss.flink.lake.LakeSnapshotSplit;
+import com.alibaba.fluss.flink.lake.state.LakeSnapshotAndFlussLogSplitState;
+import com.alibaba.fluss.flink.lake.state.LakeSnapshotSplitState;
 import com.alibaba.fluss.flink.lakehouse.paimon.split.PaimonSnapshotAndFlussLogSplit;
 import com.alibaba.fluss.flink.lakehouse.paimon.split.PaimonSnapshotAndFlussLogSplitState;
 import com.alibaba.fluss.flink.lakehouse.paimon.split.PaimonSnapshotSplit;
@@ -31,6 +35,10 @@ public class LakeSplitStateInitializer {
             return new PaimonSnapshotSplitState((PaimonSnapshotSplit) split);
         } else if (split instanceof PaimonSnapshotAndFlussLogSplit) {
             return new PaimonSnapshotAndFlussLogSplitState((PaimonSnapshotAndFlussLogSplit) split);
+        } else if (split instanceof LakeSnapshotSplit) {
+            return new LakeSnapshotSplitState((LakeSnapshotSplit) split);
+        } else if (split instanceof LakeSnapshotAndFlussLogSplit) {
+            return new LakeSnapshotAndFlussLogSplitState((LakeSnapshotAndFlussLogSplit) split);
         } else {
             throw new UnsupportedOperationException("Unsupported split type: " + split);
         }

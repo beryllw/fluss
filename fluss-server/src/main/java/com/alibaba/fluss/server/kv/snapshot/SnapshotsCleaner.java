@@ -84,7 +84,11 @@ public class SnapshotsCleaner {
 
     public void cleanSnapshot(
             CompletedSnapshot snapshot, Runnable postCleanAction, Executor executor) {
-        LOG.debug("Clean snapshot {}.", snapshot.getSnapshotID());
+        LOG.debug(
+                "Clean snapshot {} for table bucket {} of snapshot path {}.",
+                snapshot.getSnapshotID(),
+                snapshot.getTableBucket(),
+                snapshot.getMetadataFilePath());
         CompletableFuture<Void> discardFuture = snapshot.discardAsync(executor);
         discardFuture.handle(
                 (Object outerIgnored, Throwable outerThrowable) -> {

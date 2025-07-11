@@ -37,7 +37,6 @@ import com.alibaba.fluss.row.InternalRow;
 import com.alibaba.fluss.row.encode.CompactedKeyEncoder;
 import com.alibaba.fluss.server.zk.ZooKeeperClient;
 import com.alibaba.fluss.types.DataTypes;
-
 import org.apache.flink.api.connector.source.ReaderInfo;
 import org.apache.flink.api.connector.source.SourceEvent;
 import org.apache.flink.api.connector.source.SplitsAssignment;
@@ -355,7 +354,8 @@ class FlinkSourceEnumeratorTest extends FlinkTestBase {
                             OffsetsInitializer.earliest(),
                             DEFAULT_SCAN_PARTITION_DISCOVERY_INTERVAL_MS,
                             streaming,
-                            Collections.emptyList());
+                            Collections.emptyList(),
+                            null);
 
             enumerator.start();
             assertThat(context.getSplitsAssignmentSequence()).isEmpty();

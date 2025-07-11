@@ -78,6 +78,10 @@ public class ZooKeeperCompletedSnapshotHandleStore implements CompletedSnapshotH
             success = true;
         } finally {
             if (!success) {
+                LOG.warn(
+                        "add to zk failed, try to discard snapshot {} for {}",
+                        snapshotId,
+                        tableBucket);
                 // Cleanup the snapshot metadata handle if it was not written to zookeeper
                 snapshotHandle.discard();
             }

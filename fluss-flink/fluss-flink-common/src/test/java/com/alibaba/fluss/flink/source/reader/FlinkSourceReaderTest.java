@@ -30,7 +30,6 @@ import com.alibaba.fluss.metadata.TableDescriptor;
 import com.alibaba.fluss.metadata.TablePath;
 import com.alibaba.fluss.server.zk.ZooKeeperClient;
 import com.alibaba.fluss.types.RowType;
-
 import org.apache.flink.api.connector.source.SourceEvent;
 import org.apache.flink.api.connector.source.SourceReaderContext;
 import org.apache.flink.connector.base.source.reader.RecordsWithSplitIds;
@@ -179,6 +178,7 @@ class FlinkSourceReaderTest extends FlinkTestBase {
                 context,
                 null,
                 new FlinkSourceReaderMetrics(context.metricGroup()),
-                recordEmitter);
+                recordEmitter,
+                null);
     }
 }

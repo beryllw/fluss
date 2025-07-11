@@ -17,6 +17,8 @@
 package com.alibaba.fluss.flink.lakehouse;
 
 import com.alibaba.fluss.client.table.scanner.ScanRecord;
+import com.alibaba.fluss.flink.lake.state.LakeSnapshotAndFlussLogSplitState;
+import com.alibaba.fluss.flink.lake.state.LakeSnapshotSplitState;
 import com.alibaba.fluss.flink.lakehouse.paimon.split.PaimonSnapshotAndFlussLogSplitState;
 import com.alibaba.fluss.flink.lakehouse.paimon.split.PaimonSnapshotSplitState;
 import com.alibaba.fluss.flink.source.reader.RecordAndPos;
@@ -45,6 +47,13 @@ public class LakeRecordRecordEmitter<OUT> {
             sourceOutputFunc.accept(recordAndPos.record(), sourceOutput);
         } else if (splitState instanceof PaimonSnapshotAndFlussLogSplitState) {
             ((PaimonSnapshotAndFlussLogSplitState) splitState)
+                    .setRecordsToSkip(recordAndPos.readRecordsCount());
+            sourceOutputFunc.accept(recordAndPos.record(), sourceOutput);
+        } else if (splitState instanceof LakeSnapshotSplitState) {
+            ((LakeSnapshotSplitState) splitState).setRecordsToSkip(recordAndPos.readRecordsCount());
+            sourceOutputFunc.accept(recordAndPos.record(), sourceOutput);
+        } else if (splitState instanceof LakeSnapshotAndFlussLogSplitState) {
+            ((LakeSnapshotAndFlussLogSplitState) splitState)
                     .setRecordsToSkip(recordAndPos.readRecordsCount());
             sourceOutputFunc.accept(recordAndPos.record(), sourceOutput);
         } else {

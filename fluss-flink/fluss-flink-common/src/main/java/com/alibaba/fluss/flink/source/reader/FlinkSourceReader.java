@@ -27,10 +27,11 @@ import com.alibaba.fluss.flink.source.split.HybridSnapshotLogSplitState;
 import com.alibaba.fluss.flink.source.split.LogSplitState;
 import com.alibaba.fluss.flink.source.split.SourceSplitBase;
 import com.alibaba.fluss.flink.source.split.SourceSplitState;
+import com.alibaba.fluss.lake.source1.LakeSource;
+import com.alibaba.fluss.lake.source1.LakeSplit;
 import com.alibaba.fluss.metadata.TableBucket;
 import com.alibaba.fluss.metadata.TablePath;
 import com.alibaba.fluss.types.RowType;
-
 import org.apache.flink.api.connector.source.SourceEvent;
 import org.apache.flink.api.connector.source.SourceReaderContext;
 import org.apache.flink.connector.base.source.reader.RecordsWithSplitIds;
@@ -38,7 +39,6 @@ import org.apache.flink.connector.base.source.reader.SingleThreadMultiplexSource
 import org.apache.flink.connector.base.source.reader.synchronization.FutureCompletingBlockingQueue;
 
 import javax.annotation.Nullable;
-
 import java.util.Map;
 import java.util.Set;
 import java.util.function.Consumer;
@@ -56,7 +56,8 @@ public class FlinkSourceReader<OUT>
             SourceReaderContext context,
             @Nullable int[] projectedFields,
             FlinkSourceReaderMetrics flinkSourceReaderMetrics,
-            FlinkRecordEmitter<OUT> recordEmitter) {
+            FlinkRecordEmitter<OUT> recordEmitter,
+            LakeSource<LakeSplit> lakeSource) {
         super(
                 elementsQueue,
                 new FlinkSourceFetcherManager(
@@ -67,7 +68,8 @@ public class FlinkSourceReader<OUT>
                                         tablePath,
                                         sourceOutputType,
                                         projectedFields,
-                                        flinkSourceReaderMetrics),
+                                        flinkSourceReaderMetrics,
+                                        lakeSource),
                         (ignore) -> {}),
                 recordEmitter,
                 context.getConfiguration(),

@@ -18,10 +18,14 @@ package com.alibaba.fluss.lake.paimon;
 
 import com.alibaba.fluss.config.Configuration;
 import com.alibaba.fluss.lake.lakestorage.LakeStorage;
+import com.alibaba.fluss.lake.paimon.source1.PaimonLakeSource;
+import com.alibaba.fluss.lake.paimon.source1.PaimonSplit;
 import com.alibaba.fluss.lake.paimon.tiering.PaimonCommittable;
 import com.alibaba.fluss.lake.paimon.tiering.PaimonLakeTieringFactory;
 import com.alibaba.fluss.lake.paimon.tiering.PaimonWriteResult;
+import com.alibaba.fluss.lake.source1.LakeSource;
 import com.alibaba.fluss.lake.writer.LakeTieringFactory;
+import com.alibaba.fluss.metadata.TablePath;
 
 /** Paimon implementation of {@link LakeStorage}. */
 public class PaimonLakeStorage implements LakeStorage {
@@ -40,5 +44,10 @@ public class PaimonLakeStorage implements LakeStorage {
     @Override
     public PaimonLakeCatalog createLakeCatalog() {
         return new PaimonLakeCatalog(paimonConfig);
+    }
+
+    @Override
+    public LakeSource<PaimonSplit> createLakeSource(TablePath tablePath) {
+        return new PaimonLakeSource(paimonConfig, tablePath);
     }
 }

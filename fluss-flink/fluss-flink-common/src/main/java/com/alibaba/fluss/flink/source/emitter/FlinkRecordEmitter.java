@@ -94,6 +94,8 @@ public class FlinkRecordEmitter<OUT> implements RecordEmitter<RecordAndPos, OUT,
                     e);
         }
 
+        System.out.println("record: " + record);
+
         if (record != null) {
             long timestamp = scanRecord.timestamp();
             if (timestamp > 0) {
