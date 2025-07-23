@@ -18,6 +18,7 @@
 #
 
 CONF_FILE="${FLUSS_HOME}/conf/server.yaml"
+ZK_CONFIG_FILE="${FLUSS_HOME}/conf/zookeeper.properties"
 
 prepare_configuration() {
     # backward compatability: allow to use old [coordinator|tablet-server].host option in FLUSS_PROPERTIES
@@ -26,14 +27,53 @@ prepare_configuration() {
         echo "${FLUSS_PROPERTIES}" >> "${CONF_FILE}"
     fi
     envsubst < "${CONF_FILE}" > "${CONF_FILE}.tmp" && mv "${CONF_FILE}.tmp" "${CONF_FILE}"
+
+    echo "4lw.commands.whitelist=*" >> "$ZK_CONFIG_FILE"
 }
 
 prepare_configuration
 
+# Health Check
+# TODO：When the Fluss CLI can display service status, we will use its commands.
+local_cluster_health_check() {
+    local ZK_HOST="${1:-127.0.0.1}"
+    local ZK_PORT="${2:-2181}"
+    local -a NODES=("${@:3}")
+
+    if [ ${#NODES[@]} -eq 0 ]; then
+        NODES=("/fluss/tabletservers/ids/0" "/fluss/coordinators/active")
+    fi
+
+    echo "Starting health check on ZK $ZK_HOST:$ZK_PORT for nodes: ${NODES[*]}"
+
+    check_nodes_existence() {
+        local zk_dump=$(echo "dump" | nc "$ZK_HOST" "$ZK_PORT" 2>/dev/null)
+        local all_present=true
+
+        for node_path in "${NODES[@]}"; do
+            if ! echo "$zk_dump" | grep -q "$node_path"; then
+                echo "Node $node_path does not exist"
+                all_present=false
+            fi
+        done
+
+        return $((all_present))
+    }
+
+    while sleep 30; do
+        if check_nodes_existence; then
+            echo "Fluss service is operational."
+        else
+            echo "Fluss service disruption detected. Exiting."
+            exit 1
+        fi
+    done
+}
+
 args=("$@")
 
 if [ "$1" = "help" ]; then
-  printf "Usage: $(basename "$0") (coordinatorServer|tabletServer)\n"
+  printf "Usage: $(basename "$0") (coordinatorServer|tabletServer|localCluster)\n"
   printf "    Or $(basename "$0") help\n\n"
   exit 0
 elif [ "$1" = "coordinatorServer" ]; then
@@ -44,6 +84,10 @@ elif [ "$1" = "tabletServer" ]; then
   args=("${args[@]:1}")
   echo "Starting Tablet Server"
   exec "$FLUSS_HOME/bin/tablet-server.sh" start-foreground "${args[@]}"
+elif [ "$1" = "localCluster" ]; then
+  args=("${args[@]:1}")
+  $FLUSS_HOME/bin/local-cluster.sh start "${args[@]}"
+  local_cluster_health_check
 fi
 
 args=("${args[@]}")
