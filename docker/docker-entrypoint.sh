@@ -31,8 +31,6 @@ prepare_configuration() {
     echo "4lw.commands.whitelist=*" >> "$ZK_CONFIG_FILE"
 }
 
-prepare_configuration
-
 # Health Check
 # TODO：When the Fluss CLI can display service status, we will use its commands.
 local_cluster_health_check() {
@@ -46,9 +44,9 @@ local_cluster_health_check() {
 
     echo "Starting health check on ZK $ZK_HOST:$ZK_PORT for nodes: ${NODES[*]}"
 
-    check_nodes_existence() {
-        local zk_dump=$(echo "dump" | nc "$ZK_HOST" "$ZK_PORT" 2>/dev/null)
+    while sleep 30; do
         local all_present=true
+        local zk_dump=$(echo "dump" | nc "$ZK_HOST" "$ZK_PORT" 2>/dev/null)
 
         for node_path in "${NODES[@]}"; do
             if ! echo "$zk_dump" | grep -q "$node_path"; then
@@ -57,11 +55,7 @@ local_cluster_health_check() {
             fi
         done
 
-        return $((all_present))
-    }
-
-    while sleep 30; do
-        if check_nodes_existence; then
+        if $all_present; then
             echo "Fluss service is operational."
         else
             echo "Fluss service disruption detected. Exiting."
@@ -69,6 +63,20 @@ local_cluster_health_check() {
         fi
     done
 }
+
+# Build command line arguments from environment variables
+build_command_args() {
+    local -n _args=$1        # Reference to the array variable
+    local env_var_name=$2    # Name of the environment variable
+    local option_name=$3     # Command line option name
+
+    if [ -n "${!env_var_name}" ]; then
+        _args+=("$option_name" "${!env_var_name}")
+        echo "Added $option_name: ${!env_var_name}"
+    fi
+}
+
+prepare_configuration
 
 args=("$@")
 
@@ -86,7 +94,19 @@ elif [ "$1" = "tabletServer" ]; then
   exec "$FLUSS_HOME/bin/tablet-server.sh" start-foreground "${args[@]}"
 elif [ "$1" = "localCluster" ]; then
   args=("${args[@]:1}")
-  $FLUSS_HOME/bin/local-cluster.sh start "${args[@]}"
+
+  # Build arguments for local-cluster.sh
+  local cluster_args=()
+
+  # Add arguments from environment variables using helper function
+  build_command_args cluster_args "COORDINATOR_OPTS" "--coordinator-opts"
+  build_command_args cluster_args "TABLET_OPTS" "--tablet-opts"
+
+  # 添加用户额外传递的参数
+  cluster_args+=("${args[@]}")
+
+  echo "Starting Local Cluster with parameters: ${cluster_args[@]}"
+  $FLUSS_HOME/bin/local-cluster.sh start "${cluster_args[@]}"
   local_cluster_health_check
 fi
 
