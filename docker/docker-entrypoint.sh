@@ -96,7 +96,7 @@ elif [ "$1" = "localCluster" ]; then
   args=("${args[@]:1}")
 
   # Build arguments for local-cluster.sh
-  local cluster_args=()
+  local cluster_args=("start")
 
   # Add arguments from environment variables using helper function
   build_command_args cluster_args "COORDINATOR_OPTS" "--coordinator-opts"
@@ -106,7 +106,7 @@ elif [ "$1" = "localCluster" ]; then
   cluster_args+=("${args[@]}")
 
   echo "Starting Local Cluster with parameters: ${cluster_args[@]}"
-  $FLUSS_HOME/bin/local-cluster.sh start "${cluster_args[@]}"
+  $FLUSS_HOME/bin/local-cluster.sh "${cluster_args[@]}"
   local_cluster_health_check
 fi
 
