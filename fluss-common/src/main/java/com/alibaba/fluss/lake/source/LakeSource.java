@@ -19,9 +19,11 @@ package com.alibaba.fluss.lake.source;
 
 import com.alibaba.fluss.annotation.PublicEvolving;
 import com.alibaba.fluss.lake.serializer.SimpleVersionedSerializer;
+import com.alibaba.fluss.predicate.Predicate;
 
 import java.io.IOException;
 import java.io.Serializable;
+import java.util.List;
 
 /**
  * A generic interface for lake data sources that defines how to plan splits and read data. Any data
@@ -48,23 +50,23 @@ public interface LakeSource<Split extends LakeSplit> extends Serializable {
      */
     void withProject(int[][] project);
 
-    /** Applies a row limit to the data source. */
+    /** Applies a row limit to the lake source. */
     void withLimit(int limit);
 
-    // TODO：Support Lakehouse filter pushdown after https://github.com/apache/fluss/pull/515
-    // FilterPushDownResult withFilters(List<Predicate> predicates);
+    /** Applies filters to the lake source. */
+    FilterPushDownResult withFilters(List<Predicate> predicates);
 
     /**
      * Creates a planner for plan splits to be read.
      *
      * @param context The planning context providing necessary planning information
-     * @return A planner instance for this data source
+     * @return A planner instance for this lake source
      * @throws IOException if an error occurs during planner creation
      */
     Planner<Split> createPlanner(PlannerContext context) throws IOException;
 
     /**
-     * Creates a record reader for reading data of data lake for the specified split.
+     * Creates a record reader for reading data from the lake source for the specified split.
      *
      * @param context The reader context containing the split to be read
      * @return A record reader instance for the given split
@@ -95,5 +97,53 @@ public interface LakeSource<Split extends LakeSplit> extends Serializable {
      */
     interface ReaderContext<Split extends LakeSplit> extends Serializable {
         Split lakeSplit();
+    }
+
+    /**
+     * Represents the result of a filter push down operation to lake source, indicating which
+     * predicates were accepted by the source and which remain to be evaluated.
+     *
+     * @since 0.8
+     */
+    @PublicEvolving
+    final class FilterPushDownResult {
+        private final List<Predicate> acceptedPredicates;
+        private final List<Predicate> remainingPredicates;
+
+        private FilterPushDownResult(
+                List<Predicate> acceptedPredicates, List<Predicate> remainingPredicates) {
+            this.acceptedPredicates = acceptedPredicates;
+            this.remainingPredicates = remainingPredicates;
+        }
+
+        /**
+         * Creates a new FilterPushDownResult instance.
+         *
+         * @param acceptedPredicates The accepted predicates
+         * @param remainingPredicates The remaining predicates
+         * @return A new FilterPushDownResult instance
+         */
+        public static FilterPushDownResult of(
+                List<Predicate> acceptedPredicates, List<Predicate> remainingPredicates) {
+            return new FilterPushDownResult(acceptedPredicates, remainingPredicates);
+        }
+
+        /**
+         * Returns the predicates that were accepted by the source.
+         *
+         * @return The list of accepted predicates
+         */
+        public List<Predicate> acceptedPredicates() {
+            return acceptedPredicates;
+        }
+
+        /**
+         * Returns the predicates that remain to be evaluated.
+         *
+         * @return The list of remaining predicates
+         */
+        public List<Predicate> remainingPredicates() {
+            return remainingPredicates;
+        }
     }
 }
