@@ -17,6 +17,7 @@
 
 package com.alibaba.fluss.lake.source;
 
+import com.alibaba.fluss.annotation.PublicEvolving;
 import com.alibaba.fluss.row.InternalRow;
 
 import java.util.Comparator;
@@ -33,7 +34,10 @@ import java.util.Comparator;
  * <p>Note: This is mainly used for union read primary key table since we will do sort merge records
  * in lake and fluss. The records in primary key table for lake may should implement this method for
  * union read with a better performance.
+ *
+ * @since 0.8
  */
+@PublicEvolving
 public interface SortedRecordReader extends RecordReader {
 
     /**

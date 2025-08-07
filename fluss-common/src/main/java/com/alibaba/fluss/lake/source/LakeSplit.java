@@ -17,9 +17,16 @@
 
 package com.alibaba.fluss.lake.source;
 
+import com.alibaba.fluss.annotation.PublicEvolving;
+
 import java.util.List;
 
-/** Represents a logical partition or segment of data in data-lake. */
+/**
+ * Represents a logical partition or segment of data in data-lake.
+ *
+ * @since 0.8
+ */
+@PublicEvolving
 public interface LakeSplit {
 
     /**

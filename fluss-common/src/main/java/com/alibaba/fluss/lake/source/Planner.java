@@ -17,6 +17,8 @@
 
 package com.alibaba.fluss.lake.source;
 
+import com.alibaba.fluss.annotation.PublicEvolving;
+
 import java.io.IOException;
 import java.util.List;
 
@@ -28,9 +30,16 @@ import java.util.List;
  * optimizations (filters, limits, etc.) from {@link LakeSource}.
  *
  * @param <Split> the type of data split this planner generates, must extend {@link LakeSplit}
+ * @since 0.8
  */
+@PublicEvolving
 public interface Planner<Split extends LakeSplit> {
 
-    /** Plans and generates a list of readable data splits in parallel. */
+    /**
+     * Plans and generates a list of readable data splits in parallel.
+     *
+     * @return the list of readable data splits
+     * @throws IOException if an I/O error occurs
+     */
     List<Split> plan() throws IOException;
 }

@@ -17,6 +17,7 @@
 
 package com.alibaba.fluss.lake.source;
 
+import com.alibaba.fluss.annotation.PublicEvolving;
 import com.alibaba.fluss.lake.serializer.SimpleVersionedSerializer;
 
 import java.io.IOException;
@@ -34,6 +35,7 @@ import java.io.Serializable;
  * @param <Split> The type of data split, which must extend {@link LakeSplit}
  * @since 0.8
  */
+@PublicEvolving
 public interface LakeSource<Split extends LakeSplit> extends Serializable {
 
     /**
@@ -49,7 +51,7 @@ public interface LakeSource<Split extends LakeSplit> extends Serializable {
     /** Applies a row limit to the data source. */
     void withLimit(int limit);
 
-    // TODO： Support paimon filter pushdown
+    // TODO：Support Lakehouse filter pushdown after https://github.com/apache/fluss/pull/515
     // FilterPushDownResult withFilters(List<Predicate> predicates);
 
     /**
@@ -62,7 +64,7 @@ public interface LakeSource<Split extends LakeSplit> extends Serializable {
     Planner<Split> createPlanner(PlannerContext context) throws IOException;
 
     /**
-     * Creates a record reader for reading data of data lake for the specified split .
+     * Creates a record reader for reading data of data lake for the specified split.
      *
      * @param context The reader context containing the split to be read
      * @return A record reader instance for the given split

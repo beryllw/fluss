@@ -17,6 +17,7 @@
 
 package com.alibaba.fluss.lake.source;
 
+import com.alibaba.fluss.annotation.PublicEvolving;
 import com.alibaba.fluss.record.LogRecord;
 import com.alibaba.fluss.utils.CloseableIterator;
 
@@ -29,9 +30,17 @@ import java.io.IOException;
  * efficient sequential reading of potentially large datasets without loading all data into memory
  * at once. The reading should consider the pushed-down optimizations (project, filters, limits,
  * etc.) from {@link LakeSource}.
+ *
+ * @since 0.8
  */
+@PublicEvolving
 public interface RecordReader {
 
-    /** Read a {@link LakeSplit} into a closeable iterator. */
+    /**
+     * Read a {@link LakeSplit} into a closeable iterator.
+     *
+     * @return the closeable iterator of records
+     * @throws IOException if an I/O error occurs
+     */
     CloseableIterator<LogRecord> read() throws IOException;
 }
