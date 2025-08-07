@@ -19,37 +19,65 @@
 # Pull Request Labeler Github Action Configuration: https://github.com/marketplace/actions/labeler
 
 build:
-  - .github/**/*
-  - tools/**/*
-  - .gitignore
-  - pom.xml
+- changed-files:
+  - any-glob-to-any-file:
+    - .github/**/*
+    - tools/**/*
+    - .gitignore
+    - pom.xml
 docs:
-  - website/**/*
-  - README.md
+- changed-files:
+  - any-glob-to-any-file:
+    - website/**/*
+    - README.md
 client:
-  - fluss-client/**/*
+- changed-files:
+  - any-glob-to-any-file:
+    - fluss-client/**/*
 common:
-  - fluss-common/**/*
+- changed-files:
+  - any-glob-to-any-file:
+    - fluss-common/**/*
 dist:
-  - fluss-dist/**/*
+- changed-files:
+  - any-glob-to-any-file:
+    - fluss-dist/**/*
 filesystems:
-  - fluss-filesystems/**/*
+- changed-files:
+  - any-glob-to-any-file:
+    - fluss-filesystems/**/*
 flink:
-  - fluss-flink/**/*
+- changed-files:
+  - any-glob-to-any-file:
+    - fluss-flink/**/*
 jmh:
-  - fluss-jmh/**/*
+- changed-files:
+  - any-glob-to-any-file:
+    - fluss-jmh/**/*
 kafka:
-  - fluss-kafka/**/*
+- changed-files:
+  - any-glob-to-any-file:
+    - fluss-kafka/**/*
 lake:
-  - fluss-lake/**/*
-  - fluss-flink/fluss-flink-tiering/**/*
+- changed-files:
+  - any-glob-to-any-file:
+    - fluss-lake/**/*
+    - fluss-flink/fluss-flink-tiering/**/*
 metrics:
-  - fluss-metrics/**/*
+- changed-files:
+  - any-glob-to-any-file:
+    - fluss-metrics/**/*
 rpc:
-  - fluss-rpc/**/*
-  - fluss-protogen/**/*
+- changed-files:
+  - any-glob-to-any-file:
+    - fluss-rpc/**/*
+    - fluss-protogen/**/*
 server:
-  - fluss-server/**/*
+- changed-files:
+  - any-glob-to-any-file:
+    - fluss-server/**/*
 test:
-  - fluss-test-coverage/**/*
-  - fluss-test-utils/**/*
+- changed-files:
+  - any-glob-to-any-file:
+    - fluss-test-coverage/**/*
+    - fluss-test-utils/**/*
