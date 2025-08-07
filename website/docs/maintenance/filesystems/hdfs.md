@@ -40,7 +40,12 @@ You can see the configuration keys in Hadoop's [`core-site.xml`](https://hadoop.
 
 #### Hadoop Environment Configuration
 
-To use the machine hadoop environment, instead of Fluss' embedded Hadoop, follow these steps:
+Fluss includes bundled Hadoop libraries with version 3.3.4 for deploying Fluss in machine without Hadoop installed. 
+For most use cases, these work perfectly. However, you should configure your machine's native Hadoop environment if:
+1. Your HDFS uses kerberos security
+2. You need to avoid version conflicts between Fluss's bundled hadoop libraries and your HDFS cluster
+
+Configuration Steps are following:
 
 **Step 1: Set Hadoop Classpath**
 ```bash
