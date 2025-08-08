@@ -38,6 +38,7 @@ import java.util.Map;
 import static com.alibaba.fluss.testutils.DataTestUtils.row;
 import static org.assertj.core.api.Assertions.assertThat;
 
+/** Test case for flink union read paimon log table. */
 public class FlinkUnionReadLogTableITCase extends FlinkUnionReadTestBase {
     @BeforeAll
     protected static void beforeAll() {

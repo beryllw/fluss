@@ -51,6 +51,7 @@ import java.util.stream.Collectors;
 import static com.alibaba.fluss.testutils.DataTestUtils.row;
 import static org.assertj.core.api.Assertions.assertThat;
 
+/** Test case for flink union read paimon primary key table. */
 public class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
 
     @BeforeAll

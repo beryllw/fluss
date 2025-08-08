@@ -27,6 +27,7 @@ import org.junit.jupiter.api.BeforeEach;
 
 import static com.alibaba.fluss.flink.FlinkConnectorOptions.BOOTSTRAP_SERVERS;
 
+/** Base class for Flink union read test. */
 public class FlinkUnionReadTestBase extends FlinkPaimonTieringTestBase {
 
     protected static final int DEFAULT_BUCKET_NUM = 1;

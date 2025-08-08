@@ -89,6 +89,7 @@ public class PaimonRecordReader implements RecordReader {
         return readBuilder.withProjection(paimonProject);
     }
 
+    /** Iterator for paimon row as fluss record. */
     public static class PaimonRowAsFlussRecordIterator implements CloseableIterator<LogRecord> {
 
         private final org.apache.paimon.utils.CloseableIterator<InternalRow> paimonRowIterator;
