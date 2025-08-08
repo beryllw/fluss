@@ -17,15 +17,20 @@
 
 package com.alibaba.fluss.flink.lakehouse;
 
-import com.alibaba.fluss.client.Connection;
 import com.alibaba.fluss.client.table.Table;
 import com.alibaba.fluss.flink.lakehouse.paimon.reader.PaimonSnapshotAndLogSplitScanner;
 import com.alibaba.fluss.flink.lakehouse.paimon.reader.PaimonSnapshotScanner;
 import com.alibaba.fluss.flink.lakehouse.paimon.split.PaimonSnapshotAndFlussLogSplit;
 import com.alibaba.fluss.flink.lakehouse.paimon.split.PaimonSnapshotSplit;
+import com.alibaba.fluss.flink.lakehouse.reader.LakeSnapshotAndLogSplitScanner;
+import com.alibaba.fluss.flink.lakehouse.reader.LakeSnapshotScanner;
+import com.alibaba.fluss.flink.lakehouse.split.LakeSnapshotAndFlussLogSplit;
+import com.alibaba.fluss.flink.lakehouse.split.LakeSnapshotSplit;
 import com.alibaba.fluss.flink.source.reader.BoundedSplitReader;
 import com.alibaba.fluss.flink.source.split.SourceSplitBase;
 import com.alibaba.fluss.flink.utils.DataLakeUtils;
+import com.alibaba.fluss.lake.source.LakeSource;
+import com.alibaba.fluss.lake.source.LakeSplit;
 import com.alibaba.fluss.metadata.TablePath;
 
 import org.apache.flink.util.ExceptionUtils;
@@ -46,27 +51,31 @@ import java.util.stream.IntStream;
 public class LakeSplitReaderGenerator {
 
     private final Table table;
-    private final Connection connection;
 
     private final TablePath tablePath;
     private FileStoreTable fileStoreTable;
     private final @Nullable int[] projectedFields;
+    private final @Nullable LakeSource<LakeSplit> lakeSource;
 
     public LakeSplitReaderGenerator(
             Table table,
-            Connection connection,
             TablePath tablePath,
-            @Nullable int[] projectedFields) {
+            @Nullable int[] projectedFields,
+            LakeSource lakeSource) {
         this.table = table;
-        this.connection = connection;
         this.tablePath = tablePath;
         this.projectedFields = projectedFields;
+        this.lakeSource = lakeSource;
     }
 
     public void addSplit(SourceSplitBase split, Queue<SourceSplitBase> boundedSplits) {
         if (split instanceof PaimonSnapshotSplit) {
             boundedSplits.add(split);
         } else if (split instanceof PaimonSnapshotAndFlussLogSplit) {
+            boundedSplits.add(split);
+        } else if (split instanceof LakeSnapshotSplit) {
+            boundedSplits.add(split);
+        } else if (split instanceof LakeSnapshotAndFlussLogSplit) {
             boundedSplits.add(split);
         } else {
             throw new UnsupportedOperationException(
@@ -100,6 +109,21 @@ public class LakeSplitReaderGenerator {
             return new BoundedSplitReader(
                     paimonSnapshotAndLogSplitScanner,
                     paimonSnapshotAndFlussLogSplit.getRecordsToSkip());
+        } else if (split instanceof LakeSnapshotSplit) {
+            LakeSnapshotSplit lakeSnapshotSplit = (LakeSnapshotSplit) split;
+            LakeSnapshotScanner lakeSnapshotScanner =
+                    new LakeSnapshotScanner(lakeSource, lakeSnapshotSplit);
+            return new BoundedSplitReader(
+                    lakeSnapshotScanner, lakeSnapshotSplit.getRecordsToSplit());
+        } else if (split instanceof LakeSnapshotAndFlussLogSplit) {
+            LakeSnapshotAndFlussLogSplit lakeSnapshotAndFlussLogSplit =
+                    (LakeSnapshotAndFlussLogSplit) split;
+            LakeSnapshotAndLogSplitScanner lakeSnapshotAndLogSplitScanner =
+                    new LakeSnapshotAndLogSplitScanner(
+                            table, lakeSource, lakeSnapshotAndFlussLogSplit);
+            return new BoundedSplitReader(
+                    lakeSnapshotAndLogSplitScanner,
+                    lakeSnapshotAndFlussLogSplit.getRecordsToSkip());
         } else {
             throw new UnsupportedOperationException(
                     String.format("The split type of %s is not supported.", split.getClass()));

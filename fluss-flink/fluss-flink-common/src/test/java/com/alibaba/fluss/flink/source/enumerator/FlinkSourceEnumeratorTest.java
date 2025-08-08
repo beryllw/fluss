@@ -356,7 +356,8 @@ class FlinkSourceEnumeratorTest extends FlinkTestBase {
                             OffsetsInitializer.earliest(),
                             DEFAULT_SCAN_PARTITION_DISCOVERY_INTERVAL_MS,
                             streaming,
-                            Collections.emptyList());
+                            Collections.emptyList(),
+                            null);
 
             enumerator.start();
             assertThat(context.getSplitsAssignmentSequence()).isEmpty();
@@ -663,7 +664,7 @@ class FlinkSourceEnumeratorTest extends FlinkTestBase {
 
                 byte[] key = keyEncoder.encodeKey(row);
                 int bucketId = hashBucketAssigner.assignBucket(key);
-
+                System.out.println(i + ":" + bucketId);
                 bucketRows.merge(bucketId, 1, Integer::sum);
             }
             upsertWriter.flush();

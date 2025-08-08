@@ -18,60 +18,62 @@
 
 package com.alibaba.fluss.flink.lakehouse;
 
-import com.alibaba.fluss.flink.lakehouse.split.LakeSnapshotAndFlussLogSplit;
-import com.alibaba.fluss.flink.lakehouse.split.LakeSnapshotSplit;
+import com.alibaba.fluss.flink.lakehouse.paimon.split.PaimonSnapshotAndFlussLogSplit;
+import com.alibaba.fluss.flink.lakehouse.paimon.split.PaimonSnapshotSplit;
 import com.alibaba.fluss.flink.source.split.LogSplit;
 import com.alibaba.fluss.flink.source.split.SourceSplitBase;
-import com.alibaba.fluss.lake.serializer.SimpleVersionedSerializer;
-import com.alibaba.fluss.lake.source.LakeSplit;
 import com.alibaba.fluss.metadata.TableBucket;
 
 import org.apache.flink.core.memory.DataInputDeserializer;
 import org.apache.flink.core.memory.DataOutputSerializer;
+import org.apache.paimon.flink.source.FileStoreSourceSplit;
+import org.apache.paimon.flink.source.FileStoreSourceSplitSerializer;
 
 import javax.annotation.Nullable;
 
 import java.io.IOException;
 
-import static com.alibaba.fluss.flink.lakehouse.split.LakeSnapshotAndFlussLogSplit.LAKE_SNAPSHOT_FLUSS_LOG_SPLIT_KIND;
-import static com.alibaba.fluss.flink.lakehouse.split.LakeSnapshotSplit.LAKE_SNAPSHOT_SPLIT_KIND;
+import static com.alibaba.fluss.flink.lakehouse.paimon.split.PaimonSnapshotAndFlussLogSplit.PAIMON_SNAPSHOT_FLUSS_LOG_SPLIT_KIND;
+import static com.alibaba.fluss.flink.lakehouse.paimon.split.PaimonSnapshotSplit.PAIMON_SNAPSHOT_SPLIT_KIND;
 
 /** A serializer for lake split. */
-public class LakeSplitSerializer {
+public class PaimonLakeSplitSerializer {
 
-    private final SimpleVersionedSerializer<LakeSplit> sourceSplitSerializer;
-
-    public LakeSplitSerializer(SimpleVersionedSerializer<LakeSplit> sourceSplitSerializer) {
-        this.sourceSplitSerializer = sourceSplitSerializer;
-    }
+    private final FileStoreSourceSplitSerializer fileStoreSourceSplitSerializer =
+            new FileStoreSourceSplitSerializer();
 
     public void serialize(DataOutputSerializer out, SourceSplitBase split) throws IOException {
-        if (split instanceof LakeSnapshotSplit) {
-            byte[] serializeBytes =
-                    sourceSplitSerializer.serialize(((LakeSnapshotSplit) split).getLakeSplit());
+        FileStoreSourceSplitSerializer fileStoreSourceSplitSerializer =
+                new FileStoreSourceSplitSerializer();
+        if (split instanceof PaimonSnapshotSplit) {
+            FileStoreSourceSplit fileStoreSourceSplit =
+                    ((PaimonSnapshotSplit) split).getFileStoreSourceSplit();
+            byte[] serializeBytes = fileStoreSourceSplitSerializer.serialize(fileStoreSourceSplit);
             out.writeInt(serializeBytes.length);
             out.write(serializeBytes);
-        } else if (split instanceof LakeSnapshotAndFlussLogSplit) {
+        } else if (split instanceof PaimonSnapshotAndFlussLogSplit) {
             // writing file store source split
-            LakeSnapshotAndFlussLogSplit lakeSnapshotAndFlussLogSplit =
-                    ((LakeSnapshotAndFlussLogSplit) split);
-            LakeSplit lakeSplit = lakeSnapshotAndFlussLogSplit.getLakeSplit();
-            if (lakeSplit == null) {
+            PaimonSnapshotAndFlussLogSplit paimonSnapshotAndFlussLogSplit =
+                    ((PaimonSnapshotAndFlussLogSplit) split);
+            FileStoreSourceSplit fileStoreSourceSplit =
+                    paimonSnapshotAndFlussLogSplit.getSnapshotSplit();
+            if (fileStoreSourceSplit == null) {
                 // no snapshot data for the bucket
                 out.writeBoolean(false);
             } else {
                 out.writeBoolean(true);
-                byte[] serializeBytes = sourceSplitSerializer.serialize(lakeSplit);
+                byte[] serializeBytes =
+                        fileStoreSourceSplitSerializer.serialize(fileStoreSourceSplit);
                 out.writeInt(serializeBytes.length);
                 out.write(serializeBytes);
             }
             // writing starting/stopping offset
-            out.writeLong(lakeSnapshotAndFlussLogSplit.getStartingOffset());
+            out.writeLong(paimonSnapshotAndFlussLogSplit.getStartingOffset());
             out.writeLong(
-                    lakeSnapshotAndFlussLogSplit
+                    paimonSnapshotAndFlussLogSplit
                             .getStoppingOffset()
                             .orElse(LogSplit.NO_STOPPING_OFFSET));
-            out.writeLong(lakeSnapshotAndFlussLogSplit.getRecordsToSkip());
+            out.writeLong(paimonSnapshotAndFlussLogSplit.getRecordsToSkip());
         } else {
             throw new UnsupportedOperationException(
                     "Unsupported split type: " + split.getClass().getName());
@@ -84,29 +86,30 @@ public class LakeSplitSerializer {
             @Nullable String partition,
             DataInputDeserializer input)
             throws IOException {
-        if (splitKind == LAKE_SNAPSHOT_SPLIT_KIND) {
+        if (splitKind == PAIMON_SNAPSHOT_SPLIT_KIND) {
             byte[] serializeBytes = new byte[input.readInt()];
             input.read(serializeBytes);
-            LakeSplit fileStoreSourceSplit =
-                    sourceSplitSerializer.deserialize(
-                            sourceSplitSerializer.getVersion(), serializeBytes);
-            return new LakeSnapshotSplit(tableBucket, partition, fileStoreSourceSplit);
-        } else if (splitKind == LAKE_SNAPSHOT_FLUSS_LOG_SPLIT_KIND) {
-            LakeSplit lakeSplit = null;
+            FileStoreSourceSplit fileStoreSourceSplit =
+                    fileStoreSourceSplitSerializer.deserialize(
+                            fileStoreSourceSplitSerializer.getVersion(), serializeBytes);
+
+            return new PaimonSnapshotSplit(tableBucket, partition, fileStoreSourceSplit);
+        } else if (splitKind == PAIMON_SNAPSHOT_FLUSS_LOG_SPLIT_KIND) {
+            FileStoreSourceSplit fileStoreSourceSplit = null;
             if (input.readBoolean()) {
                 byte[] serializeBytes = new byte[input.readInt()];
                 input.read(serializeBytes);
-                lakeSplit =
-                        sourceSplitSerializer.deserialize(
-                                sourceSplitSerializer.getVersion(), serializeBytes);
+                fileStoreSourceSplit =
+                        fileStoreSourceSplitSerializer.deserialize(
+                                fileStoreSourceSplitSerializer.getVersion(), serializeBytes);
             }
             long startingOffset = input.readLong();
             long stoppingOffset = input.readLong();
             long recordsToSkip = input.readLong();
-            return new LakeSnapshotAndFlussLogSplit(
+            return new PaimonSnapshotAndFlussLogSplit(
                     tableBucket,
                     partition,
-                    lakeSplit,
+                    fileStoreSourceSplit,
                     startingOffset,
                     stoppingOffset,
                     recordsToSkip);
