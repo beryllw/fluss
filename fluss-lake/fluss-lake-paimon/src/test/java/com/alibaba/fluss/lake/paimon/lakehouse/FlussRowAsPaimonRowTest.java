@@ -22,7 +22,11 @@ package com.alibaba.fluss.lake.paimon.lakehouse;
 
 import com.alibaba.fluss.record.GenericRecord;
 import com.alibaba.fluss.record.LogRecord;
-import com.alibaba.fluss.row.*;
+import com.alibaba.fluss.row.BinaryString;
+import com.alibaba.fluss.row.Decimal;
+import com.alibaba.fluss.row.GenericRow;
+import com.alibaba.fluss.row.TimestampLtz;
+import com.alibaba.fluss.row.TimestampNtz;
 
 import org.apache.paimon.types.RowKind;
 import org.apache.paimon.types.RowType;
@@ -30,7 +34,11 @@ import org.junit.jupiter.api.Test;
 
 import java.math.BigDecimal;
 
-import static com.alibaba.fluss.record.ChangeType.*;
+import static com.alibaba.fluss.record.ChangeType.APPEND_ONLY;
+import static com.alibaba.fluss.record.ChangeType.DELETE;
+import static com.alibaba.fluss.record.ChangeType.INSERT;
+import static com.alibaba.fluss.record.ChangeType.UPDATE_AFTER;
+import static com.alibaba.fluss.record.ChangeType.UPDATE_BEFORE;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /** Test case for {@link FlussRowAsPaimonRow}. */
