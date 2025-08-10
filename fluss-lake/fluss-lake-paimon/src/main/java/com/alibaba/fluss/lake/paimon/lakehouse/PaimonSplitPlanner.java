@@ -41,14 +41,14 @@ import java.util.List;
 import static com.alibaba.fluss.lake.paimon.utils.PaimonConversions.toPaimon;
 
 /** Split panner for paimon table. */
-public class PaimonSplitPanner implements Planner<PaimonSplit> {
+public class PaimonSplitPlanner implements Planner<PaimonSplit> {
 
     private final Configuration paimonConfig;
     private final TablePath tablePath;
     private final Predicate predicate;
     private final long snapshotId;
 
-    public PaimonSplitPanner(
+    public PaimonSplitPlanner(
             Configuration paimonConfig, TablePath tablePath, Predicate predicate, long snapshotId) {
         this.paimonConfig = paimonConfig;
         this.tablePath = tablePath;

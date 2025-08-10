@@ -67,7 +67,7 @@ public class PaimonRowAsFlussRow implements InternalRow {
 
     @Override
     public long getLong(int pos) {
-        return paimonRow.getInt(pos);
+        return paimonRow.getLong(pos);
     }
 
     @Override

@@ -67,7 +67,7 @@ public class PaimonRecordReader implements RecordReader {
         }
 
         TableRead tableRead = readBuilder.newRead();
-        RowType paimonRowType = readBuilder.readType();
+        paimonRowType = readBuilder.readType();
 
         org.apache.paimon.reader.RecordReader<InternalRow> recordReader =
                 tableRead.createReader(split.dataSplit());
@@ -94,7 +94,7 @@ public class PaimonRecordReader implements RecordReader {
 
         private final org.apache.paimon.utils.CloseableIterator<InternalRow> paimonRowIterator;
 
-        private final ProjectedRow flussRow;
+        private final ProjectedRow projectedRow;
 
         private final int logOffsetColIndex;
         private final int timestampColIndex;
@@ -107,7 +107,7 @@ public class PaimonRecordReader implements RecordReader {
             this.timestampColIndex = paimonRowType.getFieldIndex(TIMESTAMP_COLUMN_NAME);
 
             int[] project = IntStream.range(0, paimonRowType.getFieldCount() - 3).toArray();
-            flussRow = ProjectedRow.from(project);
+            projectedRow = ProjectedRow.from(project);
         }
 
         @Override
@@ -135,7 +135,7 @@ public class PaimonRecordReader implements RecordReader {
                     offset,
                     timestamp,
                     changeType,
-                    flussRow.replaceRow(new PaimonRowAsFlussRow(paimonRow)));
+                    projectedRow.replaceRow(new PaimonRowAsFlussRow(paimonRow)));
         }
     }
 }

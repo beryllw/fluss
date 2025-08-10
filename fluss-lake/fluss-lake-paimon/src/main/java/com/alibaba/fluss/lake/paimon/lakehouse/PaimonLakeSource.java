@@ -73,7 +73,7 @@ public class PaimonLakeSource implements LakeSource<PaimonSplit> {
 
     @Override
     public Planner<PaimonSplit> createPlanner(PlannerContext plannerContext) {
-        return new PaimonSplitPanner(
+        return new PaimonSplitPlanner(
                 paimonConfig, tablePath, predicate, plannerContext.snapshotId());
     }
 
