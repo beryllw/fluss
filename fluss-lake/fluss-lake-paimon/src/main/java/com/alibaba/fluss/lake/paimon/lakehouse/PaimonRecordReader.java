@@ -31,11 +31,14 @@ import org.apache.paimon.predicate.Predicate;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.source.ReadBuilder;
 import org.apache.paimon.table.source.TableRead;
+import org.apache.paimon.types.DataField;
 import org.apache.paimon.types.RowType;
 
 import javax.annotation.Nullable;
 
 import java.io.IOException;
+import java.util.Arrays;
+import java.util.List;
 import java.util.stream.IntStream;
 
 import static com.alibaba.fluss.lake.paimon.utils.PaimonConversions.toChangeType;
@@ -58,8 +61,10 @@ public class PaimonRecordReader implements RecordReader {
             throws IOException {
 
         ReadBuilder readBuilder = fileStoreTable.newReadBuilder();
+        int fieldCount = fileStoreTable.rowType().getFieldCount();
+        List<DataField> pkFields = fileStoreTable.schema().primaryKeysFields();
         if (project != null) {
-            readBuilder = applyProject(readBuilder, project);
+            readBuilder = applyProject(readBuilder, project, fieldCount, pkFields);
         }
 
         if (predicate != null) {
@@ -81,11 +86,24 @@ public class PaimonRecordReader implements RecordReader {
         return iterator;
     }
 
-    private ReadBuilder applyProject(ReadBuilder readBuilder, int[][] projects) {
-        int[] paimonProject = new int[projects.length];
-        for (int i = 0; i < projects.length; i++) {
-            paimonProject[i] = projects[i][0];
-        }
+    // TODO: Support primary key projection and obtain primary key index for merging.
+    private ReadBuilder applyProject(
+            ReadBuilder readBuilder, int[][] projects, int fieldCount, List<DataField> pkFields) {
+        int[] pkIds = pkFields.stream().mapToInt(DataField::id).toArray();
+
+        int[] projectIds = Arrays.stream(projects).mapToInt(project -> project[0]).toArray();
+
+        int bucketFieldPos = fieldCount - 3;
+        int offsetFieldPos = fieldCount - 2;
+        int timestampFieldPos = fieldCount - 1;
+
+        int[] paimonProject =
+                IntStream.concat(
+                                IntStream.concat(IntStream.of(projectIds), IntStream.of(pkIds))
+                                        .distinct(),
+                                IntStream.of(bucketFieldPos, offsetFieldPos, timestampFieldPos))
+                        .toArray();
+
         return readBuilder.withProjection(paimonProject);
     }
 

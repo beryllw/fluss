@@ -21,6 +21,7 @@
 package com.alibaba.fluss.lake.paimon.lakehouse;
 
 import com.alibaba.fluss.lake.paimon.flink.PaimonLakeHouseTestBase;
+import com.alibaba.fluss.lake.paimon.utils.PaimonRowAsFlussRow;
 import com.alibaba.fluss.lake.source.LakeSource;
 import com.alibaba.fluss.lake.source.RecordReader;
 import com.alibaba.fluss.lake.source.SortedRecordReader;
@@ -52,8 +53,12 @@ import org.apache.paimon.CoreOptions;
 import org.apache.paimon.Snapshot;
 import org.apache.paimon.schema.Schema;
 import org.apache.paimon.table.Table;
+import org.apache.paimon.table.source.ReadBuilder;
+import org.apache.paimon.table.source.Split;
+import org.apache.paimon.table.source.TableRead;
 import org.apache.paimon.types.DataTypes;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
@@ -168,6 +173,117 @@ public class PaimonSortedRecordReaderTest extends PaimonLakeHouseTestBase {
                 mergeReadLakeRows(lakeSource, paimonSplits, fieldGetters, logRows);
 
         assertThat(actualMergeRows).containsExactlyInAnyOrderElementsOf(expectedRows);
+    }
+
+    @Test
+    void testReadPkTableWithProjectNoPk() throws Exception {
+        // first of all, create table and prepare data
+        String tableName = "logTable_non_partitioned";
+
+        TablePath tablePath = TablePath.of(DEFAULT_DB, tableName);
+
+        List<InternalRow> writtenRows = new ArrayList<>();
+        preparePkTable(tablePath, false, DEFAULT_BUCKET_NUM, writtenRows);
+
+        LakeSource<PaimonSplit> lakeSource = lakeStorage.createLakeSource(tablePath);
+        Table table = getTable(tablePath);
+        Snapshot snapshot = table.latestSnapshot().get();
+        lakeSource.withProject(new int[][] {new int[] {5}, new int[] {1}, new int[] {3}});
+        List<PaimonSplit> paimonSplits = lakeSource.createPlanner(snapshot::id).plan();
+
+        List<Row> actual = new ArrayList<>();
+
+        InternalRow.FieldGetter[] fieldGetters =
+                InternalRow.createFieldGetters(
+                        RowType.of(
+                                new FloatType(),
+                                new BooleanType(),
+                                new SmallIntType(),
+                                new IntType()));
+        for (PaimonSplit paimonSplit : paimonSplits) {
+            RecordReader recordReader = lakeSource.createRecordReader(() -> paimonSplit);
+            assertThat(recordReader).isInstanceOf(PaimonSortedRecordReader.class);
+            CloseableIterator<LogRecord> iterator = recordReader.read();
+            while (iterator.hasNext()) {
+                InternalRow row = iterator.next().getRow();
+                actual.add(convertToFlinkRow(row, fieldGetters));
+            }
+            iterator.close();
+        }
+
+        List<Row> expectRows = new ArrayList<>();
+        ReadBuilder readBuilder = table.newReadBuilder().withProjection(new int[] {5, 1, 3, 0});
+        List<Split> splits = readBuilder.newScan().plan().splits();
+        TableRead read = readBuilder.newRead();
+        org.apache.paimon.reader.RecordReader<org.apache.paimon.data.InternalRow> reader =
+                read.createReader(splits);
+        reader.forEachRemaining(
+                paimonRow -> {
+                    PaimonRowAsFlussRow row = new PaimonRowAsFlussRow(paimonRow);
+                    Row flinkRow = new Row(fieldGetters.length);
+                    for (int i = 0; i < fieldGetters.length; i++) {
+                        flinkRow.setField(i, fieldGetters[i].getFieldOrNull(row));
+                    }
+                    expectRows.add(flinkRow);
+                });
+
+        assertThat(actual).containsExactlyInAnyOrderElementsOf(expectRows);
+    }
+
+    @Test
+    void testReadPkTableWithProjectPk() throws Exception {
+        // first of all, create table and prepare data
+        String tableName = "logTable_non_partitioned";
+
+        TablePath tablePath = TablePath.of(DEFAULT_DB, tableName);
+
+        List<InternalRow> writtenRows = new ArrayList<>();
+        preparePkTable(tablePath, false, DEFAULT_BUCKET_NUM, writtenRows);
+
+        LakeSource<PaimonSplit> lakeSource = lakeStorage.createLakeSource(tablePath);
+        Table table = getTable(tablePath);
+        Snapshot snapshot = table.latestSnapshot().get();
+        lakeSource.withProject(
+                new int[][] {new int[] {5}, new int[] {1}, new int[] {3}, new int[] {0}});
+        List<PaimonSplit> paimonSplits = lakeSource.createPlanner(snapshot::id).plan();
+
+        List<Row> actual = new ArrayList<>();
+
+        InternalRow.FieldGetter[] fieldGetters =
+                InternalRow.createFieldGetters(
+                        RowType.of(
+                                new FloatType(),
+                                new BooleanType(),
+                                new SmallIntType(),
+                                new IntType()));
+        for (PaimonSplit paimonSplit : paimonSplits) {
+            RecordReader recordReader = lakeSource.createRecordReader(() -> paimonSplit);
+            assertThat(recordReader).isInstanceOf(PaimonSortedRecordReader.class);
+            CloseableIterator<LogRecord> iterator = recordReader.read();
+            while (iterator.hasNext()) {
+                InternalRow row = iterator.next().getRow();
+                actual.add(convertToFlinkRow(row, fieldGetters));
+            }
+            iterator.close();
+        }
+
+        List<Row> expectRows = new ArrayList<>();
+        ReadBuilder readBuilder = table.newReadBuilder().withProjection(new int[] {5, 1, 3, 0});
+        List<Split> splits = readBuilder.newScan().plan().splits();
+        TableRead read = readBuilder.newRead();
+        org.apache.paimon.reader.RecordReader<org.apache.paimon.data.InternalRow> reader =
+                read.createReader(splits);
+        reader.forEachRemaining(
+                paimonRow -> {
+                    PaimonRowAsFlussRow row = new PaimonRowAsFlussRow(paimonRow);
+                    Row flinkRow = new Row(fieldGetters.length);
+                    for (int i = 0; i < fieldGetters.length; i++) {
+                        flinkRow.setField(i, fieldGetters[i].getFieldOrNull(row));
+                    }
+                    expectRows.add(flinkRow);
+                });
+
+        assertThat(actual).containsExactlyInAnyOrderElementsOf(expectRows);
     }
 
     private List<Row> mergeReadLakeRows(
