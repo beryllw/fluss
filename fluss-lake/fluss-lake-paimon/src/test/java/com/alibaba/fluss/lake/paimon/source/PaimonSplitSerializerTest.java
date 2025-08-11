@@ -20,7 +20,6 @@
 
 package com.alibaba.fluss.lake.paimon.source;
 
-import com.alibaba.fluss.lake.paimon.flink.PaimonLakeHouseTestBase;
 import com.alibaba.fluss.lake.source.LakeSource;
 import com.alibaba.fluss.metadata.TablePath;
 
@@ -42,7 +41,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Test case for {@link PaimonSplitSerializer}. */
-class PaimonSplitSerializerTest extends PaimonLakeHouseTestBase {
+class PaimonSplitSerializerTest extends PaimonSourceTestBase {
     private final PaimonSplitSerializer serializer = new PaimonSplitSerializer();
 
     @Test

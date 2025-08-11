@@ -20,7 +20,6 @@
 
 package com.alibaba.fluss.lake.paimon.source;
 
-import com.alibaba.fluss.lake.paimon.flink.PaimonLakeHouseTestBase;
 import com.alibaba.fluss.lake.source.LakeSource;
 import com.alibaba.fluss.metadata.TablePath;
 
@@ -43,7 +42,7 @@ import java.util.List;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /** Test case for {@link PaimonSplit}. */
-class PaimonSplitTest extends PaimonLakeHouseTestBase {
+class PaimonSplitTest extends PaimonSourceTestBase {
 
     @Test
     void testPaimonSplit() throws Exception {

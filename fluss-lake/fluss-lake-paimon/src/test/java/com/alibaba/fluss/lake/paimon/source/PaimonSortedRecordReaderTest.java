@@ -20,7 +20,6 @@
 
 package com.alibaba.fluss.lake.paimon.source;
 
-import com.alibaba.fluss.lake.paimon.flink.PaimonLakeHouseTestBase;
 import com.alibaba.fluss.lake.source.LakeSource;
 import com.alibaba.fluss.lake.source.RecordReader;
 import com.alibaba.fluss.lake.source.SortedRecordReader;
@@ -52,10 +51,10 @@ import static com.alibaba.fluss.testutils.DataTestUtils.row;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /** Test case for {@link PaimonSortedRecordReader}. */
-class PaimonSortedRecordReaderTest extends PaimonLakeHouseTestBase {
+class PaimonSortedRecordReaderTest extends PaimonSourceTestBase {
     @BeforeAll
     protected static void beforeAll() {
-        PaimonLakeHouseTestBase.beforeAll();
+        PaimonSourceTestBase.beforeAll();
     }
 
     @ParameterizedTest

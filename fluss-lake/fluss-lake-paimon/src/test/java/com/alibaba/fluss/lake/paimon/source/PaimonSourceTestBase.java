@@ -14,11 +14,9 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
- *
- *
  */
 
-package com.alibaba.fluss.lake.paimon.flink;
+package com.alibaba.fluss.lake.paimon.source;
 
 import com.alibaba.fluss.config.Configuration;
 import com.alibaba.fluss.lake.paimon.PaimonLakeStorage;
@@ -48,7 +46,7 @@ import java.util.function.Function;
 import static com.alibaba.fluss.lake.paimon.utils.PaimonConversions.toPaimon;
 
 /** Base class for paimon lakehouse test. */
-public class PaimonLakeHouseTestBase {
+class PaimonSourceTestBase {
     protected static final String DEFAULT_DB = "fluss_lakehouse";
     protected static final String DEFAULT_TABLE = "test_lakehouse_table";
     protected static final int DEFAULT_BUCKET_NUM = 1;
