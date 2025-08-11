@@ -16,7 +16,7 @@
  * limitations under the License.
  */
 
-package com.alibaba.fluss.lake.paimon.lakehouse;
+package com.alibaba.fluss.lake.paimon.source;
 
 import com.alibaba.fluss.config.Configuration;
 import com.alibaba.fluss.lake.serializer.SimpleVersionedSerializer;
@@ -35,6 +35,7 @@ import org.apache.paimon.table.FileStoreTable;
 import javax.annotation.Nullable;
 
 import java.io.IOException;
+import java.util.Collections;
 import java.util.List;
 
 import static com.alibaba.fluss.lake.paimon.utils.PaimonConversions.toPaimon;
@@ -68,7 +69,7 @@ public class PaimonLakeSource implements LakeSource<PaimonSplit> {
 
     @Override
     public FilterPushDownResult withFilters(List<Predicate> predicates) {
-        throw new UnsupportedOperationException("Not impl.");
+        return FilterPushDownResult.of(Collections.emptyList(), predicates);
     }
 
     @Override

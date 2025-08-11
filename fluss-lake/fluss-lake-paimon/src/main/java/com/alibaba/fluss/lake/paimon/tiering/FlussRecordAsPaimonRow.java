@@ -17,14 +17,11 @@
 
 package com.alibaba.fluss.lake.paimon.tiering;
 
-import com.alibaba.fluss.lake.paimon.lakehouse.FlussRowAsPaimonRow;
+import com.alibaba.fluss.lake.paimon.source.FlussRowAsPaimonRow;
 import com.alibaba.fluss.record.LogRecord;
-import com.alibaba.fluss.row.TimestampLtz;
-import com.alibaba.fluss.row.TimestampNtz;
 
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.data.Timestamp;
-import org.apache.paimon.types.DataType;
 import org.apache.paimon.types.RowKind;
 import org.apache.paimon.types.RowType;
 
@@ -70,7 +67,7 @@ public class FlussRecordAsPaimonRow extends FlussRowAsPaimonRow {
     @Override
     public boolean isNullAt(int pos) {
         if (pos < originRowFieldCount) {
-            return internalRow.isNullAt(pos);
+            return super.isNullAt(pos);
         }
         // is the last three system fields: bucket, offset, timestamp which are never null
         return false;
@@ -82,7 +79,7 @@ public class FlussRecordAsPaimonRow extends FlussRowAsPaimonRow {
             // bucket system column
             return bucket;
         }
-        return internalRow.getInt(pos);
+        return super.getInt(pos);
     }
 
     @Override
@@ -95,7 +92,7 @@ public class FlussRecordAsPaimonRow extends FlussRowAsPaimonRow {
             return logRecord.timestamp();
         }
         //  the origin RowData
-        return internalRow.getLong(pos);
+        return super.getLong(pos);
     }
 
     @Override
@@ -104,33 +101,6 @@ public class FlussRecordAsPaimonRow extends FlussRowAsPaimonRow {
         if (pos == originRowFieldCount + 2) {
             return Timestamp.fromEpochMillis(logRecord.timestamp());
         }
-
-        DataType paimonTimestampType = tableRowType.getTypeAt(pos);
-
-        switch (paimonTimestampType.getTypeRoot()) {
-            case TIMESTAMP_WITHOUT_TIME_ZONE:
-                if (TimestampNtz.isCompact(precision)) {
-                    return Timestamp.fromEpochMillis(
-                            internalRow.getTimestampNtz(pos, precision).getMillisecond());
-                } else {
-                    TimestampNtz timestampNtz = internalRow.getTimestampNtz(pos, precision);
-                    return Timestamp.fromEpochMillis(
-                            timestampNtz.getMillisecond(), timestampNtz.getNanoOfMillisecond());
-                }
-
-            case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
-                if (TimestampLtz.isCompact(precision)) {
-                    return Timestamp.fromEpochMillis(
-                            internalRow.getTimestampLtz(pos, precision).getEpochMillisecond());
-                } else {
-                    TimestampLtz timestampLtz = internalRow.getTimestampLtz(pos, precision);
-                    return Timestamp.fromEpochMillis(
-                            timestampLtz.getEpochMillisecond(),
-                            timestampLtz.getNanoOfMillisecond());
-                }
-            default:
-                throw new UnsupportedOperationException(
-                        "Unsupported data type to get timestamp: " + paimonTimestampType);
-        }
+        return super.getTimestamp(pos, precision);
     }
 }

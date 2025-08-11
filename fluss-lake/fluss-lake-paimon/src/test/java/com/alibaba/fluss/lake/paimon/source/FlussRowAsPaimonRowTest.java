@@ -18,7 +18,7 @@
  *
  */
 
-package com.alibaba.fluss.lake.paimon.lakehouse;
+package com.alibaba.fluss.lake.paimon.source;
 
 import com.alibaba.fluss.record.GenericRecord;
 import com.alibaba.fluss.record.LogRecord;
@@ -42,7 +42,7 @@ import static com.alibaba.fluss.record.ChangeType.UPDATE_BEFORE;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /** Test case for {@link FlussRowAsPaimonRow}. */
-public class FlussRowAsPaimonRowTest {
+class FlussRowAsPaimonRowTest {
     @Test
     void testLogTableRecordAllTypes() {
         // Construct a FlussRowAsPaimonRow instance

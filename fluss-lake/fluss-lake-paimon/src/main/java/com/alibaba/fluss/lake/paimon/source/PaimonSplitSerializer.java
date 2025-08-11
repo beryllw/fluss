@@ -16,7 +16,7 @@
  * limitations under the License.
  */
 
-package com.alibaba.fluss.lake.paimon.lakehouse;
+package com.alibaba.fluss.lake.paimon.source;
 
 import com.alibaba.fluss.lake.serializer.SimpleVersionedSerializer;
 

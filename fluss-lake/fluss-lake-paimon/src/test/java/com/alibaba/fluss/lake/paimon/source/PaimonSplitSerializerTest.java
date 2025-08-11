@@ -18,7 +18,7 @@
  *
  */
 
-package com.alibaba.fluss.lake.paimon.lakehouse;
+package com.alibaba.fluss.lake.paimon.source;
 
 import com.alibaba.fluss.lake.paimon.flink.PaimonLakeHouseTestBase;
 import com.alibaba.fluss.lake.source.LakeSource;
@@ -30,24 +30,25 @@ import org.apache.paimon.catalog.Identifier;
 import org.apache.paimon.data.BinaryString;
 import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.schema.Schema;
-import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.Table;
-import org.apache.paimon.table.source.Split;
 import org.apache.paimon.types.DataTypes;
 import org.junit.jupiter.api.Test;
 
+import java.io.IOException;
 import java.util.Arrays;
 import java.util.List;
-import java.util.stream.Collectors;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-/** Test case for {@link PaimonSplitPlanner}. */
-public class PaimonSplitPlannerTest extends PaimonLakeHouseTestBase {
+/** Test case for {@link PaimonSplitSerializer}. */
+class PaimonSplitSerializerTest extends PaimonLakeHouseTestBase {
+    private final PaimonSplitSerializer serializer = new PaimonSplitSerializer();
+
     @Test
-    void testPlann() throws Exception {
+    void testSerializeAndDeserialize() throws Exception {
         // prepare paimon table
-        int bucketNum = 2;
+        int bucketNum = 1;
         TablePath tablePath = TablePath.of(DEFAULT_DB, DEFAULT_TABLE);
         Schema.Builder builder =
                 Schema.newBuilder()
@@ -57,7 +58,6 @@ public class PaimonSplitPlannerTest extends PaimonLakeHouseTestBase {
         builder.partitionKeys("c3");
         builder.primaryKey("c1", "c3");
         builder.option(CoreOptions.BUCKET.key(), String.valueOf(bucketNum));
-        builder.option(CoreOptions.BUCKET_KEY.key(), "c1");
         createTable(tablePath, builder.build());
         Table table =
                 paimonCatalog.getTable(
@@ -65,21 +65,23 @@ public class PaimonSplitPlannerTest extends PaimonLakeHouseTestBase {
 
         GenericRow record1 =
                 GenericRow.of(12, BinaryString.fromString("a"), BinaryString.fromString("A"));
-        GenericRow record2 =
-                GenericRow.of(13, BinaryString.fromString("a"), BinaryString.fromString("A"));
-        writeRecord(tablePath, Arrays.asList(record1, record2));
+        writeRecord(tablePath, Arrays.asList(record1));
         Snapshot snapshot = table.latestSnapshot().get();
 
         LakeSource<PaimonSplit> lakeSource = lakeStorage.createLakeSource(tablePath);
-        List<PaimonSplit> paimonSplits = lakeSource.createPlanner(snapshot::id).plan();
+        List<PaimonSplit> plan = lakeSource.createPlanner(snapshot::id).plan();
 
-        List<Split> actualSplits = ((FileStoreTable) table).newScan().plan().splits();
+        PaimonSplit originalPaimonSplit = plan.get(0);
+        byte[] serialized = serializer.serialize(originalPaimonSplit);
+        PaimonSplit deserialized = serializer.deserialize(serializer.getVersion(), serialized);
 
-        assertThat(actualSplits).hasSize(paimonSplits.size());
-        assertThat(actualSplits)
-                .isEqualTo(
-                        paimonSplits.stream()
-                                .map(PaimonSplit::dataSplit)
-                                .collect(Collectors.toList()));
+        assertThat(deserialized.dataSplit()).isEqualTo(originalPaimonSplit.dataSplit());
+    }
+
+    @Test
+    void testDeserializeWithInvalidData() {
+        byte[] invalidData = "invalid".getBytes();
+        assertThatThrownBy(() -> serializer.deserialize(1, invalidData))
+                .isInstanceOf(IOException.class);
     }
 }

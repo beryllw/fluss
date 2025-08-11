@@ -29,10 +29,17 @@ import org.apache.paimon.data.Timestamp;
 /** Adapter for paimon row as fluss row. */
 public class PaimonRowAsFlussRow implements InternalRow {
 
-    private final org.apache.paimon.data.InternalRow paimonRow;
+    private org.apache.paimon.data.InternalRow paimonRow;
+
+    public PaimonRowAsFlussRow() {}
 
     public PaimonRowAsFlussRow(org.apache.paimon.data.InternalRow paimonRow) {
         this.paimonRow = paimonRow;
+    }
+
+    public PaimonRowAsFlussRow replaceRow(org.apache.paimon.data.InternalRow paimonRow) {
+        this.paimonRow = paimonRow;
+        return this;
     }
 
     @Override

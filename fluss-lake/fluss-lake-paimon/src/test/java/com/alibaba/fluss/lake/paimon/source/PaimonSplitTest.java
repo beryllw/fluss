@@ -18,7 +18,7 @@
  *
  */
 
-package com.alibaba.fluss.lake.paimon.lakehouse;
+package com.alibaba.fluss.lake.paimon.source;
 
 import com.alibaba.fluss.lake.paimon.flink.PaimonLakeHouseTestBase;
 import com.alibaba.fluss.lake.source.LakeSource;
@@ -30,23 +30,23 @@ import org.apache.paimon.catalog.Identifier;
 import org.apache.paimon.data.BinaryString;
 import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.schema.Schema;
+import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.Table;
+import org.apache.paimon.table.source.DataSplit;
+import org.apache.paimon.table.source.Split;
 import org.apache.paimon.types.DataTypes;
 import org.junit.jupiter.api.Test;
 
-import java.io.IOException;
-import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-/** Test case for {@link PaimonSplitSerializer}. */
-class PaimonSplitSerializerTest extends PaimonLakeHouseTestBase {
-    private final PaimonSplitSerializer serializer = new PaimonSplitSerializer();
+/** Test case for {@link PaimonSplit}. */
+class PaimonSplitTest extends PaimonLakeHouseTestBase {
 
     @Test
-    void testSerializeAndDeserialize() throws Exception {
+    void testPaimonSplit() throws Exception {
         // prepare paimon table
         int bucketNum = 1;
         TablePath tablePath = TablePath.of(DEFAULT_DB, DEFAULT_TABLE);
@@ -65,23 +65,20 @@ class PaimonSplitSerializerTest extends PaimonLakeHouseTestBase {
 
         GenericRow record1 =
                 GenericRow.of(12, BinaryString.fromString("a"), BinaryString.fromString("A"));
-        writeRecord(tablePath, Arrays.asList(record1));
+        writeRecord(tablePath, Collections.singletonList(record1));
         Snapshot snapshot = table.latestSnapshot().get();
 
         LakeSource<PaimonSplit> lakeSource = lakeStorage.createLakeSource(tablePath);
-        List<PaimonSplit> plan = lakeSource.createPlanner(snapshot::id).plan();
+        List<PaimonSplit> paimonSplits = lakeSource.createPlanner(snapshot::id).plan();
 
-        PaimonSplit originalPaimonSplit = plan.get(0);
-        byte[] serialized = serializer.serialize(originalPaimonSplit);
-        PaimonSplit deserialized = serializer.deserialize(serializer.getVersion(), serialized);
+        // test bucket() and partition() method
+        PaimonSplit paimonSplit = paimonSplits.get(0);
+        assertThat(paimonSplit.partition()).isEqualTo(Collections.singletonList("A"));
 
-        assertThat(deserialized.dataSplit()).isEqualTo(originalPaimonSplit.dataSplit());
-    }
-
-    @Test
-    void testDeserializeWithInvalidData() {
-        byte[] invalidData = "invalid".getBytes();
-        assertThatThrownBy(() -> serializer.deserialize(1, invalidData))
-                .isInstanceOf(IOException.class);
+        List<Split> actualSplits = ((FileStoreTable) table).newScan().plan().splits();
+        assertThat(actualSplits.size()).isEqualTo(paimonSplits.size());
+        Split actualSplit = actualSplits.get(0);
+        assertThat(actualSplit).isEqualTo(paimonSplit.dataSplit());
+        assertThat(((DataSplit) actualSplit).bucket()).isEqualTo(paimonSplit.bucket());
     }
 }

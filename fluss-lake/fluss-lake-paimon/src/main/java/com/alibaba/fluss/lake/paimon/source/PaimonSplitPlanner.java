@@ -16,7 +16,7 @@
  * limitations under the License.
  */
 
-package com.alibaba.fluss.lake.paimon.lakehouse;
+package com.alibaba.fluss.lake.paimon.source;
 
 import com.alibaba.fluss.config.Configuration;
 import com.alibaba.fluss.lake.source.Planner;
@@ -34,6 +34,8 @@ import org.apache.paimon.table.source.DataSplit;
 import org.apache.paimon.table.source.InnerTableScan;
 import org.apache.paimon.table.source.Split;
 
+import javax.annotation.Nullable;
+
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -45,11 +47,14 @@ public class PaimonSplitPlanner implements Planner<PaimonSplit> {
 
     private final Configuration paimonConfig;
     private final TablePath tablePath;
-    private final Predicate predicate;
+    private final @Nullable Predicate predicate;
     private final long snapshotId;
 
     public PaimonSplitPlanner(
-            Configuration paimonConfig, TablePath tablePath, Predicate predicate, long snapshotId) {
+            Configuration paimonConfig,
+            TablePath tablePath,
+            @Nullable Predicate predicate,
+            long snapshotId) {
         this.paimonConfig = paimonConfig;
         this.tablePath = tablePath;
         this.predicate = predicate;

@@ -18,7 +18,7 @@
  *
  */
 
-package com.alibaba.fluss.lake.paimon.lakehouse;
+package com.alibaba.fluss.lake.paimon.source;
 
 import com.alibaba.fluss.lake.paimon.flink.PaimonLakeHouseTestBase;
 import com.alibaba.fluss.lake.source.LakeSource;
@@ -32,23 +32,22 @@ import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.schema.Schema;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.Table;
-import org.apache.paimon.table.source.DataSplit;
 import org.apache.paimon.table.source.Split;
 import org.apache.paimon.types.DataTypes;
 import org.junit.jupiter.api.Test;
 
 import java.util.Arrays;
 import java.util.List;
+import java.util.stream.Collectors;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-/** Test case for {@link PaimonSplit}. */
-public class PaimonSplitTest extends PaimonLakeHouseTestBase {
-
+/** Test case for {@link PaimonSplitPlanner}. */
+class PaimonSplitPlannerTest extends PaimonLakeHouseTestBase {
     @Test
-    void testPaimonSplit() throws Exception {
+    void testPlan() throws Exception {
         // prepare paimon table
-        int bucketNum = 1;
+        int bucketNum = 2;
         TablePath tablePath = TablePath.of(DEFAULT_DB, DEFAULT_TABLE);
         Schema.Builder builder =
                 Schema.newBuilder()
@@ -58,6 +57,7 @@ public class PaimonSplitTest extends PaimonLakeHouseTestBase {
         builder.partitionKeys("c3");
         builder.primaryKey("c1", "c3");
         builder.option(CoreOptions.BUCKET.key(), String.valueOf(bucketNum));
+        builder.option(CoreOptions.BUCKET_KEY.key(), "c1");
         createTable(tablePath, builder.build());
         Table table =
                 paimonCatalog.getTable(
@@ -65,20 +65,21 @@ public class PaimonSplitTest extends PaimonLakeHouseTestBase {
 
         GenericRow record1 =
                 GenericRow.of(12, BinaryString.fromString("a"), BinaryString.fromString("A"));
-        writeRecord(tablePath, Arrays.asList(record1));
+        GenericRow record2 =
+                GenericRow.of(13, BinaryString.fromString("a"), BinaryString.fromString("A"));
+        writeRecord(tablePath, Arrays.asList(record1, record2));
         Snapshot snapshot = table.latestSnapshot().get();
 
         LakeSource<PaimonSplit> lakeSource = lakeStorage.createLakeSource(tablePath);
         List<PaimonSplit> paimonSplits = lakeSource.createPlanner(snapshot::id).plan();
 
-        // test bucket() and partition() method
-        PaimonSplit paimonSplit = paimonSplits.get(0);
-        assertThat(paimonSplit.partition()).isEqualTo(Arrays.asList("A"));
-
         List<Split> actualSplits = ((FileStoreTable) table).newScan().plan().splits();
-        assertThat(actualSplits.size()).isEqualTo(paimonSplits.size());
-        Split actualSplit = actualSplits.get(0);
-        assertThat(actualSplit).isEqualTo(paimonSplit.dataSplit());
-        assertThat(((DataSplit) actualSplit).bucket()).isEqualTo(paimonSplit.bucket());
+
+        assertThat(actualSplits).hasSize(paimonSplits.size());
+        assertThat(actualSplits)
+                .isEqualTo(
+                        paimonSplits.stream()
+                                .map(PaimonSplit::dataSplit)
+                                .collect(Collectors.toList()));
     }
 }

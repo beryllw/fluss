@@ -16,7 +16,7 @@
  * limitations under the License.
  */
 
-package com.alibaba.fluss.lake.paimon.lakehouse;
+package com.alibaba.fluss.lake.paimon.source;
 
 import com.alibaba.fluss.lake.paimon.utils.PaimonRowAsFlussRow;
 import com.alibaba.fluss.lake.source.RecordReader;
@@ -31,14 +31,12 @@ import org.apache.paimon.predicate.Predicate;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.source.ReadBuilder;
 import org.apache.paimon.table.source.TableRead;
-import org.apache.paimon.types.DataField;
 import org.apache.paimon.types.RowType;
 
 import javax.annotation.Nullable;
 
 import java.io.IOException;
 import java.util.Arrays;
-import java.util.List;
 import java.util.stream.IntStream;
 
 import static com.alibaba.fluss.lake.paimon.utils.PaimonConversions.toChangeType;
@@ -59,12 +57,10 @@ public class PaimonRecordReader implements RecordReader {
             @Nullable int[][] project,
             @Nullable Predicate predicate)
             throws IOException {
-
         ReadBuilder readBuilder = fileStoreTable.newReadBuilder();
-        int fieldCount = fileStoreTable.rowType().getFieldCount();
-        List<DataField> pkFields = fileStoreTable.schema().primaryKeysFields();
+        RowType paimonFullRowType = fileStoreTable.rowType();
         if (project != null) {
-            readBuilder = applyProject(readBuilder, project, fieldCount, pkFields);
+            readBuilder = applyProject(readBuilder, project, paimonFullRowType);
         }
 
         if (predicate != null) {
@@ -86,22 +82,17 @@ public class PaimonRecordReader implements RecordReader {
         return iterator;
     }
 
-    // TODO: Support primary key projection and obtain primary key index for merging.
     private ReadBuilder applyProject(
-            ReadBuilder readBuilder, int[][] projects, int fieldCount, List<DataField> pkFields) {
-        int[] pkIds = pkFields.stream().mapToInt(DataField::id).toArray();
-
+            ReadBuilder readBuilder, int[][] projects, RowType paimonFullRowType) {
         int[] projectIds = Arrays.stream(projects).mapToInt(project -> project[0]).toArray();
 
-        int bucketFieldPos = fieldCount - 3;
-        int offsetFieldPos = fieldCount - 2;
-        int timestampFieldPos = fieldCount - 1;
+        int offsetFieldPos = paimonFullRowType.getFieldIndex(OFFSET_COLUMN_NAME);
+        int timestampFieldPos = paimonFullRowType.getFieldIndex(TIMESTAMP_COLUMN_NAME);
 
         int[] paimonProject =
                 IntStream.concat(
-                                IntStream.concat(IntStream.of(projectIds), IntStream.of(pkIds))
-                                        .distinct(),
-                                IntStream.of(bucketFieldPos, offsetFieldPos, timestampFieldPos))
+                                IntStream.of(projectIds),
+                                IntStream.of(offsetFieldPos, timestampFieldPos))
                         .toArray();
 
         return readBuilder.withProjection(paimonProject);
@@ -113,6 +104,7 @@ public class PaimonRecordReader implements RecordReader {
         private final org.apache.paimon.utils.CloseableIterator<InternalRow> paimonRowIterator;
 
         private final ProjectedRow projectedRow;
+        private final PaimonRowAsFlussRow paimonRowAsFlussRow;
 
         private final int logOffsetColIndex;
         private final int timestampColIndex;
@@ -124,8 +116,9 @@ public class PaimonRecordReader implements RecordReader {
             this.logOffsetColIndex = paimonRowType.getFieldIndex(OFFSET_COLUMN_NAME);
             this.timestampColIndex = paimonRowType.getFieldIndex(TIMESTAMP_COLUMN_NAME);
 
-            int[] project = IntStream.range(0, paimonRowType.getFieldCount() - 3).toArray();
+            int[] project = IntStream.range(0, paimonRowType.getFieldCount() - 2).toArray();
             projectedRow = ProjectedRow.from(project);
+            paimonRowAsFlussRow = new PaimonRowAsFlussRow();
         }
 
         @Override
@@ -153,7 +146,7 @@ public class PaimonRecordReader implements RecordReader {
                     offset,
                     timestamp,
                     changeType,
-                    projectedRow.replaceRow(new PaimonRowAsFlussRow(paimonRow)));
+                    projectedRow.replaceRow(paimonRowAsFlussRow.replaceRow(paimonRow)));
         }
     }
 }

@@ -16,7 +16,7 @@
  * limitations under the License.
  */
 
-package com.alibaba.fluss.lake.paimon.lakehouse;
+package com.alibaba.fluss.lake.paimon.source;
 
 import com.alibaba.fluss.lake.source.LakeSplit;
 
@@ -50,6 +50,9 @@ public class PaimonSplit implements LakeSplit {
 
         List<String> partitions = new ArrayList<>();
         for (int i = 0; i < partition.getFieldCount(); i++) {
+            // Todo Currently, partition column must be String datatype, so we can always use
+            // consider it as string. Revisit here when
+            // #489 is finished.
             partitions.add(partition.getString(i).toString());
         }
         return partitions;
