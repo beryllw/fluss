@@ -26,7 +26,6 @@ import org.apache.paimon.CoreOptions;
 import org.apache.paimon.catalog.Catalog;
 import org.apache.paimon.catalog.CatalogContext;
 import org.apache.paimon.catalog.CatalogFactory;
-import org.apache.paimon.options.MemorySize;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.predicate.Predicate;
 import org.apache.paimon.table.FileStoreTable;
@@ -67,16 +66,6 @@ public class PaimonSplitPlanner implements Planner<PaimonSplit> {
             List<PaimonSplit> splits = new ArrayList<>();
             try (Catalog catalog = getCatalog()) {
                 FileStoreTable fileStoreTable = getTable(catalog, tablePath, snapshotId);
-                // if primary key table, only generate splits
-                // to do batch sort merge
-                if (!fileStoreTable.primaryKeys().isEmpty()) {
-                    // todo: may need make it passed in context
-                    fileStoreTable.copy(
-                            Collections.singletonMap(
-                                    CoreOptions.SOURCE_SPLIT_TARGET_SIZE.key(),
-                                    // we set a max size to make sure only one splits
-                                    MemorySize.MAX_VALUE.toString()));
-                }
                 // TODO: support filter .withFilter(predicate)
                 InnerTableScan tableScan = fileStoreTable.newScan();
                 for (Split split : tableScan.plan().splits()) {

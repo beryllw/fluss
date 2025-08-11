@@ -42,6 +42,7 @@ import com.alibaba.fluss.types.StringType;
 import com.alibaba.fluss.types.TimestampType;
 import com.alibaba.fluss.types.TinyIntType;
 import com.alibaba.fluss.utils.CloseableIterator;
+
 import org.apache.flink.types.Row;
 import org.apache.paimon.CoreOptions;
 import org.apache.paimon.Snapshot;
@@ -57,6 +58,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import javax.annotation.Nullable;
+
 import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Collectors;
@@ -105,13 +107,11 @@ class PaimonRecordReaderTest extends PaimonLakeHouseTestBase {
             actual.addAll(
                     convertToFlinkRow(
                             fieldGetters,
-                            TransformingCloseableIterator.transform(
-                                    iterator, LogRecord::getRow)));
+                            TransformingCloseableIterator.transform(iterator, LogRecord::getRow)));
             iterator.close();
         }
         List<Row> expectRows =
-                convertToFlinkRow(
-                        fieldGetters, CloseableIterator.wrap(writtenRows.iterator()));
+                convertToFlinkRow(fieldGetters, CloseableIterator.wrap(writtenRows.iterator()));
         assertThat(actual).containsExactlyInAnyOrderElementsOf(expectRows);
     }
 
@@ -142,8 +142,7 @@ class PaimonRecordReaderTest extends PaimonLakeHouseTestBase {
             actual.addAll(
                     convertToFlinkRow(
                             fieldGetters,
-                            TransformingCloseableIterator.transform(
-                                    iterator, LogRecord::getRow)));
+                            TransformingCloseableIterator.transform(iterator, LogRecord::getRow)));
             iterator.close();
         }
         List<Row> expectRows = new ArrayList<>();

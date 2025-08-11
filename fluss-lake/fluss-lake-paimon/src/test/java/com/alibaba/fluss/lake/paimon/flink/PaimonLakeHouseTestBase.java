@@ -23,8 +23,8 @@ package com.alibaba.fluss.lake.paimon.flink;
 import com.alibaba.fluss.config.Configuration;
 import com.alibaba.fluss.lake.paimon.PaimonLakeStorage;
 import com.alibaba.fluss.metadata.TablePath;
-
 import com.alibaba.fluss.utils.CloseableIterator;
+
 import org.apache.flink.types.Row;
 import org.apache.paimon.catalog.Catalog;
 import org.apache.paimon.catalog.CatalogContext;
