@@ -29,11 +29,10 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.Iterator;
-import java.util.LinkedList;
 import java.util.List;
-import java.util.Queue;
+import java.util.NoSuchElementException;
+import java.util.PriorityQueue;
 import java.util.function.Function;
-import java.util.stream.Collectors;
 
 /** A sort merge reader to merge lakehouse snapshot record and fluss change log. */
 class SortMergeReader {
@@ -81,7 +80,7 @@ class SortMergeReader {
 
     /** A concat record iterator to concat multiple record iterator. */
     private static class ConcatRecordIterator implements CloseableIterator<LogRecord> {
-        private final Queue<CloseableIterator<LogRecord>> iteratorQueue;
+        private final PriorityQueue<SingleElementHeadIterator<LogRecord>> priorityQueue;
         private final ProjectedRow snapshotProjectedPkRow1;
         private final ProjectedRow snapshotProjectedPkRow2;
 
@@ -91,19 +90,20 @@ class SortMergeReader {
                 Comparator<InternalRow> comparator) {
             this.snapshotProjectedPkRow1 = ProjectedRow.from(pkIndexes);
             this.snapshotProjectedPkRow2 = ProjectedRow.from(pkIndexes);
-            this.iteratorQueue =
-                    iteratorList.stream()
-                            .filter(Iterator::hasNext)
-                            .map(
-                                    iterator ->
-                                            SingleElementHeadIterator.addElementToHead(
-                                                    iterator.next(), iterator))
-                            .sorted(
-                                    (s1, s2) ->
-                                            comparator.compare(
-                                                    getComparableRow(s1, snapshotProjectedPkRow1),
-                                                    getComparableRow(s2, snapshotProjectedPkRow2)))
-                            .collect(Collectors.toCollection(LinkedList::new));
+            this.priorityQueue =
+                    new PriorityQueue<>(
+                            Math.max(1, iteratorList.size()),
+                            (s1, s2) ->
+                                    comparator.compare(
+                                            getComparableRow(s1, snapshotProjectedPkRow1),
+                                            getComparableRow(s2, snapshotProjectedPkRow2)));
+            iteratorList.stream()
+                    .filter(Iterator::hasNext)
+                    .map(
+                            iterator ->
+                                    SingleElementHeadIterator.addElementToHead(
+                                            iterator.next(), iterator))
+                    .forEach(priorityQueue::add);
         }
 
         public static CloseableIterator<LogRecord> wrap(
@@ -123,26 +123,29 @@ class SortMergeReader {
 
         @Override
         public void close() {
-            while (!iteratorQueue.isEmpty()) {
-                iteratorQueue.poll().close();
+            while (!priorityQueue.isEmpty()) {
+                priorityQueue.poll().close();
             }
         }
 
         @Override
         public boolean hasNext() {
-            while (!iteratorQueue.isEmpty()) {
-                CloseableIterator<LogRecord> iterator = iteratorQueue.peek();
+            while (!priorityQueue.isEmpty()) {
+                CloseableIterator<LogRecord> iterator = priorityQueue.peek();
                 if (iterator.hasNext()) {
                     return true;
                 }
-                iteratorQueue.poll().close();
+                priorityQueue.poll().close();
             }
             return false;
         }
 
         @Override
         public LogRecord next() {
-            return iteratorQueue.peek().next();
+            if (!hasNext()) {
+                throw new NoSuchElementException();
+            }
+            return priorityQueue.peek().next();
         }
     }
 

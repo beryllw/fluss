@@ -120,7 +120,7 @@ public class LakeSplitReaderGenerator {
                     (LakeSnapshotAndFlussLogSplit) split;
             LakeSnapshotAndLogSplitScanner lakeSnapshotAndLogSplitScanner =
                     new LakeSnapshotAndLogSplitScanner(
-                            table, lakeSource, lakeSnapshotAndFlussLogSplit);
+                            table, lakeSource, lakeSnapshotAndFlussLogSplit, projectedFields);
             return new BoundedSplitReader(
                     lakeSnapshotAndLogSplitScanner,
                     lakeSnapshotAndFlussLogSplit.getRecordsToSkip());

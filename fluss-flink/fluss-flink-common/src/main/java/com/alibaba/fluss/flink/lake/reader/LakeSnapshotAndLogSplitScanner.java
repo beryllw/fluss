@@ -61,7 +61,7 @@ public class LakeSnapshotAndLogSplitScanner implements BatchScanner {
     // the indexes of primary key in emitted row by paimon and fluss
     private int[] keyIndexesInRow;
     @Nullable private int[] adjustProjectedFields;
-    private int[] newProjectedFields;
+    private final int[] newProjectedFields;
 
     // the sorted logs in memory, mapping from key -> value
     private SortedMap<InternalRow, KeyValueRow> logRows;
@@ -75,11 +75,12 @@ public class LakeSnapshotAndLogSplitScanner implements BatchScanner {
     public LakeSnapshotAndLogSplitScanner(
             Table table,
             LakeSource<LakeSplit> lakeSource,
-            LakeSnapshotAndFlussLogSplit lakeSnapshotAndFlussLogSplit) {
+            LakeSnapshotAndFlussLogSplit lakeSnapshotAndFlussLogSplit,
+            @Nullable int[] projectedFields) {
         this.pkIndexes = table.getTableInfo().getSchema().getPrimaryKeyIndexes();
         this.lakeSnapshotSplitAndFlussLogSplit = lakeSnapshotAndFlussLogSplit;
         this.lakeSource = lakeSource;
-        this.newProjectedFields = getNeedProjectFields(table);
+        this.newProjectedFields = getNeedProjectFields(table, projectedFields);
 
         this.logScanner = table.newScan().project(newProjectedFields).createLogScanner();
         this.lakeSource.withProject(
@@ -110,10 +111,8 @@ public class LakeSnapshotAndLogSplitScanner implements BatchScanner {
         this.logScanFinished = lakeSnapshotAndFlussLogSplit.getStartingOffset() >= stoppingOffset;
     }
 
-    private int[] getNeedProjectFields(Table flussTable) {
-        if (lakeSource.getProject() != null) {
-            int[] projectedFields =
-                    Arrays.stream(lakeSource.getProject()).mapToInt(field -> field[0]).toArray();
+    private int[] getNeedProjectFields(Table flussTable, @Nullable int[] projectedFields) {
+        if (projectedFields != null) {
             // we need to include the primary key in projected fields to sort merge by pk
             // if the provided don't include, we need to include it
             List<Integer> newProjectedFields =
@@ -169,11 +168,12 @@ public class LakeSnapshotAndLogSplitScanner implements BatchScanner {
             if (lakeRecordIterators.isEmpty()) {
                 if (lakeSnapshotSplitAndFlussLogSplit.getLakeSplits() == null
                         || lakeSnapshotSplitAndFlussLogSplit.getLakeSplits().isEmpty()) {
-                    lakeRecordIterators =
-                            Collections.singletonList(CloseableIterator.emptyIterator());
-                }
-                for (LakeSplit lakeSplit : lakeSnapshotSplitAndFlussLogSplit.getLakeSplits()) {
-                    lakeRecordIterators.add(lakeSource.createRecordReader(() -> lakeSplit).read());
+                    lakeRecordIterators = Collections.emptyList();
+                } else {
+                    for (LakeSplit lakeSplit : lakeSnapshotSplitAndFlussLogSplit.getLakeSplits()) {
+                        lakeRecordIterators.add(
+                                lakeSource.createRecordReader(() -> lakeSplit).read());
+                    }
                 }
             }
             if (currentSortMergeReader == null) {
@@ -193,20 +193,21 @@ public class LakeSnapshotAndLogSplitScanner implements BatchScanner {
             if (lakeRecordIterators.isEmpty()) {
                 if (lakeSnapshotSplitAndFlussLogSplit.getLakeSplits() == null
                         || lakeSnapshotSplitAndFlussLogSplit.getLakeSplits().isEmpty()) {
-                    lakeRecordIterators =
-                            Collections.singletonList(CloseableIterator.emptyIterator());
-                }
-                for (LakeSplit lakeSplit : lakeSnapshotSplitAndFlussLogSplit.getLakeSplits()) {
-                    RecordReader reader = lakeSource.createRecordReader(() -> lakeSplit);
-                    if (reader instanceof SortedRecordReader) {
-                        rowComparator = ((SortedRecordReader) reader).order();
-                    } else {
-                        throw new UnsupportedOperationException(
-                                "lake records must instance of sorted view.");
+                    lakeRecordIterators = Collections.emptyList();
+                    logRows = new TreeMap<>();
+                } else {
+                    for (LakeSplit lakeSplit : lakeSnapshotSplitAndFlussLogSplit.getLakeSplits()) {
+                        RecordReader reader = lakeSource.createRecordReader(() -> lakeSplit);
+                        if (reader instanceof SortedRecordReader) {
+                            rowComparator = ((SortedRecordReader) reader).order();
+                        } else {
+                            throw new UnsupportedOperationException(
+                                    "lake records must instance of sorted view.");
+                        }
+                        lakeRecordIterators.add(reader.read());
                     }
-                    lakeRecordIterators.add(reader.read());
+                    logRows = new TreeMap<>(rowComparator);
                 }
-                logRows = new TreeMap<>(rowComparator);
             }
             pollLogRecords(timeout);
             return CloseableIterator.wrap(Collections.emptyIterator());
@@ -237,6 +238,11 @@ public class LakeSnapshotAndLogSplitScanner implements BatchScanner {
         try {
             if (logScanner != null) {
                 logScanner.close();
+            }
+            if (lakeRecordIterators != null) {
+                for (CloseableIterator<LogRecord> iterator : lakeRecordIterators) {
+                    iterator.close();
+                }
             }
         } catch (Exception e) {
             throw new IOException("Failed to close resources", e);

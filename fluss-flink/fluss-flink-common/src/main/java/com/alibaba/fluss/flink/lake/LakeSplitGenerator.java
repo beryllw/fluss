@@ -241,7 +241,7 @@ public class LakeSplitGenerator {
                 long stoppingOffset = bucketEndOffset.get(bucket);
                 splits.add(
                         generateSplitForPrimaryKeyTableBucket(
-                                lakeSplits.get(bucket),
+                                lakeSplits != null ? lakeSplits.get(bucket) : null,
                                 tableBucket,
                                 partitionName,
                                 snapshotLogOffset,
@@ -267,7 +267,7 @@ public class LakeSplitGenerator {
     }
 
     private SourceSplitBase generateSplitForPrimaryKeyTableBucket(
-            List<LakeSplit> lakeSplits,
+            @Nullable List<LakeSplit> lakeSplits,
             TableBucket tableBucket,
             @Nullable String partitionName,
             @Nullable Long snapshotLogOffset,

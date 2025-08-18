@@ -29,108 +29,88 @@ import org.apache.flink.core.memory.DataInputDeserializer;
 import org.apache.flink.core.memory.DataOutputSerializer;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mock;
-import org.mockito.Mockito;
 
 import java.io.IOException;
 import java.util.Collections;
+import java.util.List;
 
 import static com.alibaba.fluss.client.table.scanner.log.LogScanner.EARLIEST_OFFSET;
 import static com.alibaba.fluss.flink.lake.split.LakeSnapshotAndFlussLogSplit.LAKE_SNAPSHOT_FLUSS_LOG_SPLIT_KIND;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
-import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.when;
 
 /** Test case for {@link LakeSplitSerializer}. */
-public class LakeSplitSerializerTest {
+class LakeSplitSerializerTest {
     private static final byte LAKE_SNAPSHOT_SPLIT_KIND = -1;
 
-    private final SimpleVersionedSerializer<LakeSplit> mockSourceSerializer =
-            Mockito.mock(SimpleVersionedSerializer.class);
+    private static final int SERIALIZER_VERSION = 3;
 
-    @Mock private LakeSplit mockLakeSplit = Mockito.mock(LakeSplit.class);
+    private static final byte[] TEST_DATA = "test-lake-split".getBytes();
 
-    @Mock private TableBucket mockTableBucket = Mockito.mock(TableBucket.class);
+    private static final int STOPPING_OFFSET = 1024;
 
-    private final LakeSplitSerializer serializer = new LakeSplitSerializer(mockSourceSerializer);
+    private static final LakeSplit LAKE_SPLIT =
+            new TestLakeSplit(0, Collections.singletonList("2025-08-18"));
+
+    private final SimpleVersionedSerializer<LakeSplit> sourceSplitSerializer =
+            new TestSimpleVersionedSerializer();
+
+    @Mock private TableBucket tableBucket = new TableBucket(0, 1L, 0);
+
+    private final LakeSplitSerializer serializer = new LakeSplitSerializer(sourceSplitSerializer);
 
     @Test
     void testSerializeAndDeserializeLakeSnapshotSplit() throws IOException {
         // Prepare test data
-        byte[] testData = "test-lake-split".getBytes();
-        int serializerVersion = 3;
-
-        when(mockSourceSerializer.serialize(mockLakeSplit)).thenReturn(testData);
-        when(mockSourceSerializer.getVersion()).thenReturn(serializerVersion);
-        when(mockSourceSerializer.deserialize(serializerVersion, testData))
-                .thenReturn(mockLakeSplit);
-
         LakeSnapshotSplit originalSplit =
-                new LakeSnapshotSplit(mockTableBucket, "2025-08-15", mockLakeSplit);
+                new LakeSnapshotSplit(tableBucket, "2025-08-18", LAKE_SPLIT);
 
-        DataOutputSerializer output = new DataOutputSerializer(1024);
+        DataOutputSerializer output = new DataOutputSerializer(STOPPING_OFFSET);
         serializer.serialize(output, originalSplit);
 
         SourceSplitBase deserializedSplit =
                 serializer.deserialize(
                         LAKE_SNAPSHOT_SPLIT_KIND,
-                        mockTableBucket,
-                        "2025-08-15",
+                        tableBucket,
+                        "2025-08-18",
                         new DataInputDeserializer(output.getCopyOfBuffer()));
 
         assertThat(deserializedSplit instanceof LakeSnapshotSplit).isTrue();
         LakeSnapshotSplit result = (LakeSnapshotSplit) deserializedSplit;
 
-        assertThat(mockTableBucket).isEqualTo(result.getTableBucket());
-        assertThat("2025-08-15").isEqualTo(result.getPartitionName());
-        assertThat(mockLakeSplit).isEqualTo(result.getLakeSplit());
-
-        verify(mockSourceSerializer).serialize(mockLakeSplit);
-        verify(mockSourceSerializer).getVersion();
-        verify(mockSourceSerializer).deserialize(serializerVersion, testData);
+        assertThat(tableBucket).isEqualTo(result.getTableBucket());
+        assertThat("2025-08-18").isEqualTo(result.getPartitionName());
+        assertThat(LAKE_SPLIT).isEqualTo(result.getLakeSplit());
     }
 
     @Test
     void testSerializeAndDeserializeLakeSnapshotAndFlussLogSplit() throws IOException {
-        byte[] testData = "test-lake-split".getBytes();
-        int serializerVersion = 3;
-        long stoppingOffset = 1024;
-
-        when(mockSourceSerializer.serialize(mockLakeSplit)).thenReturn(testData);
-        when(mockSourceSerializer.getVersion()).thenReturn(serializerVersion);
-        when(mockSourceSerializer.deserialize(serializerVersion, testData))
-                .thenReturn(mockLakeSplit);
-
         LakeSnapshotAndFlussLogSplit originalSplit =
                 new LakeSnapshotAndFlussLogSplit(
-                        mockTableBucket,
-                        "2025-08-15",
-                        Collections.singletonList(mockLakeSplit),
+                        tableBucket,
+                        "2025-08-18",
+                        Collections.singletonList(LAKE_SPLIT),
                         EARLIEST_OFFSET,
-                        stoppingOffset);
+                        STOPPING_OFFSET);
 
-        DataOutputSerializer output = new DataOutputSerializer(1024);
+        DataOutputSerializer output = new DataOutputSerializer(STOPPING_OFFSET);
         serializer.serialize(output, originalSplit);
 
         SourceSplitBase deserializedSplit =
                 serializer.deserialize(
                         LAKE_SNAPSHOT_FLUSS_LOG_SPLIT_KIND,
-                        mockTableBucket,
-                        "2025-08-15",
+                        tableBucket,
+                        "2025-08-18",
                         new DataInputDeserializer(output.getCopyOfBuffer()));
 
         assertThat(deserializedSplit instanceof LakeSnapshotAndFlussLogSplit).isTrue();
         LakeSnapshotAndFlussLogSplit result = (LakeSnapshotAndFlussLogSplit) deserializedSplit;
 
-        assertThat(mockTableBucket).isEqualTo(result.getTableBucket());
-        assertThat("2025-08-15").isEqualTo(result.getPartitionName());
-        assertThat(Collections.singletonList(mockLakeSplit)).isEqualTo(result.getLakeSplits());
+        assertThat(tableBucket).isEqualTo(result.getTableBucket());
+        assertThat("2025-08-18").isEqualTo(result.getPartitionName());
+        assertThat(Collections.singletonList(LAKE_SPLIT)).isEqualTo(result.getLakeSplits());
         assertThat(EARLIEST_OFFSET).isEqualTo(result.getStartingOffset());
-        assertThat(stoppingOffset).isEqualTo(result.getStoppingOffset().get());
-
-        verify(mockSourceSerializer).serialize(mockLakeSplit);
-        verify(mockSourceSerializer).getVersion();
-        verify(mockSourceSerializer).deserialize(serializerVersion, testData);
+        assertThat((long) STOPPING_OFFSET).isEqualTo(result.getStoppingOffset().get());
     }
 
     @Test
@@ -142,10 +122,55 @@ public class LakeSplitSerializerTest {
                         () ->
                                 serializer.deserialize(
                                         (byte) 99,
-                                        mockTableBucket,
+                                        tableBucket,
                                         "2023-10-01",
                                         new DataInputDeserializer(output.getCopyOfBuffer())))
                 .withFailMessage(() -> "Unsupported split kind: ")
                 .isInstanceOf(UnsupportedOperationException.class);
+    }
+
+    private static class TestSimpleVersionedSerializer
+            implements SimpleVersionedSerializer<LakeSplit> {
+
+        @Override
+        public byte[] serialize(LakeSplit split) throws IOException {
+            return TEST_DATA;
+        }
+
+        @Override
+        public LakeSplit deserialize(int version, byte[] serialized) throws IOException {
+            return LAKE_SPLIT;
+        }
+
+        @Override
+        public int getVersion() {
+            return SERIALIZER_VERSION;
+        }
+    }
+
+    private static class TestLakeSplit implements LakeSplit {
+
+        private int bucket;
+        private List<String> partition;
+
+        public TestLakeSplit(int bucket, List<String> partition) {
+            this.bucket = bucket;
+            this.partition = partition;
+        }
+
+        @Override
+        public String toString() {
+            return "TestLakeSplit";
+        }
+
+        @Override
+        public int bucket() {
+            return bucket;
+        }
+
+        @Override
+        public List<String> partition() {
+            return partition;
+        }
     }
 }

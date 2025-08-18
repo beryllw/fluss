@@ -30,7 +30,8 @@ import com.alibaba.fluss.types.RowType;
 import com.alibaba.fluss.types.StringType;
 import com.alibaba.fluss.utils.CloseableIterator;
 
-import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -42,7 +43,7 @@ import static com.alibaba.fluss.testutils.DataTestUtils.row;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /** Test for {@link SortMergeReader}. */
-public class SortMergeReaderTest {
+class SortMergeReaderTest {
 
     private static class FlussRowComparator implements Comparator<InternalRow> {
 
@@ -54,60 +55,21 @@ public class SortMergeReaderTest {
 
         @Override
         public int compare(InternalRow o1, InternalRow o2) {
-            int compare = o1.getInt(keyIndex) - o2.getInt(keyIndex);
-            return compare;
+            return o1.getInt(keyIndex) - o2.getInt(keyIndex);
         }
     }
 
-    @Test
-    void testReadBatch() {
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void testReadBatch(boolean isProjected) {
         int keyIndex = 0;
         int[] pkIndexes = new int[] {keyIndex};
+        int[] projectedFields = isProjected ? new int[] {keyIndex, 1} : null;
         List<LogRecord> logRecords1 = createRecords(0, 10, false);
         List<LogRecord> logRecords2 = createRecords(10, 10, false);
-        List<KeyValueRow> logRecords3 =
-                createRecords(5, 10, true).stream()
-                        .map(logRecord -> new KeyValueRow(pkIndexes, logRecord.getRow(), false))
-                        .collect(Collectors.toList());
-
-        SortMergeReader sortMergeReader =
-                new SortMergeReader(
-                        null,
-                        new int[] {keyIndex},
-                        Arrays.asList(
-                                CloseableIterator.wrap(logRecords2.iterator()),
-                                CloseableIterator.wrap(logRecords1.iterator())),
-                        new FlussRowComparator(keyIndex),
-                        CloseableIterator.wrap(logRecords3.iterator()));
-
-        List<InternalRow> actualRows = new ArrayList<>();
-        InternalRow.FieldGetter[] fieldGetters =
-                InternalRow.createFieldGetters(
-                        RowType.of(new IntType(), new StringType(), new StringType()));
-        try (CloseableIterator<InternalRow> iterator = sortMergeReader.readBatch()) {
-            actualRows.addAll(materializeRows(iterator, fieldGetters));
-        }
-        assertThat(actualRows).hasSize(20);
-        List<LogRecord> excepted = createRecords(0, 5, false);
-        excepted.addAll(createRecords(5, 10, true));
-        excepted.addAll(createRecords(15, 5, false));
-        assertThat(actualRows)
-                .isEqualTo(
-                        materializeRows(
-                                CloseableIterator.wrap(
-                                        excepted.stream().map(LogRecord::getRow).iterator()),
-                                fieldGetters));
-    }
-
-    @Test
-    void testReadBatchWithProjectedFields() {
-        int keyIndex = 0;
-        int[] projectedFields = new int[] {keyIndex, 1};
-        int[] pkIndexes = new int[] {keyIndex};
-        List<LogRecord> logRecords1 = createRecords(0, 10, false);
-        List<LogRecord> logRecords2 = createRecords(10, 10, false);
-        List<KeyValueRow> logRecords3 =
-                createRecords(5, 10, true).stream()
+        List<LogRecord> logRecords3 = createRecords(20, 10, false);
+        List<KeyValueRow> logRecords4 =
+                createRecords(5, 20, true).stream()
                         .map(logRecord -> new KeyValueRow(pkIndexes, logRecord.getRow(), false))
                         .collect(Collectors.toList());
 
@@ -117,27 +79,33 @@ public class SortMergeReaderTest {
                         new int[] {keyIndex},
                         Arrays.asList(
                                 CloseableIterator.wrap(logRecords2.iterator()),
+                                CloseableIterator.wrap(logRecords3.iterator()),
                                 CloseableIterator.wrap(logRecords1.iterator())),
                         new FlussRowComparator(keyIndex),
-                        CloseableIterator.wrap(logRecords3.iterator()));
+                        CloseableIterator.wrap(logRecords4.iterator()));
 
         List<InternalRow> actualRows = new ArrayList<>();
         InternalRow.FieldGetter[] fieldGetters =
-                InternalRow.createFieldGetters(RowType.of(new IntType(), new StringType()));
+                InternalRow.createFieldGetters(
+                        isProjected
+                                ? RowType.of(new IntType(), new StringType())
+                                : RowType.of(new IntType(), new StringType(), new StringType()));
         try (CloseableIterator<InternalRow> iterator = sortMergeReader.readBatch()) {
             actualRows.addAll(materializeRows(iterator, fieldGetters));
         }
-        assertThat(actualRows).hasSize(20);
-        List<LogRecord> excepted = createRecords(0, 5, false);
-        excepted.addAll(createRecords(5, 10, true));
-        excepted.addAll(createRecords(15, 5, false));
-        ProjectedRow projectedRow = ProjectedRow.from(projectedFields);
-        assertThat(actualRows)
-                .isEqualTo(
-                        materializeRows(
-                                projected(
-                                        CloseableIterator.wrap(excepted.iterator()), projectedRow),
-                                fieldGetters));
+        assertThat(actualRows).hasSize(30);
+
+        List<LogRecord> expectedLogRecords = createRecords(0, 5, false);
+        expectedLogRecords.addAll(createRecords(5, 20, true));
+        expectedLogRecords.addAll(createRecords(25, 5, false));
+        ProjectedRow projectedRow = isProjected ? ProjectedRow.from(projectedFields) : null;
+        CloseableIterator<InternalRow> expected =
+                isProjected
+                        ? projected(
+                                CloseableIterator.wrap(expectedLogRecords.iterator()), projectedRow)
+                        : CloseableIterator.wrap(
+                                expectedLogRecords.stream().map(LogRecord::getRow).iterator());
+        assertThat(actualRows).isEqualTo(materializeRows(expected, fieldGetters));
     }
 
     private CloseableIterator<InternalRow> projected(

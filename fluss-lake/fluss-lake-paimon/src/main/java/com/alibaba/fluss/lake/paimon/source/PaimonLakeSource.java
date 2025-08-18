@@ -67,11 +67,6 @@ public class PaimonLakeSource implements LakeSource<PaimonSplit> {
     }
 
     @Override
-    public int[][] getProject() {
-        return project;
-    }
-
-    @Override
     public void withLimit(int limit) {
         throw new UnsupportedOperationException("Not impl.");
     }
