@@ -42,8 +42,9 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.SortedMap;
+import java.util.Map;
 import java.util.TreeMap;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
@@ -64,7 +65,7 @@ public class LakeSnapshotAndLogSplitScanner implements BatchScanner {
     private final int[] newProjectedFields;
 
     // the sorted logs in memory, mapping from key -> value
-    private SortedMap<InternalRow, KeyValueRow> logRows;
+    private Map<InternalRow, KeyValueRow> logRows;
 
     private final LogScanner logScanner;
     private final long stoppingOffset;
@@ -194,7 +195,7 @@ public class LakeSnapshotAndLogSplitScanner implements BatchScanner {
                 if (lakeSnapshotSplitAndFlussLogSplit.getLakeSplits() == null
                         || lakeSnapshotSplitAndFlussLogSplit.getLakeSplits().isEmpty()) {
                     lakeRecordIterators = Collections.emptyList();
-                    logRows = new TreeMap<>();
+                    logRows = new LinkedHashMap<>();
                 } else {
                     for (LakeSplit lakeSplit : lakeSnapshotSplitAndFlussLogSplit.getLakeSplits()) {
                         RecordReader reader = lakeSource.createRecordReader(() -> lakeSplit);
