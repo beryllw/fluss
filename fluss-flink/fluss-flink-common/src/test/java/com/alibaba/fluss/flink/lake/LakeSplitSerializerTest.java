@@ -56,7 +56,7 @@ public class LakeSplitSerializerTest {
 
     @Test
     void testSerializeAndDeserializeLakeSnapshotSplit() throws IOException {
-        // 准备测试数据
+        // Prepare test data
         byte[] testData = "test-lake-split".getBytes();
         int serializerVersion = 3;
 
