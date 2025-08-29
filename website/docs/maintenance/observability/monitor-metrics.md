@@ -445,6 +445,8 @@ Some metrics might not be exposed when using other JVM implementations (e.g. IBM
           request_lookup
           request_prefixLookup
           request_metadata
+          request_fetchLogClient
+          request_fetchLogFollower
       </td>
       <td>requestsPerSecond</td>
       <td>The total number of requests processed per second for each request type.</td>
