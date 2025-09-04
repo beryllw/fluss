@@ -440,7 +440,7 @@ Some metrics might not be exposed when using other JVM implementations (e.g. IBM
     </tr>
     <tr>
       <td rowspan="7">
-          request_productLog
+          request_produceLog
           request_putKv
           request_lookup
           request_prefixLookup
