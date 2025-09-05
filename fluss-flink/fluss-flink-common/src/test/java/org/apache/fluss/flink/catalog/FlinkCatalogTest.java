@@ -289,9 +289,7 @@ class FlinkCatalogTest {
                 .hasMessage(
                         String.format(
                                 "The table %s already exists in %s catalog, please first drop the table in %s catalog or use a new table name.",
-                                this.tableInDefaultDb,
-                                PAIMON.name().toLowerCase(),
-                                PAIMON.name().toLowerCase()));
+                                this.tableInDefaultDb, "paimon", "paimon"));
     }
 
     @Test
