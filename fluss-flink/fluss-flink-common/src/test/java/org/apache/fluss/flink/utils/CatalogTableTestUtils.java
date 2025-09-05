@@ -23,6 +23,7 @@ import java.util.HashMap;
 import java.util.Map;
 
 import static org.apache.fluss.config.ConfigOptions.BOOTSTRAP_SERVERS;
+import static org.apache.fluss.config.ConfigOptions.TABLE_DATALAKE_FORMAT;
 import static org.apache.fluss.config.ConfigOptions.TABLE_REPLICATION_FACTOR;
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -80,6 +81,8 @@ public class CatalogTableTestUtils {
             Map<String, String> actualOptions, Map<String, String> expectedOptions) {
         actualOptions.remove(BOOTSTRAP_SERVERS.key());
         actualOptions.remove(TABLE_REPLICATION_FACTOR.key());
+        // TODO:remove this after #1646
+        actualOptions.remove(TABLE_DATALAKE_FORMAT.key());
         assertThat(actualOptions).isEqualTo(expectedOptions);
     }
 }

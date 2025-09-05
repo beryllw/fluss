@@ -381,7 +381,7 @@ public class FlinkCatalog extends AbstractCatalog {
             } else if (CatalogExceptionUtils.isTableAlreadyExist(t)) {
                 throw new TableAlreadyExistException(getName(), objectPath);
             } else if (CatalogExceptionUtils.isLakeTableAlreadyExist(t)) {
-                throw new TableAlreadyExistException("lakeCatalog", objectPath, t);
+                throw new CatalogException(t.getMessage());
             } else if (isTableInvalid(t)) {
                 throw new InvalidTableException(t.getMessage());
             } else {
