@@ -81,7 +81,7 @@ public class CatalogTableTestUtils {
             Map<String, String> actualOptions, Map<String, String> expectedOptions) {
         actualOptions.remove(BOOTSTRAP_SERVERS.key());
         actualOptions.remove(TABLE_REPLICATION_FACTOR.key());
-        // TODO:remove this after #1646
+        // Remove datalake format (auto-added when datalake is enabled in Fluss cluster)
         actualOptions.remove(TABLE_DATALAKE_FORMAT.key());
         assertThat(actualOptions).isEqualTo(expectedOptions);
     }

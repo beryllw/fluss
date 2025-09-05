@@ -89,6 +89,7 @@ class FlinkCatalogTest {
                     .setNumOfTabletServers(1)
                     .build();
 
+    private static final DataLakeFormat LAKE_FORMAT = DataLakeFormat.PAIMON;
     private static final String CATALOG_NAME = "test-catalog";
     private static final String DEFAULT_DB = "default";
     static Catalog catalog;
@@ -96,7 +97,7 @@ class FlinkCatalogTest {
 
     private static Configuration initConfig() {
         Configuration configuration = new Configuration();
-        configuration.set(ConfigOptions.DATALAKE_FORMAT, DataLakeFormat.PAIMON);
+        configuration.set(ConfigOptions.DATALAKE_FORMAT, LAKE_FORMAT);
         return configuration;
     }
 
@@ -271,7 +272,7 @@ class FlinkCatalogTest {
     void testCreateAlreadyExistsLakeTable() throws Exception {
         Map<String, String> options = new HashMap<>();
         options.put(TABLE_DATALAKE_ENABLED.key(), "true");
-        options.put(TABLE_DATALAKE_FORMAT.key(), DataLakeFormat.PAIMON.name());
+        options.put(TABLE_DATALAKE_FORMAT.key(), LAKE_FORMAT.name());
         assertThatThrownBy(() -> catalog.getTable(tableInDefaultDb))
                 .isInstanceOf(TableNotExistException.class)
                 .hasMessage(
@@ -289,7 +290,7 @@ class FlinkCatalogTest {
                 .hasMessage(
                         String.format(
                                 "The table %s already exists in %s catalog, please first drop the table in %s catalog or use a new table name.",
-                                this.tableInDefaultDb, "paimon", "paimon"));
+                                this.tableInDefaultDb, LAKE_FORMAT.name(), LAKE_FORMAT.name()));
     }
 
     @Test
