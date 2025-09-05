@@ -217,7 +217,7 @@ public enum Errors {
     LAKE_SNAPSHOT_NOT_EXIST(
             53, "The lake snapshot is not exist.", LakeTableSnapshotNotExistException::new),
     LAKE_TABLE_ALREADY_EXIST(
-            54, "The lake table is already exist.", LakeTableAlreadyExistException::new);
+            54, "The lake table already exists.", LakeTableAlreadyExistException::new);
 
     private static final Logger LOG = LoggerFactory.getLogger(Errors.class);
 
