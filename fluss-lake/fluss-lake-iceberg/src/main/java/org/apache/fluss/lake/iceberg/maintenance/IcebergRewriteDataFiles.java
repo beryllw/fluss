@@ -82,10 +82,15 @@ public class IcebergRewriteDataFiles {
         return this;
     }
 
-    private List<CombinedScanTask> planRewriteFileGroups() throws IOException {
+    private List<CombinedScanTask> planRewriteFileGroups(Long snapshotId) throws IOException {
         List<FileScanTask> fileScanTasks = new ArrayList<>();
         try (CloseableIterable<FileScanTask> tasks =
-                table.newScan().includeColumnStats().filter(filter).ignoreResiduals().planFiles()) {
+                table.newScan()
+                        .useSnapshot(snapshotId)
+                        .includeColumnStats()
+                        .filter(filter)
+                        .ignoreResiduals()
+                        .planFiles()) {
             tasks.forEach(fileScanTasks::add);
         }
 
@@ -137,7 +142,8 @@ public class IcebergRewriteDataFiles {
     public RewriteDataFileResult execute() {
         try {
             // plan the file groups to be rewrite
-            List<CombinedScanTask> tasksToRewrite = planRewriteFileGroups();
+            long latestSnapshotId = table.currentSnapshot().snapshotId();
+            List<CombinedScanTask> tasksToRewrite = planRewriteFileGroups(latestSnapshotId);
             if (tasksToRewrite.isEmpty()) {
                 return null;
             }
@@ -152,7 +158,7 @@ public class IcebergRewriteDataFiles {
                                 .collect(Collectors.toList()));
             }
             LOG.info("Finish rewriting files from {} to {}.", deletedDataFiles, addedDataFiles);
-            return new RewriteDataFileResult(deletedDataFiles, addedDataFiles);
+            return new RewriteDataFileResult(latestSnapshotId, deletedDataFiles, addedDataFiles);
         } catch (Exception e) {
             throw new RuntimeException(
                     String.format("Fail to compact bucket %s of table %s.", bucket, table.name()),
