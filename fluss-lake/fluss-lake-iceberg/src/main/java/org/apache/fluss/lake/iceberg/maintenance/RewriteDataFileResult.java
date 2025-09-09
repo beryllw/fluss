@@ -54,7 +54,9 @@ public class RewriteDataFileResult implements Serializable {
     @Override
     public String toString() {
         return "RewriteDataFileResult{"
-                + "deletedDataFiles="
+                + "snapshotId="
+                + snapshotId
+                + ", deletedDataFiles="
                 + deletedDataFiles
                 + ", addedDataFiles="
                 + addedDataFiles
