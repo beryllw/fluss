@@ -69,7 +69,7 @@ class IcebergRewriteITCase extends FlinkIcebergTieringTestBase {
     }
 
     @Test
-    void testPosDeleteCompaction() throws Exception {
+    void testPkTableCompaction() throws Exception {
         JobClient jobClient = buildTieringJob(execEnv);
         try {
             TablePath t1 = TablePath.of(DEFAULT_DB, "pk_table_1");
@@ -126,7 +126,7 @@ class IcebergRewriteITCase extends FlinkIcebergTieringTestBase {
     }
 
     @Test
-    void testPosDeleteDuringCompaction() throws Exception {
+    void testPkTableCompactionWithConflict() throws Exception {
         JobClient jobClient = buildTieringJob(execEnv);
         try {
             TablePath t1 = TablePath.of(DEFAULT_DB, "pk_table_2");
