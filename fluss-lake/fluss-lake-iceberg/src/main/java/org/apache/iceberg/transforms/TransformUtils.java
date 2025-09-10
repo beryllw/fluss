@@ -16,18 +16,11 @@
  * limitations under the License.
  */
 
-package org.apache.iceberg.data;
+package org.apache.iceberg.transforms;
 
-import org.apache.iceberg.FileScanTask;
-import org.apache.iceberg.TableScan;
-
-/**
- * GenericReader to read for records for iceberg. Extends from Iceberg {@link GenericReader} to
- * enable the {@link FileScanTask} method to be visible to Fluss.
- */
-public class IcebergGenericReader extends GenericReader {
-
-    public IcebergGenericReader(TableScan scan, boolean reuseContainers) {
-        super(scan, reuseContainers);
+/** TransformUtils enables the {@link Transform} class to be visible to Fluss. */
+public class TransformUtils {
+    public static boolean isBucketTransform(Transform<?, ?> transform) {
+        return transform instanceof Bucket<?>;
     }
 }
