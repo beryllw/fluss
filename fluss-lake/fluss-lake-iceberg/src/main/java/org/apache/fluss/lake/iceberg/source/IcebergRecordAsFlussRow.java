@@ -45,6 +45,11 @@ public class IcebergRecordAsFlussRow implements InternalRow {
         this.icebergRecord = icebergRecord;
     }
 
+    public IcebergRecordAsFlussRow replaceRow(Record icebergRecord) {
+        this.icebergRecord = icebergRecord;
+        return this;
+    }
+
     @Override
     public int getFieldCount() {
         return icebergRecord.struct().fields().size() - SYSTEM_COLUMNS.size();
