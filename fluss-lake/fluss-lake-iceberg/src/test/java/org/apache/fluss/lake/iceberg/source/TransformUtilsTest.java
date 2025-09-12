@@ -16,8 +16,11 @@
  * limitations under the License.
  */
 
-package org.apache.iceberg.transforms;
+package org.apache.fluss.lake.iceberg.source;
 
+import org.apache.iceberg.transforms.Transform;
+import org.apache.iceberg.transforms.TransformUtils;
+import org.apache.iceberg.transforms.Transforms;
 import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -26,13 +29,13 @@ import static org.assertj.core.api.Assertions.assertThat;
 public class TransformUtilsTest {
     @Test
     public void testIsBucketTransformWithBucketInstance() {
-        Transform<?, ?> bucketTransform = Bucket.get(16);
+        Transform<?, ?> bucketTransform = Transforms.bucket(16);
         assertThat(TransformUtils.isBucketTransform(bucketTransform)).isTrue();
     }
 
     @Test
     public void testIsBucketTransformWithNonBucketInstance() {
-        Transform<?, ?> identityTransform = Identity.get();
+        Transform<?, ?> identityTransform = Transforms.identity();
         assertThat(TransformUtils.isBucketTransform(identityTransform)).isFalse();
     }
 
