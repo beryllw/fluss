@@ -488,6 +488,6 @@ public class FlinkIcebergTieringTestBase {
                     return replica.getLogTablet().getLakeTableSnapshotId() >= 0;
                 },
                 Duration.ofMinutes(2),
-                "bucket " + tb + "not synced");
+                "bucket " + tb + " not synced");
     }
 }

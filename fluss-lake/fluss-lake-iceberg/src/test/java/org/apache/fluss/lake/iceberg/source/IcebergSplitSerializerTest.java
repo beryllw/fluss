@@ -45,7 +45,7 @@ class IcebergSplitSerializerTest extends IcebergSourceTestBase {
 
     @Test
     void testSerializeAndDeserialize() throws Exception {
-        // prepare paimon table
+        // prepare iceberg table
         TablePath tablePath = TablePath.of(DEFAULT_DB, DEFAULT_TABLE);
         Schema schema =
                 new Schema(
