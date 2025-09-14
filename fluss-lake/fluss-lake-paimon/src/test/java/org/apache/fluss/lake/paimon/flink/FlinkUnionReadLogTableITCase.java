@@ -84,7 +84,7 @@ class FlinkUnionReadLogTableITCase extends FlinkUnionReadTestBase {
 
         assertThat(actual).containsExactlyInAnyOrderElementsOf(writtenRows);
 
-        // can database sync job
+        // cancel the tiering job
         jobClient.cancel().get();
 
         // write some log data again
@@ -154,7 +154,7 @@ class FlinkUnionReadLogTableITCase extends FlinkUnionReadTestBase {
         assertResultsIgnoreOrder(
                 actual, writtenRows.stream().map(Row::toString).collect(Collectors.toList()), true);
 
-        // can database sync job
+        // cancel the tiering job
         jobClient.cancel().get();
 
         // write some log data again
