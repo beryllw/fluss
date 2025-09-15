@@ -89,8 +89,8 @@ class IcebergSplitPlannerTest extends IcebergSourceTestBase {
 
     @ParameterizedTest
     @ValueSource(booleans = {true, false})
-    void testLogTablePlanWithFlussBucket(boolean isPartitioned) throws Exception {
-        // prepare iceberg table
+    void testBucketUnawareLogTablePlan(boolean isPartitioned) throws Exception {
+        // prepare iceberg table which corresponding to a Fluss bucket unaware table log table
         TablePath tablePath =
                 TablePath.of(
                         DEFAULT_DB,
