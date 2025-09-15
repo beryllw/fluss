@@ -173,7 +173,7 @@ public class LakeSnapshotAndLogSplitScanner implements BatchScanner {
                 } else {
                     for (LakeSplit lakeSplit : lakeSnapshotSplitAndFlussLogSplit.getLakeSplits()) {
                         lakeRecordIterators.add(
-                                lakeSource.createRecordReader(() -> lakeSplit).read());
+                                lakeSource.createRecordReader(() -> lakeSplit, true).read());
                     }
                 }
             }
@@ -198,7 +198,7 @@ public class LakeSnapshotAndLogSplitScanner implements BatchScanner {
                     logRows = new LinkedHashMap<>();
                 } else {
                     for (LakeSplit lakeSplit : lakeSnapshotSplitAndFlussLogSplit.getLakeSplits()) {
-                        RecordReader reader = lakeSource.createRecordReader(() -> lakeSplit);
+                        RecordReader reader = lakeSource.createRecordReader(() -> lakeSplit, true);
                         if (reader instanceof SortedRecordReader) {
                             rowComparator = ((SortedRecordReader) reader).order();
                         } else {

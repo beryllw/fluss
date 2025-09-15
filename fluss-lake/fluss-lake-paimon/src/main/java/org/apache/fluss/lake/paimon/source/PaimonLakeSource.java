@@ -100,10 +100,11 @@ public class PaimonLakeSource implements LakeSource<PaimonSplit> {
     }
 
     @Override
-    public RecordReader createRecordReader(ReaderContext<PaimonSplit> context) throws IOException {
+    public RecordReader createRecordReader(ReaderContext<PaimonSplit> context, boolean readInOrder)
+            throws IOException {
         try (Catalog catalog = getCatalog()) {
             FileStoreTable fileStoreTable = getTable(catalog, tablePath);
-            if (fileStoreTable.primaryKeys().isEmpty()) {
+            if (fileStoreTable.primaryKeys().isEmpty() || !readInOrder) {
                 return new PaimonRecordReader(
                         fileStoreTable, context.lakeSplit(), project, predicate);
             } else {

@@ -30,28 +30,40 @@ import org.apache.fluss.row.TimestampNtz;
 import org.apache.fluss.types.DataTypes;
 
 import org.apache.flink.core.execution.JobClient;
+import org.apache.flink.core.execution.SavepointFormatType;
+import org.apache.flink.table.api.TableResult;
+import org.apache.flink.table.api.bridge.java.StreamTableEnvironment;
 import org.apache.flink.types.Row;
+import org.apache.flink.util.CloseableIterator;
 import org.apache.flink.util.CollectionUtil;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import javax.annotation.Nullable;
 
+import java.io.File;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.util.ArrayList;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 
+import static org.apache.fluss.flink.source.testutils.FlinkRowAssertionsUtils.assertResultsExactOrder;
+import static org.apache.fluss.flink.source.testutils.FlinkRowAssertionsUtils.assertResultsIgnoreOrder;
+import static org.apache.fluss.flink.source.testutils.FlinkRowAssertionsUtils.assertRowResultsIgnoreOrder;
 import static org.apache.fluss.testutils.DataTestUtils.row;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /** Test union read log table with full type. */
 public class FlinkUnionReadLogTableITCase extends FlinkUnionReadTestBase {
+    @TempDir public static File savepointDir;
+
     @BeforeAll
     protected static void beforeAll() {
         FlinkUnionReadTestBase.beforeAll();
@@ -129,6 +141,114 @@ public class FlinkUnionReadLogTableITCase extends FlinkUnionReadTestBase {
         }
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void testReadLogTableInStreamMode(boolean isPartitioned) throws Exception {
+        // first of all, start tiering
+        JobClient jobClient = buildTieringJob(execEnv);
+
+        String tableName = "stream_logTable_" + (isPartitioned ? "partitioned" : "non_partitioned");
+
+        TablePath t1 = TablePath.of(DEFAULT_DB, tableName);
+        List<Row> writtenRows = new LinkedList<>();
+        long tableId = prepareLogTable(t1, DEFAULT_BUCKET_NUM, isPartitioned, writtenRows);
+        // wait until records has been synced
+        waitUntilBucketSynced(t1, tableId, DEFAULT_BUCKET_NUM, isPartitioned);
+
+        // now, start to read the log table, which will read iceberg
+        // may read fluss or not, depends on the log offset of iceberg snapshot
+        CloseableIterator<Row> actual =
+                streamTEnv.executeSql("select * from " + tableName).collect();
+        assertResultsIgnoreOrder(
+                actual, writtenRows.stream().map(Row::toString).collect(Collectors.toList()), true);
+
+        // cancel the tiering job
+        jobClient.cancel().get();
+
+        // write some log data again
+        writtenRows.addAll(writeRows(t1, 3, isPartitioned));
+
+        // query the log table again and check the data
+        // it should read both iceberg snapshot and fluss log
+        actual =
+                streamTEnv
+                        .executeSql(
+                                "select * from "
+                                        + tableName
+                                        + " /*+ OPTIONS('scan.partition.discovery.interval'='100ms') */")
+                        .collect();
+        if (isPartitioned) {
+            // we write to a new partition to verify partition discovery
+            writtenRows.addAll(writeFullTypeRows(t1, 10, "3027"));
+        }
+        assertResultsIgnoreOrder(
+                actual, writtenRows.stream().map(Row::toString).collect(Collectors.toList()), true);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void testUnionReadLogTableFailover(boolean isPartitioned) throws Exception {
+        // first of all, start tiering
+        JobClient jobClient = buildTieringJob(execEnv);
+
+        String tableName1 =
+                "restore_logTable_" + (isPartitioned ? "partitioned" : "non_partitioned");
+        String resultTableName =
+                "result_table" + (isPartitioned ? "partitioned" : "non_partitioned");
+
+        TablePath table1 = TablePath.of(DEFAULT_DB, tableName1);
+        TablePath resultTable = TablePath.of(DEFAULT_DB, resultTableName);
+        List<Row> writtenRows = new LinkedList<>();
+        long tableId = prepareLogTable(table1, DEFAULT_BUCKET_NUM, isPartitioned, writtenRows);
+        // wait until records has been synced
+        waitUntilBucketSynced(table1, tableId, DEFAULT_BUCKET_NUM, isPartitioned);
+
+        StreamTableEnvironment streamTEnv = buildSteamTEnv(null);
+        // now, start to read the log table to write to a fluss result table
+        // may read fluss or not, depends on the log offset of iceberg snapshot
+        createFullTypeLogTable(resultTable, DEFAULT_BUCKET_NUM, isPartitioned, false);
+        TableResult insertResult =
+                streamTEnv.executeSql(
+                        "insert into " + resultTableName + " select * from " + tableName1);
+
+        CloseableIterator<Row> actual =
+                streamTEnv.executeSql("select * from " + resultTableName).collect();
+        if (isPartitioned) {
+            assertRowResultsIgnoreOrder(actual, writtenRows, false);
+        } else {
+            assertResultsExactOrder(actual, writtenRows, false);
+        }
+
+        // now, stop the job with save point
+        String savepointPath =
+                insertResult
+                        .getJobClient()
+                        .get()
+                        .stopWithSavepoint(
+                                false,
+                                savepointDir.getAbsolutePath(),
+                                SavepointFormatType.CANONICAL)
+                        .get();
+
+        // re buildSteamTEnv
+        streamTEnv = buildSteamTEnv(savepointPath);
+        insertResult =
+                streamTEnv.executeSql(
+                        "insert into " + resultTableName + " select * from " + tableName1);
+
+        // write some log data again
+        List<Row> rows = writeRows(table1, 3, isPartitioned);
+        if (isPartitioned) {
+            assertRowResultsIgnoreOrder(actual, rows, true);
+        } else {
+            assertResultsExactOrder(actual, rows, true);
+        }
+
+        // cancel jobs
+        insertResult.getJobClient().get().cancel().get();
+        jobClient.cancel().get();
+    }
+
     private long prepareLogTable(
             TablePath tablePath, int bucketNum, boolean isPartitioned, List<Row> flinkRows)
             throws Exception {
@@ -151,6 +271,12 @@ public class FlinkUnionReadLogTableITCase extends FlinkUnionReadTestBase {
     }
 
     protected long createFullTypeLogTable(TablePath tablePath, int bucketNum, boolean isPartitioned)
+            throws Exception {
+        return createFullTypeLogTable(tablePath, bucketNum, isPartitioned, true);
+    }
+
+    protected long createFullTypeLogTable(
+            TablePath tablePath, int bucketNum, boolean isPartitioned, boolean lakeEnabled)
             throws Exception {
         Schema.Builder schemaBuilder =
                 Schema.newBuilder()
@@ -175,6 +301,12 @@ public class FlinkUnionReadLogTableITCase extends FlinkUnionReadTestBase {
                         .distributedBy(bucketNum, "f_int")
                         .property(ConfigOptions.TABLE_DATALAKE_ENABLED.key(), "true")
                         .property(ConfigOptions.TABLE_DATALAKE_FRESHNESS, Duration.ofMillis(500));
+
+        if (lakeEnabled) {
+            tableBuilder
+                    .property(ConfigOptions.TABLE_DATALAKE_ENABLED.key(), "true")
+                    .property(ConfigOptions.TABLE_DATALAKE_FRESHNESS, Duration.ofMillis(500));
+        }
 
         if (isPartitioned) {
             schemaBuilder.column("p", DataTypes.STRING());

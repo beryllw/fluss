@@ -74,7 +74,7 @@ class PaimonSortedRecordReaderTest extends PaimonSourceTestBase {
         List<PaimonSplit> paimonSplits = lakeSource.createPlanner(snapshot::id).plan();
 
         for (PaimonSplit paimonSplit : paimonSplits) {
-            RecordReader recordReader = lakeSource.createRecordReader(() -> paimonSplit);
+            RecordReader recordReader = lakeSource.createRecordReader(() -> paimonSplit, true);
             assertThat(recordReader).isInstanceOf(PaimonSortedRecordReader.class);
             CloseableIterator<LogRecord> iterator = recordReader.read();
             assertThat(

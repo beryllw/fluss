@@ -21,10 +21,13 @@ package org.apache.fluss.lake.iceberg.flink;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.lake.iceberg.testutils.FlinkIcebergTieringTestBase;
 
+import org.apache.flink.configuration.Configuration;
 import org.apache.flink.table.api.EnvironmentSettings;
 import org.apache.flink.table.api.bridge.java.StreamTableEnvironment;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
+
+import javax.annotation.Nullable;
 
 import static org.apache.fluss.flink.FlinkConnectorOptions.BOOTSTRAP_SERVERS;
 
@@ -35,6 +38,7 @@ class FlinkUnionReadTestBase extends FlinkIcebergTieringTestBase {
     protected static final String CATALOG_NAME = "test_iceberg_lake";
     protected static final int DEFAULT_BUCKET_NUM = 1;
     StreamTableEnvironment batchTEnv;
+    StreamTableEnvironment streamTEnv;
 
     @BeforeAll
     protected static void beforeAll() {
@@ -54,5 +58,25 @@ class FlinkUnionReadTestBase extends FlinkIcebergTieringTestBase {
                         CATALOG_NAME, BOOTSTRAP_SERVERS.key(), bootstrapServers));
         batchTEnv.executeSql("use catalog " + CATALOG_NAME);
         batchTEnv.executeSql("use " + DEFAULT_DB);
+        buildSteamTEnv(null);
+    }
+
+    protected StreamTableEnvironment buildSteamTEnv(@Nullable String savepointPath) {
+        Configuration conf = new Configuration();
+        if (savepointPath != null) {
+            conf.setString("execution.savepoint.path", savepointPath);
+            execEnv.configure(conf);
+        }
+        String bootstrapServers = String.join(",", clientConf.get(ConfigOptions.BOOTSTRAP_SERVERS));
+        // create table environment
+        streamTEnv = StreamTableEnvironment.create(execEnv, EnvironmentSettings.inStreamingMode());
+        // crate catalog using sql
+        streamTEnv.executeSql(
+                String.format(
+                        "create catalog %s with ('type' = 'fluss', '%s' = '%s')",
+                        CATALOG_NAME, BOOTSTRAP_SERVERS.key(), bootstrapServers));
+        streamTEnv.executeSql("use catalog " + CATALOG_NAME);
+        streamTEnv.executeSql("use " + DEFAULT_DB);
+        return streamTEnv;
     }
 }

@@ -131,7 +131,7 @@ class PaimonLakeSourceTest extends PaimonSourceTestBase {
         org.apache.fluss.row.InternalRow.FieldGetter[] fieldGetters =
                 org.apache.fluss.row.InternalRow.createFieldGetters(
                         RowType.of(new IntType(), new StringType()));
-        RecordReader recordReader = lakeSource.createRecordReader(() -> paimonSplit);
+        RecordReader recordReader = lakeSource.createRecordReader(() -> paimonSplit, false);
         try (CloseableIterator<LogRecord> iterator = recordReader.read()) {
             actual.addAll(
                     convertToFlinkRow(

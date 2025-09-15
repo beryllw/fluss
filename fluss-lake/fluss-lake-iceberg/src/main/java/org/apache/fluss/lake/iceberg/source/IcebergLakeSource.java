@@ -72,9 +72,14 @@ public class IcebergLakeSource implements LakeSource<IcebergSplit> {
     }
 
     @Override
-    public RecordReader createRecordReader(ReaderContext<IcebergSplit> context) throws IOException {
+    public RecordReader createRecordReader(ReaderContext<IcebergSplit> context, boolean readInOrder)
+            throws IOException {
         Catalog catalog = IcebergCatalogUtils.createIcebergCatalog(icebergConfig);
         Table table = catalog.loadTable(toIceberg(tablePath));
+        if (readInOrder) {
+            // TODO: Support iceberg table sorted read. #1707
+            throw new UnsupportedOperationException("Iceberg sorted read not impl.");
+        }
         return new IcebergRecordReader(context.lakeSplit().fileScanTask(), table, project);
     }
 

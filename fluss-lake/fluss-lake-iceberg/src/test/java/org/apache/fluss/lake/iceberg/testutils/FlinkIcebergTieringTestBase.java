@@ -219,6 +219,29 @@ public class FlinkIcebergTieringTestBase {
         return admin.getTableInfo(tablePath).get().getTableId();
     }
 
+    protected void assertReplicaStatus(
+            TablePath tablePath,
+            long tableId,
+            int bucketCount,
+            boolean isPartitioned,
+            Map<TableBucket, Long> expectedLogEndOffset) {
+        if (isPartitioned) {
+            Map<Long, String> partitionById =
+                    waitUntilPartitions(FLUSS_CLUSTER_EXTENSION.getZooKeeperClient(), tablePath);
+            for (Long partitionId : partitionById.keySet()) {
+                for (int i = 0; i < bucketCount; i++) {
+                    TableBucket tableBucket = new TableBucket(tableId, partitionId, i);
+                    assertReplicaStatus(tableBucket, expectedLogEndOffset.get(tableBucket));
+                }
+            }
+        } else {
+            for (int i = 0; i < bucketCount; i++) {
+                TableBucket tableBucket = new TableBucket(tableId, i);
+                assertReplicaStatus(tableBucket, expectedLogEndOffset.get(tableBucket));
+            }
+        }
+    }
+
     protected void assertReplicaStatus(TableBucket tb, long expectedLogEndOffset) {
         retry(
                 Duration.ofMinutes(1),
@@ -229,6 +252,18 @@ public class FlinkIcebergTieringTestBase {
                             .isGreaterThanOrEqualTo(0);
                     assertThat(replica.getLakeLogEndOffset()).isEqualTo(expectedLogEndOffset);
                 });
+    }
+
+    /**
+     * Wait until the default number of partitions is created. Return the map from partition id to
+     * partition name. .
+     */
+    public static Map<Long, String> waitUntilPartitions(
+            ZooKeeperClient zooKeeperClient, TablePath tablePath) {
+        return waitUntilPartitions(
+                zooKeeperClient,
+                tablePath,
+                ConfigOptions.TABLE_AUTO_PARTITION_NUM_PRECREATE.defaultValue());
     }
 
     public static Map<Long, String> waitUntilPartitions(TablePath tablePath) {

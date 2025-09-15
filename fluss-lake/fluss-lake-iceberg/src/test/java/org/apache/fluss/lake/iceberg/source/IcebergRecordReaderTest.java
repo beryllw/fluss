@@ -112,7 +112,7 @@ class IcebergRecordReaderTest extends IcebergSourceTestBase {
 
         LakeSource<IcebergSplit> lakeSource = lakeStorage.createLakeSource(tablePath);
         for (IcebergSplit icebergSplit : lakeSource.createPlanner(snapshot::snapshotId).plan()) {
-            RecordReader recordReader = lakeSource.createRecordReader(() -> icebergSplit);
+            RecordReader recordReader = lakeSource.createRecordReader(() -> icebergSplit, false);
             CloseableIterator<LogRecord> iterator = recordReader.read();
             actual.addAll(
                     convertToFlinkRow(
@@ -132,7 +132,7 @@ class IcebergRecordReaderTest extends IcebergSourceTestBase {
 
         List<Row> projectActual = new ArrayList<>();
         for (IcebergSplit icebergSplit : lakeSource.createPlanner(snapshot::snapshotId).plan()) {
-            RecordReader recordReader = lakeSource.createRecordReader(() -> icebergSplit);
+            RecordReader recordReader = lakeSource.createRecordReader(() -> icebergSplit, false);
             CloseableIterator<LogRecord> iterator = recordReader.read();
             projectActual.addAll(
                     convertToFlinkRow(

@@ -53,7 +53,8 @@ public class LakeSnapshotScanner implements BatchScanner {
                             lakeSource
                                     .createRecordReader(
                                             (LakeSource.ReaderContext<LakeSplit>)
-                                                    lakeSnapshotSplit::getLakeSplit)
+                                                    lakeSnapshotSplit::getLakeSplit,
+                                            false)
                                     .read());
         }
         return rowsIterator.hasNext() ? rowsIterator : null;
