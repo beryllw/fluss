@@ -23,4 +23,8 @@ public class TransformUtils {
     public static boolean isBucketTransform(Transform<?, ?> transform) {
         return transform instanceof Bucket<?>;
     }
+
+    public static boolean isIdentityTransform(Transform<?, ?> transform) {
+        return transform instanceof Identity<?>;
+    }
 }

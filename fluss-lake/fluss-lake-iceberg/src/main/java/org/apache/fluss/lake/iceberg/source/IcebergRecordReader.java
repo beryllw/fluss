@@ -71,8 +71,7 @@ public class IcebergRecordReader implements RecordReader {
         List<Types.NestedField> cols = new ArrayList<>(projects.length + 2);
 
         for (int[] project : projects) {
-            // iceberg field index starts from 1
-            cols.add(structType.field(project[0] + 1));
+            cols.add(structType.fields().get(project[0]));
         }
 
         cols.add(structType.field(OFFSET_COLUMN_NAME));

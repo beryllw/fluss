@@ -27,29 +27,39 @@ import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.data.GenericRecord;
 import org.apache.iceberg.types.Types;
-import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.Collections;
 import java.util.List;
 
+import static org.apache.fluss.metadata.TableDescriptor.BUCKET_COLUMN_NAME;
+import static org.apache.fluss.metadata.TableDescriptor.OFFSET_COLUMN_NAME;
+import static org.apache.fluss.metadata.TableDescriptor.TIMESTAMP_COLUMN_NAME;
 import static org.apache.iceberg.types.Types.NestedField.optional;
 import static org.apache.iceberg.types.Types.NestedField.required;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /** Test class for {@link IcebergSplitPlanner}. */
 class IcebergSplitPlannerTest extends IcebergSourceTestBase {
-    @Test
-    void testLogTablePlan() throws Exception {
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void testLogTablePlan(boolean isPartitioned) throws Exception {
         // prepare iceberg log table
-        TablePath tablePath = TablePath.of(DEFAULT_DB, "log_" + DEFAULT_TABLE);
+        TablePath tablePath =
+                TablePath.of(
+                        DEFAULT_DB, "log_" + (isPartitioned ? "partitioned_" : "") + DEFAULT_TABLE);
         Schema schema =
                 new Schema(
                         optional(1, "c1", Types.IntegerType.get()),
                         optional(2, "c2", Types.StringType.get()),
                         optional(3, "c3", Types.StringType.get()));
-        PartitionSpec partitionSpec = PartitionSpec.builderFor(schema).bucket("c1", 2).build();
+        PartitionSpec partitionSpec =
+                isPartitioned
+                        ? PartitionSpec.builderFor(schema).identity("c2").bucket("c1", 2).build()
+                        : PartitionSpec.builderFor(schema).bucket("c1", 2).build();
         createTable(tablePath, schema, partitionSpec);
 
         // write data
@@ -57,8 +67,8 @@ class IcebergSplitPlannerTest extends IcebergSourceTestBase {
         GenericRecord record1 = createIcebergRecord(schema, 12, "a", "A");
         GenericRecord record2 = createIcebergRecord(schema, 13, "b", "B");
 
-        writeRecord(table, Collections.singletonList(record1), null, 0);
-        writeRecord(table, Collections.singletonList(record2), null, 1);
+        writeRecord(table, Collections.singletonList(record1), isPartitioned ? "a" : null, 0);
+        writeRecord(table, Collections.singletonList(record2), isPartitioned ? "b" : null, 1);
 
         // refresh table
         table.refresh();
@@ -67,26 +77,43 @@ class IcebergSplitPlannerTest extends IcebergSourceTestBase {
         LakeSource<IcebergSplit> lakeSource = lakeStorage.createLakeSource(tablePath);
         List<IcebergSplit> icebergSplits = lakeSource.createPlanner(snapshot::snapshotId).plan();
         assertThat(icebergSplits.size()).isEqualTo(2);
-        // Log table is not bucket-aware
-        assertThat(icebergSplits.get(0).bucket()).isEqualTo(-1);
-        assertThat(icebergSplits.get(1).bucket()).isEqualTo(-1);
+        // Log table with bucket-aware
+        assertThat(icebergSplits.stream().map(IcebergSplit::bucket))
+                .containsExactlyInAnyOrder(0, 1);
+        if (isPartitioned) {
+            assertThat(icebergSplits.stream().map(IcebergSplit::partition))
+                    .containsExactlyInAnyOrder(
+                            Collections.singletonList("a"), Collections.singletonList("b"));
+        }
     }
 
-    @Test
-    void testLogTablePlanWithFlussBucket() throws Exception {
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void testLogTablePlanWithFlussBucket(boolean isPartitioned) throws Exception {
         // prepare iceberg table
-        TablePath tablePath = TablePath.of(DEFAULT_DB, "log_" + DEFAULT_TABLE + "_fluss_bucket");
+        TablePath tablePath =
+                TablePath.of(
+                        DEFAULT_DB,
+                        "log_"
+                                + (isPartitioned ? "partitioned_" : "")
+                                + DEFAULT_TABLE
+                                + "_fluss_bucket");
         Schema schema =
                 new Schema(
                         optional(1, "c1", Types.IntegerType.get()),
                         optional(2, "c2", Types.StringType.get()),
                         optional(3, "c3", Types.StringType.get()),
                         // System columns
-                        required(14, "__bucket", Types.IntegerType.get()),
-                        required(15, "__offset", Types.LongType.get()),
-                        required(16, "__timestamp", Types.TimestampType.withZone()));
+                        required(14, BUCKET_COLUMN_NAME, Types.IntegerType.get()),
+                        required(15, OFFSET_COLUMN_NAME, Types.LongType.get()),
+                        required(16, TIMESTAMP_COLUMN_NAME, Types.TimestampType.withZone()));
         PartitionSpec partitionSpec =
-                PartitionSpec.builderFor(schema).bucket("__bucket", 2).build();
+                isPartitioned
+                        ? PartitionSpec.builderFor(schema)
+                                .identity("c2")
+                                .identity(BUCKET_COLUMN_NAME)
+                                .build()
+                        : PartitionSpec.builderFor(schema).identity(BUCKET_COLUMN_NAME).build();
         createTable(tablePath, schema, partitionSpec);
 
         // write data
@@ -98,8 +125,8 @@ class IcebergSplitPlannerTest extends IcebergSourceTestBase {
                 createIcebergRecord(
                         schema, 13, "b", "B", 1, 200L, OffsetDateTime.now(ZoneOffset.UTC));
 
-        writeRecord(table, Collections.singletonList(record1), null, 0);
-        writeRecord(table, Collections.singletonList(record2), null, 1);
+        writeRecord(table, Collections.singletonList(record1), isPartitioned ? "a" : null, 0);
+        writeRecord(table, Collections.singletonList(record2), isPartitioned ? "b" : null, 1);
 
         // refresh table
         table.refresh();
@@ -111,41 +138,10 @@ class IcebergSplitPlannerTest extends IcebergSourceTestBase {
         // Log table is not bucket-aware
         assertThat(icebergSplits.get(0).bucket()).isEqualTo(-1);
         assertThat(icebergSplits.get(1).bucket()).isEqualTo(-1);
-    }
-
-    @Test
-    void testLogPartitionTablePlan() throws Exception {
-        // prepare iceberg table
-        TablePath tablePath = TablePath.of(DEFAULT_DB, "log_partition_" + DEFAULT_TABLE);
-        Schema schema =
-                new Schema(
-                        optional(1, "c1", Types.IntegerType.get()),
-                        optional(2, "c2", Types.StringType.get()),
-                        optional(3, "c3", Types.StringType.get()));
-        PartitionSpec partitionSpec =
-                PartitionSpec.builderFor(schema).identity("c2").bucket("c1", 2).build();
-        createTable(tablePath, schema, partitionSpec);
-
-        // write data
-        Table table = getTable(tablePath);
-        GenericRecord record1 = createIcebergRecord(schema, 12, "a", "A");
-        GenericRecord record2 = createIcebergRecord(schema, 13, "b", "B");
-
-        writeRecord(table, Collections.singletonList(record1), "a", 0);
-        writeRecord(table, Collections.singletonList(record2), "b", 1);
-
-        // refresh table
-        table.refresh();
-        Snapshot snapshot = table.currentSnapshot();
-
-        LakeSource<IcebergSplit> lakeSource = lakeStorage.createLakeSource(tablePath);
-        List<IcebergSplit> icebergSplits = lakeSource.createPlanner(snapshot::snapshotId).plan();
-        assertThat(icebergSplits.size()).isEqualTo(2);
-        // Log table is not bucket-aware
-        assertThat(icebergSplits.get(0).bucket()).isEqualTo(-1);
-        assertThat(icebergSplits.get(1).bucket()).isEqualTo(-1);
-        assertThat(icebergSplits.stream().map(IcebergSplit::partition))
-                .containsExactlyInAnyOrder(
-                        Collections.singletonList("a"), Collections.singletonList("b"));
+        if (isPartitioned) {
+            assertThat(icebergSplits.stream().map(IcebergSplit::partition))
+                    .containsExactlyInAnyOrder(
+                            Collections.singletonList("a"), Collections.singletonList("b"));
+        }
     }
 }

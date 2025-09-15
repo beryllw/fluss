@@ -26,6 +26,7 @@ import org.apache.fluss.metadata.TablePath;
 import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.PartitionField;
 import org.apache.iceberg.PartitionSpec;
+import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.io.CloseableIterable;
@@ -36,9 +37,11 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.function.Function;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
 import static org.apache.fluss.lake.iceberg.utils.IcebergConversions.toIceberg;
+import static org.apache.fluss.metadata.TableDescriptor.BUCKET_COLUMN_NAME;
 
 /** Iceberg split planner. */
 public class IcebergSplitPlanner implements Planner<IcebergSplit> {
@@ -46,6 +49,12 @@ public class IcebergSplitPlanner implements Planner<IcebergSplit> {
     private final Configuration icebergConfig;
     private final TablePath tablePath;
     private final long snapshotId;
+    private static final Predicate<PartitionField> isBucketField =
+            field -> TransformUtils.isBucketTransform(field.transform());
+    private static final Predicate<PartitionField> isIdentityBucketField =
+            field ->
+                    TransformUtils.isIdentityTransform(field.transform())
+                            && field.name().equals(BUCKET_COLUMN_NAME);
 
     public IcebergSplitPlanner(Configuration icebergConfig, TablePath tablePath, long snapshotId) {
         this.icebergConfig = icebergConfig;
@@ -59,6 +68,7 @@ public class IcebergSplitPlanner implements Planner<IcebergSplit> {
         Catalog catalog = IcebergCatalogUtils.createIcebergCatalog(icebergConfig);
         Table table = catalog.loadTable(toIceberg(tablePath));
         Function<FileScanTask, List<String>> partitionExtract = createPartitionExtractor(table);
+        Function<FileScanTask, Integer> bucketExtractor = createBucketExtractor(table);
         try (CloseableIterable<FileScanTask> tasks =
                 table.newScan()
                         .useSnapshot(snapshotId)
@@ -66,9 +76,42 @@ public class IcebergSplitPlanner implements Planner<IcebergSplit> {
                         .ignoreResiduals()
                         .planFiles()) {
             tasks.forEach(
-                    task -> splits.add(new IcebergSplit(task, -1, partitionExtract.apply(task))));
+                    task ->
+                            splits.add(
+                                    new IcebergSplit(
+                                            task,
+                                            bucketExtractor.apply(task),
+                                            partitionExtract.apply(task))));
         }
         return splits;
+    }
+
+    private Function<FileScanTask, Integer> createBucketExtractor(Table table) {
+        Schema schema = table.schema();
+        PartitionSpec partitionSpec = table.spec();
+        List<PartitionField> partitionFields = partitionSpec.fields();
+
+        List<PartitionField> bucketFields =
+                partitionFields.stream()
+                        .filter(isBucketField.or(isIdentityBucketField))
+                        .collect(Collectors.toList());
+
+        if (bucketFields.size() != 1) {
+            throw new UnsupportedOperationException(
+                    String.format(
+                            "Only one bucket key is supported for Iceberg at the moment, but found %d",
+                            bucketFields.size()));
+        }
+
+        PartitionField bucketField = bucketFields.get(0);
+        if (isIdentityBucketField.test(bucketField)) {
+            return task -> -1;
+        }
+        Types.StructType partitionType = partitionSpec.partitionType();
+        int bucketFieldIndex =
+                partitionType.fields().indexOf(partitionType.field(bucketField.fieldId()));
+
+        return task -> task.file().partition().get(bucketFieldIndex, Integer.class);
     }
 
     private Function<FileScanTask, List<String>> createPartitionExtractor(Table table) {
@@ -76,9 +119,9 @@ public class IcebergSplitPlanner implements Planner<IcebergSplit> {
         List<PartitionField> partitionFields = partitionSpec.fields();
         Types.StructType partitionType = partitionSpec.partitionType();
 
-        List<Integer> nonBucketFieldIndices =
+        List<Integer> partitionFieldIndices =
                 partitionFields.stream()
-                        .filter(field -> !TransformUtils.isBucketTransform(field.transform()))
+                        .filter(field -> !isBucketField.or(isIdentityBucketField).test(field))
                         .map(
                                 field ->
                                         partitionType
@@ -87,7 +130,7 @@ public class IcebergSplitPlanner implements Planner<IcebergSplit> {
                         .collect(Collectors.toList());
 
         return task ->
-                nonBucketFieldIndices.stream()
+                partitionFieldIndices.stream()
                         .map(index -> task.partition().get(index, String.class))
                         .collect(Collectors.toList());
     }
