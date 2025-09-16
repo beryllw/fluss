@@ -101,7 +101,7 @@ class PaimonRecordReaderTest extends PaimonSourceTestBase {
         InternalRow.FieldGetter[] fieldGetters =
                 InternalRow.createFieldGetters(getFlussRowType(isPartitioned));
         for (PaimonSplit paimonSplit : paimonSplits) {
-            RecordReader recordReader = lakeSource.createRecordReader(() -> paimonSplit, false);
+            RecordReader recordReader = lakeSource.createRecordReader(() -> paimonSplit);
             CloseableIterator<LogRecord> iterator = recordReader.read();
             actual.addAll(
                     convertToFlinkRow(
@@ -136,7 +136,7 @@ class PaimonRecordReaderTest extends PaimonSourceTestBase {
                 InternalRow.createFieldGetters(
                         RowType.of(new FloatType(), new TinyIntType(), new IntType()));
         for (PaimonSplit paimonSplit : paimonSplits) {
-            RecordReader recordReader = lakeSource.createRecordReader(() -> paimonSplit, false);
+            RecordReader recordReader = lakeSource.createRecordReader(() -> paimonSplit);
             CloseableIterator<LogRecord> iterator = recordReader.read();
             actual.addAll(
                     convertToFlinkRow(

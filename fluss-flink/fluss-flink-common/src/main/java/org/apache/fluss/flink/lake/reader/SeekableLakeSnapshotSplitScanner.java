@@ -89,8 +89,7 @@ public class SeekableLakeSnapshotSplitScanner implements BatchScanner {
             LakeSplit split = lakeSplits.get(currentLakeSplitIndex);
             CloseableIterator<LogRecord> lakeRecords =
                     lakeSource
-                            .createRecordReader(
-                                    (LakeSource.ReaderContext<LakeSplit>) () -> split, false)
+                            .createRecordReader((LakeSource.ReaderContext<LakeSplit>) () -> split)
                             .read();
             currentLakeRecordIterator =
                     new IndexedLakeSplitRecordIterator(lakeRecords, currentLakeSplitIndex);

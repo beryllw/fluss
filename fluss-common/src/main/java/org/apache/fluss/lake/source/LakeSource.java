@@ -69,12 +69,10 @@ public interface LakeSource<Split extends LakeSplit> extends Serializable {
      * Creates a record reader for reading data from the lake source for the specified split.
      *
      * @param context The reader context containing the split to be read
-     * @param readInOrder Whether the reader should read lake data in order
      * @return A record reader instance for the given split
      * @throws IOException if an error occurs during reader creation
      */
-    RecordReader createRecordReader(ReaderContext<Split> context, boolean readInOrder)
-            throws IOException;
+    RecordReader createRecordReader(ReaderContext<Split> context) throws IOException;
 
     /**
      * Returns the serializer for the data split, used to transfer split information in distributed

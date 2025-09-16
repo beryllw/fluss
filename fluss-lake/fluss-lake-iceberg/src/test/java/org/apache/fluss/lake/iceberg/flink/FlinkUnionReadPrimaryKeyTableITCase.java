@@ -51,38 +51,9 @@ import java.util.Map;
 import static org.apache.fluss.flink.source.testutils.FlinkRowAssertionsUtils.assertResultsExactOrder;
 import static org.apache.fluss.flink.source.testutils.FlinkRowAssertionsUtils.assertRowResultsIgnoreOrder;
 import static org.apache.fluss.testutils.DataTestUtils.row;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Test case for union read primary key table. */
 public class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
-
-    @ParameterizedTest
-    @ValueSource(booleans = {false, true})
-    void testUnionReadFullType(Boolean isPartitioned) throws Exception {
-        // first of all, start tiering
-        JobClient jobClient = buildTieringJob(execEnv);
-
-        String tableName = "pk_table_full" + (isPartitioned ? "_partitioned" : "_non_partitioned");
-        TablePath t1 = TablePath.of(DEFAULT_DB, tableName);
-        Map<TableBucket, Long> bucketLogEndOffset = new HashMap<>();
-        // create table & write initial data
-        long tableId =
-                preparePKTableFullType(t1, DEFAULT_BUCKET_NUM, isPartitioned, bucketLogEndOffset);
-
-        // wait unit records have been synced
-        waitUntilBucketSynced(t1, tableId, DEFAULT_BUCKET_NUM, isPartitioned);
-
-        // check the status of replica after synced
-        assertReplicaStatus(t1, tableId, DEFAULT_BUCKET_NUM, isPartitioned, bucketLogEndOffset);
-
-        // iceberg not support sorted read yet, throw UnsupportedOperationException
-        assertThatThrownBy(
-                        () -> batchTEnv.executeSql("select * from " + tableName).collect().next())
-                .rootCause()
-                .isInstanceOf(UnsupportedOperationException.class)
-                .hasMessage("Iceberg sorted read not impl.");
-    }
-
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
     void testUnionReadInStreamMode(Boolean isPartitioned) throws Exception {
