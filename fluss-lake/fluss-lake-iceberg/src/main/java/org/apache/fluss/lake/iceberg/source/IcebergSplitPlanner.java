@@ -27,8 +27,12 @@ import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.PartitionField;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.TableScan;
 import org.apache.iceberg.catalog.Catalog;
+import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.io.CloseableIterable;
+
+import javax.annotation.Nullable;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -47,11 +51,14 @@ public class IcebergSplitPlanner implements Planner<IcebergSplit> {
     private final Configuration icebergConfig;
     private final TablePath tablePath;
     private final long snapshotId;
+    private final @Nullable Expression filter;
 
-    public IcebergSplitPlanner(Configuration icebergConfig, TablePath tablePath, long snapshotId) {
+    public IcebergSplitPlanner(
+            Configuration icebergConfig, TablePath tablePath, long snapshotId, Expression filter) {
         this.icebergConfig = icebergConfig;
         this.tablePath = tablePath;
         this.snapshotId = snapshotId;
+        this.filter = filter;
     }
 
     @Override
@@ -61,12 +68,11 @@ public class IcebergSplitPlanner implements Planner<IcebergSplit> {
         Table table = catalog.loadTable(toIceberg(tablePath));
         Function<FileScanTask, List<String>> partitionExtract = createPartitionExtractor(table);
         Function<FileScanTask, Integer> bucketExtractor = createBucketExtractor(table);
-        try (CloseableIterable<FileScanTask> tasks =
-                table.newScan()
-                        .useSnapshot(snapshotId)
-                        .includeColumnStats()
-                        .ignoreResiduals()
-                        .planFiles()) {
+        TableScan tableScan = table.newScan().useSnapshot(snapshotId).includeColumnStats();
+        if (filter != null) {
+            tableScan = tableScan.filter(filter);
+        }
+        try (CloseableIterable<FileScanTask> tasks = tableScan.planFiles()) {
             tasks.forEach(
                     task ->
                             splits.add(

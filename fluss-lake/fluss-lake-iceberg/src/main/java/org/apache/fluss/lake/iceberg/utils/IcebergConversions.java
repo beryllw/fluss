@@ -17,7 +17,13 @@
 
 package org.apache.fluss.lake.iceberg.utils;
 
+import org.apache.fluss.lake.iceberg.source.FlussRowAsIcebergRecord;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.row.GenericRow;
+import org.apache.fluss.row.InternalRow;
+import org.apache.fluss.types.DataType;
+import org.apache.fluss.types.DataTypes;
+import org.apache.fluss.types.RowType;
 
 import org.apache.iceberg.PartitionField;
 import org.apache.iceberg.PartitionKey;
@@ -27,6 +33,8 @@ import org.apache.iceberg.Table;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.expressions.Expressions;
+import org.apache.iceberg.types.Type;
+import org.apache.iceberg.types.Types;
 
 import javax.annotation.Nullable;
 
@@ -81,5 +89,51 @@ public class IcebergConversions {
         }
         expression = Expressions.and(expression, Expressions.equal(BUCKET_COLUMN_NAME, bucket));
         return expression;
+    }
+
+    public static Object toIcebergLiteral(Types.NestedField field, Object flussLiteral) {
+        InternalRow flussRow = GenericRow.of(flussLiteral);
+        FlussRowAsIcebergRecord flussRowAsIcebergRecord =
+                new FlussRowAsIcebergRecord(
+                        Types.StructType.of(field),
+                        RowType.of(convertIcebergTypeToFlussType(field.type())),
+                        flussRow);
+        return flussRowAsIcebergRecord.get(0, field.type().typeId().javaClass());
+    }
+
+    /**
+     * Converts Iceberg data types to Fluss data types for filter push-down. Currently, Fluss filter
+     * push-down only supports the following Iceberg types: boolean, int, long, double, time,
+     * timestamp, string, and decimal.
+     *
+     * <p>Refer to {@link org.apache.fluss.flink.utils.PushdownUtils} for details.
+     */
+    private static DataType convertIcebergTypeToFlussType(Type icebergType) {
+        if (icebergType instanceof Types.BooleanType) {
+            return DataTypes.BOOLEAN();
+        } else if (icebergType instanceof Types.IntegerType) {
+            return DataTypes.INT();
+        } else if (icebergType instanceof Types.LongType) {
+            return DataTypes.BIGINT();
+        } else if (icebergType instanceof Types.DoubleType) {
+            return DataTypes.DOUBLE();
+        } else if (icebergType instanceof Types.TimeType) {
+            return DataTypes.TIME();
+        } else if (icebergType instanceof Types.TimestampType) {
+            Types.TimestampType timestampType = (Types.TimestampType) icebergType;
+            if (timestampType.shouldAdjustToUTC()) {
+                return DataTypes.TIMESTAMP_LTZ();
+            } else {
+                return DataTypes.TIMESTAMP();
+            }
+        } else if (icebergType instanceof Types.StringType) {
+            return DataTypes.STRING();
+        } else if (icebergType instanceof Types.DecimalType) {
+            Types.DecimalType decimalType = (Types.DecimalType) icebergType;
+            return DataTypes.DECIMAL(decimalType.precision(), decimalType.scale());
+        }
+        throw new UnsupportedOperationException(
+                "Unsupported data type conversion for Iceberg type: "
+                        + icebergType.getClass().getName());
     }
 }

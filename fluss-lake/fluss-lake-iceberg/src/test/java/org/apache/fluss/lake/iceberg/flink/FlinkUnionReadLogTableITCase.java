@@ -111,10 +111,11 @@ public class FlinkUnionReadLogTableITCase extends FlinkUnionReadTestBase {
             String plan = batchTEnv.explainSql(sqlWithPartitionFilter);
 
             // check if the plan contains partition filter
-            // TODO: push down iceberg partition filter
+            // check filter push down
             assertThat(plan)
                     .contains("TableSourceScan(")
-                    .contains("LogicalFilter(condition=[=($15, _UTF-16LE'" + partition + "'");
+                    .contains("LogicalFilter(condition=[=($15, _UTF-16LE'" + partition + "'")
+                    .contains("filter=[=(p, _UTF-16LE'" + partition + "'");
 
             List<Row> expectedFiltered =
                     writtenRows.stream()

@@ -19,6 +19,7 @@
 package org.apache.fluss.lake.iceberg.source;
 
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.lake.iceberg.utils.FlussToIcebergPredicateConverter;
 import org.apache.fluss.lake.iceberg.utils.IcebergCatalogUtils;
 import org.apache.fluss.lake.serializer.SimpleVersionedSerializer;
 import org.apache.fluss.lake.source.LakeSource;
@@ -27,14 +28,18 @@ import org.apache.fluss.lake.source.RecordReader;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.predicate.Predicate;
 
+import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.catalog.Catalog;
+import org.apache.iceberg.expressions.Expression;
+import org.apache.iceberg.expressions.Expressions;
 
 import javax.annotation.Nullable;
 
 import java.io.IOException;
-import java.util.Collections;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 
 import static org.apache.fluss.lake.iceberg.utils.IcebergConversions.toIceberg;
 
@@ -44,6 +49,7 @@ public class IcebergLakeSource implements LakeSource<IcebergSplit> {
     private final Configuration icebergConfig;
     private final TablePath tablePath;
     private @Nullable int[][] project;
+    private @Nullable Expression filter;
 
     public IcebergLakeSource(Configuration icebergConfig, TablePath tablePath) {
         this.icebergConfig = icebergConfig;
@@ -62,24 +68,45 @@ public class IcebergLakeSource implements LakeSource<IcebergSplit> {
 
     @Override
     public FilterPushDownResult withFilters(List<Predicate> predicates) {
-        // TODO: Support filter push down. #1676
-        return FilterPushDownResult.of(Collections.emptyList(), predicates);
+        List<Predicate> unConsumedPredicates = new ArrayList<>();
+        List<Predicate> consumedPredicates = new ArrayList<>();
+        List<Expression> converted = new ArrayList<>();
+        Schema schema = getSchema(tablePath);
+        for (Predicate predicate : predicates) {
+            Optional<Expression> optPredicate =
+                    FlussToIcebergPredicateConverter.convert(schema, predicate);
+            if (optPredicate.isPresent()) {
+                consumedPredicates.add(predicate);
+                converted.add(optPredicate.get());
+            } else {
+                unConsumedPredicates.add(predicate);
+            }
+        }
+        if (!converted.isEmpty()) {
+            filter = converted.stream().reduce(Expressions::and).orElse(null);
+        }
+        return FilterPushDownResult.of(consumedPredicates, unConsumedPredicates);
     }
 
     @Override
     public Planner<IcebergSplit> createPlanner(PlannerContext context) throws IOException {
-        return new IcebergSplitPlanner(icebergConfig, tablePath, context.snapshotId());
+        return new IcebergSplitPlanner(icebergConfig, tablePath, context.snapshotId(), filter);
     }
 
     @Override
     public RecordReader createRecordReader(ReaderContext<IcebergSplit> context) throws IOException {
         Catalog catalog = IcebergCatalogUtils.createIcebergCatalog(icebergConfig);
         Table table = catalog.loadTable(toIceberg(tablePath));
-        return new IcebergRecordReader(context.lakeSplit().fileScanTask(), table, project);
+        return new IcebergRecordReader(context.lakeSplit().fileScanTask(), table, project, filter);
     }
 
     @Override
     public SimpleVersionedSerializer<IcebergSplit> getSplitSerializer() {
         return new IcebergSplitSerializer();
+    }
+
+    private Schema getSchema(TablePath tablePath) {
+        Catalog catalog = IcebergCatalogUtils.createIcebergCatalog(icebergConfig);
+        return catalog.loadTable(toIceberg(tablePath)).schema();
     }
 }

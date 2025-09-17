@@ -42,7 +42,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /** UT for {@link IcebergConversions}. */
 class IcebergConversionsTest {
-    ;
 
     @Test
     void testToPartition(@TempDir File tempWarehouseDir) {
