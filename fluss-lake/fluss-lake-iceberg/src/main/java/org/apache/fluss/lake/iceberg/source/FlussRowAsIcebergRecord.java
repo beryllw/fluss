@@ -171,7 +171,7 @@ public class FlussRowAsIcebergRecord implements Record {
             return row -> DateTimeUtils.toLocalTime(row.getInt(pos));
         } else {
             throw new UnsupportedOperationException(
-                    "Unsupported data type conversion for Fluss type:  "
+                    "Unsupported data type conversion for Fluss type: "
                             + flussType.getClass().getSimpleName());
         }
     }

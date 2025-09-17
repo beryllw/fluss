@@ -66,7 +66,6 @@ public class IcebergLakeSourceTest extends IcebergSourceTestBase {
                     required(3, "__bucket", Types.IntegerType.get()),
                     required(4, "__offset", Types.LongType.get()),
                     required(5, "__timestamp", Types.TimestampType.withZone()));
-    ;
 
     private static final PartitionSpec PARTITION_SPEC =
             PartitionSpec.builderFor(SCHEMA).bucket("id", DEFAULT_BUCKET_NUM).build();

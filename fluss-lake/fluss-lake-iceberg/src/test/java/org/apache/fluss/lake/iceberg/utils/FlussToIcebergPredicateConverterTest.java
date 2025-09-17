@@ -33,6 +33,7 @@ import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 
 import java.util.Arrays;
+import java.util.Optional;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -153,5 +154,18 @@ class FlussToIcebergPredicateConverterTest {
         Expression convertedIcebergExpression =
                 FlussToIcebergPredicateConverter.convert(ICEBERG_SCHEMA, flussPredicate).get();
         assertThat(convertedIcebergExpression.toString()).isEqualTo(expectedPredicate.toString());
+    }
+
+    public static Stream<Arguments> parametersNotSupported() {
+        return Stream.of(
+                Arguments.of(FLUSS_BUILDER.endsWith(2, fromString("end"))),
+                Arguments.of(FLUSS_BUILDER.contains(2, fromString("mid"))));
+    }
+
+    @ParameterizedTest
+    @MethodSource("parametersNotSupported")
+    void testNotSupportedPredicateConverter(Predicate flussPredicate) {
+        assertThat(FlussToIcebergPredicateConverter.convert(ICEBERG_SCHEMA, flussPredicate))
+                .isEqualTo(Optional.empty());
     }
 }
