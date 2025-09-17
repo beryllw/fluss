@@ -633,7 +633,7 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
         // create result table
         createSimplePkTable(resultTable, DEFAULT_BUCKET_NUM, isPartitioned, false);
         // union read lake data
-        StreamTableEnvironment streamTEnv = buildSteamTEnv(null);
+        StreamTableEnvironment streamTEnv = buildStreamTEnv(null);
         TableResult insertResult =
                 streamTEnv.executeSql(
                         "insert into " + resultTableName + " select * from " + tableName1);
@@ -670,8 +670,8 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
                                 SavepointFormatType.CANONICAL)
                         .get();
 
-        // re buildSteamTEnv
-        streamTEnv = buildSteamTEnv(savepointPath);
+        // re buildStreamTEnv
+        streamTEnv = buildStreamTEnv(savepointPath);
         insertResult =
                 streamTEnv.executeSql(
                         "insert into " + resultTableName + " select * from " + tableName1);

@@ -63,7 +63,7 @@ public class FlinkUnionReadTestBase extends FlinkPaimonTieringTestBase {
         return FLUSS_CLUSTER_EXTENSION;
     }
 
-    protected StreamTableEnvironment buildSteamTEnv(@Nullable String savepointPath) {
+    protected StreamTableEnvironment buildStreamTEnv(@Nullable String savepointPath) {
         Configuration conf = new Configuration();
         if (savepointPath != null) {
             conf.setString("execution.savepoint.path", savepointPath);
@@ -83,7 +83,7 @@ public class FlinkUnionReadTestBase extends FlinkPaimonTieringTestBase {
     }
 
     private void buildStreamTEnv() {
-        buildSteamTEnv(null);
+        buildStreamTEnv(null);
     }
 
     public void buildBatchTEnv() {

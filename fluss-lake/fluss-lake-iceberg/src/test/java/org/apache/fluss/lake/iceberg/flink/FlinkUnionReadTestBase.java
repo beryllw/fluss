@@ -58,10 +58,10 @@ class FlinkUnionReadTestBase extends FlinkIcebergTieringTestBase {
                         CATALOG_NAME, BOOTSTRAP_SERVERS.key(), bootstrapServers));
         batchTEnv.executeSql("use catalog " + CATALOG_NAME);
         batchTEnv.executeSql("use " + DEFAULT_DB);
-        buildSteamTEnv(null);
+        buildStreamTEnv(null);
     }
 
-    protected StreamTableEnvironment buildSteamTEnv(@Nullable String savepointPath) {
+    protected StreamTableEnvironment buildStreamTEnv(@Nullable String savepointPath) {
         Configuration conf = new Configuration();
         if (savepointPath != null) {
             conf.setString("execution.savepoint.path", savepointPath);

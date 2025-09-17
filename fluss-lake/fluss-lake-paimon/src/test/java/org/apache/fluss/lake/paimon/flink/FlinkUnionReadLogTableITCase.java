@@ -196,7 +196,7 @@ class FlinkUnionReadLogTableITCase extends FlinkUnionReadTestBase {
         // wait until records has been synced
         waitUntilBucketSynced(table1, tableId, DEFAULT_BUCKET_NUM, isPartitioned);
 
-        StreamTableEnvironment streamTEnv = buildSteamTEnv(null);
+        StreamTableEnvironment streamTEnv = buildStreamTEnv(null);
         // now, start to read the log table to write to a fluss result table
         // may read fluss or not, depends on the log offset of paimon snapshot
         createFullTypeLogTable(resultTable, DEFAULT_BUCKET_NUM, isPartitioned, false);
@@ -223,8 +223,8 @@ class FlinkUnionReadLogTableITCase extends FlinkUnionReadTestBase {
                                 SavepointFormatType.CANONICAL)
                         .get();
 
-        // re buildSteamTEnv
-        streamTEnv = buildSteamTEnv(savepointPath);
+        // re buildStreamTEnv
+        streamTEnv = buildStreamTEnv(savepointPath);
         insertResult =
                 streamTEnv.executeSql(
                         "insert into " + resultTableName + " select * from " + tableName1);
