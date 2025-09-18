@@ -45,7 +45,13 @@ import java.util.stream.IntStream;
 import static org.apache.fluss.metadata.TableDescriptor.OFFSET_COLUMN_NAME;
 import static org.apache.fluss.metadata.TableDescriptor.TIMESTAMP_COLUMN_NAME;
 
-/** Iceberg record reader. */
+/**
+ * Iceberg record reader. The filter is applied during the plan phase of IcebergSplitPlanner, so the
+ * RecordReader does not need to apply the filter again.
+ *
+ * <p>Refer to {@link org.apache.iceberg.data.GenericReader#open(FileScanTask)} and {@link
+ * org.apache.iceberg.Scan#ignoreResiduals()} for details.
+ */
 public class IcebergRecordReader implements RecordReader {
     protected IcebergRecordAsFlussRecordIterator iterator;
     protected @Nullable int[][] project;
