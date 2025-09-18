@@ -97,7 +97,7 @@ public class IcebergLakeSource implements LakeSource<IcebergSplit> {
     public RecordReader createRecordReader(ReaderContext<IcebergSplit> context) throws IOException {
         Catalog catalog = IcebergCatalogUtils.createIcebergCatalog(icebergConfig);
         Table table = catalog.loadTable(toIceberg(tablePath));
-        return new IcebergRecordReader(context.lakeSplit().fileScanTask(), table, project, filter);
+        return new IcebergRecordReader(context.lakeSplit().fileScanTask(), table, project);
     }
 
     @Override

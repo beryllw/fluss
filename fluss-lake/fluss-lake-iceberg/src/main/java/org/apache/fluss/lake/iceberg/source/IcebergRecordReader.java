@@ -31,7 +31,6 @@ import org.apache.iceberg.Table;
 import org.apache.iceberg.TableScan;
 import org.apache.iceberg.data.IcebergGenericReader;
 import org.apache.iceberg.data.Record;
-import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.types.Types;
 
@@ -51,20 +50,11 @@ public class IcebergRecordReader implements RecordReader {
     protected IcebergRecordAsFlussRecordIterator iterator;
     protected @Nullable int[][] project;
     protected Types.StructType struct;
-    private final @Nullable Expression filter;
 
-    public IcebergRecordReader(
-            FileScanTask fileScanTask,
-            Table table,
-            @Nullable int[][] project,
-            @Nullable Expression filter) {
-        this.filter = filter;
+    public IcebergRecordReader(FileScanTask fileScanTask, Table table, @Nullable int[][] project) {
         TableScan tableScan = table.newScan();
         if (project != null) {
             tableScan = applyProject(tableScan, project);
-        }
-        if (filter != null) {
-            tableScan = tableScan.filter(filter);
         }
         IcebergGenericReader reader = new IcebergGenericReader(tableScan, true);
         struct = tableScan.schema().asStruct();
