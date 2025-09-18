@@ -101,13 +101,7 @@ public class IcebergConversions {
         return flussRowAsIcebergRecord.get(0, field.type().typeId().javaClass());
     }
 
-    /**
-     * Converts Iceberg data types to Fluss data types for filter push-down. Currently, Fluss filter
-     * push-down only supports the following Iceberg types: boolean, int, long, double, time,
-     * timestamp, string, and decimal.
-     *
-     * <p>Refer to {@link org.apache.fluss.flink.utils.PushdownUtils} for details.
-     */
+    /** Converts Iceberg data types to Fluss data types. */
     private static DataType convertIcebergTypeToFlussType(Type icebergType) {
         if (icebergType instanceof Types.BooleanType) {
             return DataTypes.BOOLEAN();

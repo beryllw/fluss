@@ -21,14 +21,9 @@ package org.apache.fluss.lake.iceberg.source;
 import org.apache.fluss.lake.source.LakeSource;
 import org.apache.fluss.lake.source.RecordReader;
 import org.apache.fluss.metadata.TablePath;
-import org.apache.fluss.predicate.FieldRef;
-import org.apache.fluss.predicate.FunctionVisitor;
-import org.apache.fluss.predicate.LeafFunction;
-import org.apache.fluss.predicate.LeafPredicate;
 import org.apache.fluss.predicate.Predicate;
 import org.apache.fluss.predicate.PredicateBuilder;
 import org.apache.fluss.record.LogRecord;
-import org.apache.fluss.types.DataType;
 import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.types.IntType;
 import org.apache.fluss.types.RowType;
@@ -50,14 +45,13 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
-import java.util.Optional;
 
 import static org.apache.iceberg.types.Types.NestedField.optional;
 import static org.apache.iceberg.types.Types.NestedField.required;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /** Test filter push down in {@link IcebergLakeSource}. */
-public class IcebergLakeSourceTest extends IcebergSourceTestBase {
+class IcebergLakeSourceTest extends IcebergSourceTestBase {
 
     private static final Schema SCHEMA =
             new Schema(
@@ -148,12 +142,7 @@ public class IcebergLakeSourceTest extends IcebergSourceTestBase {
 
         // test mix one unaccepted filter
         Predicate nonConvertibleFilter =
-                new LeafPredicate(
-                        new UnSupportFilterFunction(),
-                        DataTypes.INT(),
-                        0,
-                        "f1",
-                        Collections.emptyList());
+                FLUSS_BUILDER.endsWith(1, org.apache.fluss.row.BinaryString.fromString("name"));
         allFilters = Arrays.asList(nonConvertibleFilter, filter1, filter2);
 
         filterPushDownResult = lakeSource.withFilters(allFilters);
@@ -168,35 +157,5 @@ public class IcebergLakeSourceTest extends IcebergSourceTestBase {
         assertThat(filterPushDownResult.acceptedPredicates()).isEmpty();
         assertThat(filterPushDownResult.remainingPredicates().toString())
                 .isEqualTo(allFilters.toString());
-    }
-
-    private static class UnSupportFilterFunction extends LeafFunction {
-
-        @Override
-        public boolean test(DataType type, Object field, List<Object> literals) {
-            return false;
-        }
-
-        @Override
-        public boolean test(
-                DataType type,
-                long rowCount,
-                Object min,
-                Object max,
-                Long nullCount,
-                List<Object> literals) {
-            return false;
-        }
-
-        @Override
-        public Optional<LeafFunction> negate() {
-            return Optional.empty();
-        }
-
-        @Override
-        public <T> T visit(FunctionVisitor<T> visitor, FieldRef fieldRef, List<Object> literals) {
-            throw new UnsupportedOperationException(
-                    "Unsupported filter function for test purpose.");
-        }
     }
 }
