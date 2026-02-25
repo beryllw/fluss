@@ -44,6 +44,12 @@ class SparkLogTableReadTest extends FlussSparkTestBase {
           Row(1000L, 25L, 605, "addr5") :: Nil
       )
 
+      // Verify empty projection handling for COUNT(*)
+      checkAnswer(
+        sql(s"SELECT count(*) FROM $DEFAULT_DATABASE.t"),
+        Row(5L) :: Nil
+      )
+
       // projection
       checkAnswer(
         sql(s"SELECT address, itemId FROM $DEFAULT_DATABASE.t ORDER BY orderId"),
