@@ -17,6 +17,10 @@
 
 package org.apache.fluss.flink.sink;
 
+import org.apache.flink.api.common.functions.MapFunction;
+import org.apache.flink.streaming.api.datastream.DataStream;
+import org.apache.flink.table.api.DataTypes;
+import org.apache.flink.table.api.Schema;
 import org.apache.fluss.client.Connection;
 import org.apache.fluss.client.ConnectionFactory;
 import org.apache.fluss.client.table.Table;
@@ -1761,6 +1765,128 @@ abstract class FlinkTableSinkITCase extends AbstractTestBase {
                         "This table has auto increment column [auto_increment_id]. "
                                 + "Explicitly specifying values for an auto increment column is not allowed. "
                                 + "Please specify non-auto-increment columns as target columns using partialUpdate first.");
+    }
+
+    @Test
+    void verifyAutoIncrementWithUnionAllConsumesByArrivalOrder() throws Exception {
+        env.setParallelism(1);
+        tEnv.getConfig().set(ExecutionConfigOptions.TABLE_EXEC_RESOURCE_DEFAULT_PARALLELISM, 1);
+
+        String tableName = "auto_increment_union_order_table";
+        tEnv.executeSql(
+                String.format(
+                        "create table %s ("
+                                + " id int not null,"
+                                + " auto_increment_id bigint,"
+                                + " amount bigint,"
+                                + " primary key (id) not enforced"
+                                + ") with ("
+                                + " 'bucket.num' = '1',"
+                                + " 'table.changelog.image' = 'wal',"
+                                + " 'auto-increment.fields' = 'auto_increment_id'"
+                                + ")",
+                        tableName));
+
+        Schema sourceSchema =
+                Schema.newBuilder()
+                        .column("f0", DataTypes.INT())
+                        .column("f1", DataTypes.BIGINT())
+                        .build();
+        tEnv.createTemporaryView(
+                "slow_source",
+                tEnv.fromDataStream(createSingleRowSource(1, 100L, 1000L), sourceSchema));
+        tEnv.createTemporaryView(
+                "fast_source",
+                tEnv.fromDataStream(createSingleRowSource(2, 200L, 0L), sourceSchema));
+
+        String insertSql =
+                String.format(
+                        "INSERT INTO %s (id, amount) "
+                                + "SELECT f0, f1 FROM slow_source "
+                                + "UNION  "
+                                + "SELECT f0, f1 FROM fast_source",
+                        tableName);
+
+        assertThat(tEnv.explainSql(insertSql)).contains("Union");
+
+        tEnv.executeSql(insertSql).await();
+
+        assertQueryResultExactOrder(
+                tEnv,
+                String.format(
+                        "SELECT _change_type, id, auto_increment_id, amount "
+                                + "FROM %s$changelog /*+ OPTIONS('scan.startup.mode' = 'earliest') */",
+                        tableName),
+                Arrays.asList("+I[insert, 2, 1, 200]", "+I[insert, 1, 2, 100]"));
+    }
+
+    private DataStream<Row> createSingleRowSource(int id, long amount, long delayMillis) {
+        return env.fromData(Collections.singletonList(Row.of(id, amount)))
+                .returns(Types.ROW(Types.INT, Types.LONG))
+                .map(
+                        (MapFunction<Row, Row>)
+                                value -> {
+                                    if (delayMillis > 0) {
+                                        try {
+                                            Thread.sleep(delayMillis);
+                                        } catch (InterruptedException e) {
+                                            Thread.currentThread().interrupt();
+                                            throw new RuntimeException(
+                                                    "Interrupted while delaying source emission.",
+                                                    e);
+                                        }
+                                    }
+                                    return value;
+                                })
+                .returns(Types.ROW(Types.INT, Types.LONG));
+    }
+
+    @Test
+    void verifyInsertValuesGeneratesMultipleValuesSourceUnion() throws Exception {
+        env.setParallelism(1);
+        tEnv.getConfig().set(ExecutionConfigOptions.TABLE_EXEC_RESOURCE_DEFAULT_PARALLELISM, 1);
+
+        String tableName = "insert_values_union_table";
+        tEnv.executeSql(
+                String.format(
+                        "create table %s ("
+                                + " id int not null,"
+                                + " auto_increment_id bigint,"
+                                + " amount bigint,"
+                                + " primary key (id) not enforced"
+                                + ") with ("
+                                + " 'bucket.num' = '1',"
+                                + " 'table.changelog.image' = 'wal',"
+                                + " 'auto-increment.fields' = 'auto_increment_id'"
+                                + ")",
+                        tableName));
+
+        // INSERT with multiple VALUES - Flink parses this as multiple ValuesSource unioned together
+        String insertSql =
+                String.format("INSERT INTO %s (id, amount) VALUES (1, 100), (2, 200), (3, 300)", tableName);
+
+        // Explain the INSERT to show it generates Union of multiple ValuesSource
+        String plan = tEnv.explainSql(insertSql);
+        System.out.println(plan);
+
+        // Verify the plan contains Union (indicating multiple ValuesSource are unioned)
+        assertThat(plan).contains("Union");
+        // Also verify it contains Values (ValuesSource operators)
+        assertThat(plan).contains("Values");
+
+        tEnv.executeSql(insertSql).await();
+
+        // Verify all rows got unique auto_increment_ids in the order they appeared in VALUES
+        assertQueryResultExactOrder(
+                tEnv,
+                String.format(
+                        "SELECT _change_type, id, auto_increment_id, amount "
+                                + "FROM %s$changelog /*+ OPTIONS('scan.startup.mode' = 'earliest') */",
+                        tableName),
+                Arrays.asList(
+                        "+I[insert, 1, 1, 100]",
+                        "+I[insert, 2, 2, 200]",
+                        "+I[insert, 3, 3, 300]"));
     }
 
     @Test
