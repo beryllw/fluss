@@ -70,6 +70,8 @@ public class MetricNames {
     public static final String LAKE_TIERING_TABLE_FAILURES_TOTAL = "failuresTotal";
     public static final String LAKE_TIERING_TABLE_FILE_SIZE = "fileSize";
     public static final String LAKE_TIERING_TABLE_RECORD_COUNT = "recordCount";
+    public static final String LAKE_TIERING_TABLE_PENDING_TIME = "pendingTime";
+    public static final String LAKE_TIERING_TABLE_FRESHNESS = "freshness";
 
     // --------------------------------------------------------------------------------------------
     // metrics for tablet server
