@@ -855,7 +855,7 @@ Some metrics might not be exposed when using other JVM implementations (e.g. IBM
     </tr>
      <tr>
       <td>timestampLag</td>
-      <td>The timestamp lag between local log and remote log for this table bucket in milliseconds.</td>
+      <td>The timestamp lag between the latest log record and the latest record already tiered to the lake for this table bucket, in milliseconds.</td>
       <td>Gauge</td>
     </tr>
     <tr>

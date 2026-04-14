@@ -23,6 +23,7 @@ import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.TableConfig;
 import org.apache.fluss.exception.FencedLeaderEpochException;
 import org.apache.fluss.exception.InvalidColumnProjectionException;
+import org.apache.fluss.exception.InvalidTableException;
 import org.apache.fluss.exception.InvalidTimestampException;
 import org.apache.fluss.exception.InvalidUpdateVersionException;
 import org.apache.fluss.exception.KvStorageException;
@@ -549,11 +550,20 @@ public final class Replica {
     private void registerLakeTieringMetrics() {
         lakeTieringMetricGroup = bucketMetricGroup.addGroup("lakeTiering");
         lakeTieringMetricGroup.gauge(
-                MetricNames.LOG_LAKE_PENDING_RECORDS,
-                () ->
-                        getLakeLogEndOffset() < 0L
-                                ? getLogHighWatermark() - getLogStartOffset()
-                                : getLogHighWatermark() - getLakeLogEndOffset());
+                MetricNames.LAKE_PENDING_RECORDS,
+                () -> {
+                    long lakeLogEndOffset = getLakeLogEndOffset();
+                    if (lakeLogEndOffset < 0L) {
+                        try {
+                            return getRowCount();
+                        } catch (InvalidTableException e) {
+                            // WAL mode or v0.9 old table: row count disabled,
+                            // fall back to log-level pending count
+                            return getLogHighWatermark() - getLogStartOffset();
+                        }
+                    }
+                    return getLogHighWatermark() - lakeLogEndOffset;
+                });
         lakeTieringMetricGroup.gauge(
                 MetricNames.LOG_LAKE_TIMESTAMP_LAG,
                 () ->
