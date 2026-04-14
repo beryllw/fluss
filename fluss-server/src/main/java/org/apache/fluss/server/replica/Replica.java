@@ -557,9 +557,9 @@ public final class Replica {
                         try {
                             return getRowCount();
                         } catch (InvalidTableException e) {
-                            // WAL mode or v0.9 old table: row count disabled,
-                            // fall back to log-level pending count
-                            return getLogHighWatermark() - getLogStartOffset();
+                            // WAL mode or v0.9 old table with no completed tiering:
+                            // row count disabled, return -1 to indicate unavailable
+                            return -1L;
                         }
                     }
                     return getLogHighWatermark() - lakeLogEndOffset;
