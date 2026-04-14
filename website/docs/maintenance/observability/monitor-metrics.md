@@ -850,12 +850,12 @@ Some metrics might not be exposed when using other JVM implementations (e.g. IBM
      <tr>
       <td rowspan="2">table_bucket_lakeTiering</td>
       <td>pendingRecords</td>
-      <td>The number of records lag between log record and the latest tiered lake log record for this table bucket. Returns -1 if row count is disabled (WAL mode or v0.9 old table) and no tiering has completed.</td>
+      <td>The number of records lag between the latest log record and the latest tiered lake log record for this table bucket. Returns -1 if row count is disabled (WAL mode or v0.9 old table) and no tiering has completed.</td>
       <td>Gauge</td>
     </tr>
      <tr>
       <td>timestampLag</td>
-      <td>The timestamp lag between the latest log record and the latest record already tiered to the lake for this table bucket, in milliseconds.</td>
+      <td>The timestamp lag between the latest log record and the latest tiered lake log record for this table bucket, in milliseconds.</td>
       <td>Gauge</td>
     </tr>
     <tr>
