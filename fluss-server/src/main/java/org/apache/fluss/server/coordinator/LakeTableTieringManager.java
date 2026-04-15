@@ -285,14 +285,7 @@ public class LakeTableTieringManager implements AutoCloseable {
 
         // pendingTime: how long the table has been waiting in the pending queue
         tableMetricGroup.gauge(
-                MetricNames.LAKE_TIERING_TABLE_PENDING_TIME,
-                () ->
-                        inReadLock(
-                                lock,
-                                () -> {
-                                    long enterTime = pendingEnterTime.getOrDefault(tableId, 0L);
-                                    return enterTime > 0 ? clock.milliseconds() - enterTime : 0L;
-                                }));
+                MetricNames.LAKE_TIERING_TABLE_PENDING_TIME, () -> getTablePendingTime(tableId));
 
         // failuresTotal: total failure count for this table
         Counter failuresCounter =
@@ -605,7 +598,7 @@ public class LakeTableTieringManager implements AutoCloseable {
             case Tiering:
                 liveTieringTableIds.put(tableId, clock.milliseconds());
                 currentTieringStartTime.put(tableId, clock.milliseconds());
-                pendingEnterTime.put(tableId, 0L);
+                pendingEnterTime.remove(tableId);
                 break;
             case Tiered:
                 liveTieringTableIds.remove(tableId);
@@ -847,5 +840,15 @@ public class LakeTableTieringManager implements AutoCloseable {
     @VisibleForTesting
     long getLastTieringResultField(long tableId, ToLongFunction<LastTieringResult> fieldExtractor) {
         return inReadLock(lock, () -> getLastResultField(tableId, fieldExtractor));
+    }
+
+    @VisibleForTesting
+    long getTablePendingTime(long tableId) {
+        return inReadLock(
+                lock,
+                () -> {
+                    Long enterTime = pendingEnterTime.get(tableId);
+                    return enterTime != null ? clock.milliseconds() - enterTime : 0L;
+                });
     }
 }
