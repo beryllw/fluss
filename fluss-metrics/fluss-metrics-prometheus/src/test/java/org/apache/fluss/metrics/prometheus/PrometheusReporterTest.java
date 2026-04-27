@@ -17,6 +17,8 @@
 
 package org.apache.fluss.metrics.prometheus;
 
+import org.apache.fluss.config.ConfigOptions;
+import org.apache.fluss.config.Configuration;
 import org.apache.fluss.metrics.Counter;
 import org.apache.fluss.metrics.Gauge;
 import org.apache.fluss.metrics.Histogram;
@@ -281,5 +283,56 @@ class PrometheusReporterTest {
                 + String.format("# HELP %s %s (scope: %s)\n", scopedName, name, LOGICAL_SCOPE)
                 + String.format("# TYPE %s %s\n", scopedName, type)
                 + String.format("%s%s%s %s\n", scopedName, nameSuffix, DEFAULT_LABELS, value);
+    }
+
+    @Test
+    void labelValueWithHyphenIsPreservedWhenFilterIsDisabled() throws UnirestException {
+        // configure reporter with filterLabelValueCharacters=false
+        Configuration config = new Configuration();
+        config.setBoolean(
+                ConfigOptions.METRICS_REPORTER_PROMETHEUS_FILTER_LABEL_VALUE_CHARACTERS.key(),
+                false);
+        reporter.open(config);
+
+        String[] labelNames = {"table"};
+        String[] labelValues = {"metrics-test"};
+        MetricGroup groupWithHyphen =
+                TestUtils.createTestMetricGroup(
+                        LOGICAL_SCOPE, TestUtils.toMap(labelNames, labelValues));
+
+        Counter counter = new SimpleCounter();
+        counter.inc(5);
+
+        reporter.notifyOfAddedMetric(counter, "testCounter", groupWithHyphen);
+
+        String response = pollMetrics(reporter.getPort()).getBody();
+        // the exported label value should preserve the hyphen, not convert it to underscore
+        assertThat(response).contains("table=\"metrics-test\"");
+        assertThat(response).doesNotContain("table=\"metrics_test\"");
+    }
+
+    @Test
+    void labelValueWithHyphenIsReplacedWhenFilterIsEnabled() throws UnirestException {
+        // configure reporter with filterLabelValueCharacters=true (default)
+        Configuration config = new Configuration();
+        config.setBoolean(
+                ConfigOptions.METRICS_REPORTER_PROMETHEUS_FILTER_LABEL_VALUE_CHARACTERS.key(),
+                true);
+        reporter.open(config);
+
+        String[] labelNames = {"table"};
+        String[] labelValues = {"metrics-test"};
+        MetricGroup groupWithHyphen =
+                TestUtils.createTestMetricGroup(
+                        LOGICAL_SCOPE, TestUtils.toMap(labelNames, labelValues));
+
+        Counter counter = new SimpleCounter();
+        counter.inc(5);
+
+        reporter.notifyOfAddedMetric(counter, "testCounter", groupWithHyphen);
+
+        String response = pollMetrics(reporter.getPort()).getBody();
+        // the exported label value should have hyphen converted to underscore (legacy behavior)
+        assertThat(response).contains("table=\"metrics_test\"");
     }
 }

@@ -1963,6 +1963,18 @@ public class ConfigOptions {
                                     + "the CoordinatorServer) it is advisable to use a port range "
                                     + "like 9250-9260.");
 
+    public static final ConfigOption<Boolean>
+            METRICS_REPORTER_PROMETHEUS_FILTER_LABEL_VALUE_CHARACTERS =
+                    key("metrics.reporter.prometheus.filter-label-value-characters")
+                            .booleanType()
+                            .defaultValue(true)
+                            .withDescription(
+                                    "Specifies whether to filter label value characters. "
+                                            + "If enabled, all characters not matching [a-zA-Z0-9:_] will be replaced with an underscore, "
+                                            + "otherwise no characters will be replaced. "
+                                            + "Before disabling this option please ensure that your label values "
+                                            + "meet the Prometheus requirements.");
+
     // ------------------------------------------------------------------------
     //  ConfigOptions for prometheus push gateway reporter
     // ------------------------------------------------------------------------
