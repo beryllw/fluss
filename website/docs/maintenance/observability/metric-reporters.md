@@ -64,14 +64,12 @@ Type: pull
 Parameters:
 
 - `metrics.reporter.prometheus.port` - (optional) the port the Prometheus exporter listens on, defaults to [9249](https://github.com/prometheus/prometheus/wiki/Default-port-allocations). In order to be able to run several instances of the reporter on one host (e.g. when one TabletServer is co-located with the CoordinatorServer) it is advisable to use a port range like `9250-9260`.
-- `metrics.reporter.prometheus.filter-label-value-characters` - (optional) Specifies whether to filter label value characters, defaults to true. If enabled, all characters not matching `[a-zA-Z0-9:_]` will be replaced with an underscore, otherwise no characters will be replaced.
 
 Example configuration:
 
 ```yaml
 metrics.reporters: prometheus
 metrics.reporter.prometheus.port: 9250
-metrics.reporter.prometheus.filter-label-value-characters: true
 ```
 
 Fluss metric types are mapped to Prometheus metric types as follows:

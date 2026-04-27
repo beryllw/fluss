@@ -17,7 +17,6 @@
 
 package org.apache.fluss.metrics.prometheus;
 
-import org.apache.fluss.config.Configuration;
 import org.apache.fluss.metrics.Metric;
 import org.apache.fluss.metrics.reporter.ScheduledMetricReporter;
 
@@ -53,11 +52,6 @@ public class PrometheusPushGatewayReporter extends AbstractPrometheusReporter
         this.groupingKey = groupingKey;
         this.deleteOnShutdown = deleteOnShutdown;
         this.pushInterval = pushInterval;
-    }
-
-    @Override
-    public void open(Configuration config) {
-        super.open(config);
     }
 
     @Override

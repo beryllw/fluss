@@ -17,8 +17,6 @@
 
 package org.apache.fluss.metrics.prometheus;
 
-import org.apache.fluss.config.ConfigOptions;
-import org.apache.fluss.config.Configuration;
 import org.apache.fluss.metrics.Counter;
 import org.apache.fluss.metrics.Gauge;
 import org.apache.fluss.metrics.Histogram;
@@ -37,8 +35,6 @@ import com.mashape.unirest.http.exceptions.UnirestException;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.CsvSource;
 
 import java.util.Arrays;
 import java.util.Collections;
@@ -287,16 +283,8 @@ class PrometheusReporterTest {
                 + String.format("%s%s%s %s\n", scopedName, nameSuffix, DEFAULT_LABELS, value);
     }
 
-    @ParameterizedTest
-    @CsvSource({"false, metrics-test", "true, metrics_test"})
-    void labelValueFilteringRespectsConfig(
-            boolean filterLabelValueCharacters, String expectedLabelValue) throws UnirestException {
-        Configuration config = new Configuration();
-        config.setBoolean(
-                ConfigOptions.METRICS_REPORTER_PROMETHEUS_FILTER_LABEL_VALUE_CHARACTERS.key(),
-                filterLabelValueCharacters);
-        reporter.open(config);
-
+    @Test
+    void labelValueWithHyphenIsPreserved() throws UnirestException {
         String[] labelNames = {"table"};
         String[] labelValues = {"metrics-test"};
         MetricGroup groupWithHyphen =
@@ -309,6 +297,6 @@ class PrometheusReporterTest {
         reporter.notifyOfAddedMetric(counter, "testCounter", groupWithHyphen);
 
         String response = pollMetrics(reporter.getPort()).getBody();
-        assertThat(response).contains("table=\"" + expectedLabelValue + "\"");
+        assertThat(response).contains("table=\"metrics-test\"");
     }
 }

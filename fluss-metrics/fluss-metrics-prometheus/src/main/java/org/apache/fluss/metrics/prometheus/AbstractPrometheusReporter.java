@@ -18,7 +18,6 @@
 package org.apache.fluss.metrics.prometheus;
 
 import org.apache.fluss.annotation.VisibleForTesting;
-import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.metrics.CharacterFilter;
 import org.apache.fluss.metrics.Counter;
@@ -71,8 +70,6 @@ public abstract class AbstractPrometheusReporter implements MetricReporter {
 
     @VisibleForTesting protected final CollectorRegistry registry = new CollectorRegistry(true);
 
-    private CharacterFilter labelValueCharactersFilter = CHARACTER_FILTER;
-
     protected static String replaceInvalidChars(final String input) {
         // https://prometheus.io/docs/instrumenting/writing_exporters/
         // Only [a-zA-Z0-9:_] are valid in metric names, any other characters should be sanitized to
@@ -81,19 +78,13 @@ public abstract class AbstractPrometheusReporter implements MetricReporter {
     }
 
     /**
-     * Configures the reporter. Reads the {@code filterLabelValueCharacters} option to decide
-     * whether to filter label value characters.
+     * Configures the reporter. Subclasses should override this to add their own configuration.
      *
      * @param config the configuration
      */
     @Override
     public void open(Configuration config) {
-        boolean filterLabelValueCharacters =
-                config.getBoolean(
-                        ConfigOptions.METRICS_REPORTER_PROMETHEUS_FILTER_LABEL_VALUE_CHARACTERS);
-        if (!filterLabelValueCharacters) {
-            labelValueCharactersFilter = input -> input;
-        }
+        // default no-op
     }
 
     /**
@@ -118,7 +109,7 @@ public abstract class AbstractPrometheusReporter implements MetricReporter {
         List<String> dimensionValues = new LinkedList<>();
         for (final Map.Entry<String, String> dimension : group.getAllVariables().entrySet()) {
             dimensionKeys.add(CHARACTER_FILTER.filterCharacters(dimension.getKey()));
-            dimensionValues.add(labelValueCharactersFilter.filterCharacters(dimension.getValue()));
+            dimensionValues.add(dimension.getValue());
         }
 
         final String scopedMetricName = getScopedName(metricName, group);
@@ -164,7 +155,7 @@ public abstract class AbstractPrometheusReporter implements MetricReporter {
     public void notifyOfRemovedMetric(Metric metric, String metricName, MetricGroup group) {
         List<String> dimensionValues = new LinkedList<>();
         for (final Map.Entry<String, String> dimension : group.getAllVariables().entrySet()) {
-            dimensionValues.add(labelValueCharactersFilter.filterCharacters(dimension.getValue()));
+            dimensionValues.add(dimension.getValue());
         }
 
         final String scopedMetricName = getScopedName(metricName, group);

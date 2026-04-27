@@ -17,7 +17,6 @@
 
 package org.apache.fluss.metrics.prometheus;
 
-import org.apache.fluss.config.Configuration;
 import org.apache.fluss.metrics.Metric;
 
 import io.prometheus.client.exporter.HTTPServer;
@@ -60,11 +59,6 @@ public class PrometheusReporter extends AbstractPrometheusReporter {
                     "Could not start PrometheusReporter HTTP server on any configured port. Ports: "
                             + ports);
         }
-    }
-
-    @Override
-    public void open(Configuration config) {
-        super.open(config);
     }
 
     @Override
