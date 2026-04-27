@@ -1971,9 +1971,7 @@ public class ConfigOptions {
                             .withDescription(
                                     "Specifies whether to filter label value characters. "
                                             + "If enabled, all characters not matching [a-zA-Z0-9:_] will be replaced with an underscore, "
-                                            + "otherwise no characters will be replaced. "
-                                            + "Before disabling this option please ensure that your label values "
-                                            + "meet the Prometheus requirements.");
+                                            + "otherwise no characters will be replaced.");
 
     // ------------------------------------------------------------------------
     //  ConfigOptions for prometheus push gateway reporter
