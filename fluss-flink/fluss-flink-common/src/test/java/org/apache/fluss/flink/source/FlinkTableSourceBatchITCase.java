@@ -505,7 +505,8 @@ abstract class FlinkTableSourceBatchITCase extends FlinkTestBase {
         try (Table table = conn.getTable(tablePath)) {
             AppendWriter appendWriter = table.newAppend().createWriter();
             for (int i = 1; i <= 5; i++) {
-                Object[] values = new Object[] {i, "address" + i, "name" + i, new Integer[] {i, i + 1}};
+                Object[] values =
+                        new Object[] {i, "address" + i, "name" + i, new Integer[] {i, i + 1}};
                 appendWriter.append(row(values));
                 // make sure every bucket has records
                 appendWriter.flush();
