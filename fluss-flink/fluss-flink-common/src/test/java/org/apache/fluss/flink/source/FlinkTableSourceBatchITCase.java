@@ -320,11 +320,11 @@ abstract class FlinkTableSourceBatchITCase extends FlinkTestBase {
         List<String> collected = collectRowsWithTimeout(iterRows, 2);
         List<String> expected =
                 Arrays.asList(
-                        "+I[1, address1, name1]",
-                        "+I[2, address2, name2]",
-                        "+I[3, address3, name3]",
-                        "+I[4, address4, name4]",
-                        "+I[5, address5, name5]");
+                        "+I[1, address1, name1, [1, 2]]",
+                        "+I[2, address2, name2, [2, 3]]",
+                        "+I[3, address3, name3, [3, 4]]",
+                        "+I[4, address4, name4, [4, 5]]",
+                        "+I[5, address5, name5, [5, 6]]");
         assertThat(collected).isSubsetOf(expected);
         assertThat(collected).hasSize(2);
 
@@ -491,7 +491,8 @@ abstract class FlinkTableSourceBatchITCase extends FlinkTestBase {
                         "create table %s ("
                                 + "  id int not null,"
                                 + "  address varchar,"
-                                + "  name varchar)"
+                                + "  name varchar,"
+                                + "  int_array array<int>)"
                                 + " with ("
                                 + "  'bucket.num' = '4', "
                                 + "  'table.auto-partition.enabled' = 'false' "
@@ -504,7 +505,7 @@ abstract class FlinkTableSourceBatchITCase extends FlinkTestBase {
         try (Table table = conn.getTable(tablePath)) {
             AppendWriter appendWriter = table.newAppend().createWriter();
             for (int i = 1; i <= 5; i++) {
-                Object[] values = new Object[] {i, "address" + i, "name" + i};
+                Object[] values = new Object[] {i, "address" + i, "name" + i, new Integer[] {i, i + 1}};
                 appendWriter.append(row(values));
                 // make sure every bucket has records
                 appendWriter.flush();
