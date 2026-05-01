@@ -80,11 +80,12 @@ public class TieringSourceFetcherManager<WriteResult>
 
     private void enqueueTaskForTable(
             long tableId, Consumer<TieringSplitReader<WriteResult>> action, String actionDesc) {
-        SplitFetcher<TableBucketWriteResult<WriteResult>, TieringSplit> splitFetcher;
         if (!fetchers.isEmpty()) {
+            // The fetcher thread is still running. This should be the majority of the cases.
             LOG.info("Fetchers are active, enqueueing {} task for table {}", actionDesc, tableId);
             fetchers.values().forEach(f -> enqueueReaderTask(f, action));
         } else {
+            SplitFetcher<TableBucketWriteResult<WriteResult>, TieringSplit> splitFetcher;
             LOG.info(
                     "No active fetchers, creating new fetcher and enqueueing {} task for table {}",
                     actionDesc,
@@ -109,7 +110,9 @@ public class TieringSourceFetcherManager<WriteResult>
                     }
 
                     @Override
-                    public void wakeUp() {}
+                    public void wakeUp() {
+                        // do nothing
+                    }
                 });
     }
 }

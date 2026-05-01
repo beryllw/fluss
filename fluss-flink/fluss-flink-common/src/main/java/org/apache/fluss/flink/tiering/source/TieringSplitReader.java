@@ -280,7 +280,7 @@ public class TieringSplitReader<WriteResult>
                 currentTableSplitsByBucket.put(split.getTableBucket(), split);
             }
             LOG.info(
-                    "Skipping RPC for dropped table {} (path: {}), will force complete in next fetch cycle.",
+                    "Table {} is already marked dropped; skip opening table {} and force complete in next fetch cycle.",
                     pendingTableId,
                     currentTablePath);
             return;
@@ -301,10 +301,7 @@ public class TieringSplitReader<WriteResult>
             currentTableNumberOfSplits = split.getNumberOfSplits();
             TableInfo currentTableInfo = checkNotNull(currentTable).getTableInfo();
             // check currentTable's id for the table path is same with table id of the tiering
-            // split, if not, it means the tiering split is for a previous dropped table. let's fail
-            // directly
-            // todo: we should skip and notify enumerator that the table id is not tiering now
-            // instead of fail directly
+            // split, if not, it means the tiering split is for a previous dropped table
             checkArgument(
                     currentTableInfo.getTableId() == split.getTableBucket().getTableId(),
                     "The current table id %s for table path %s is different from the table id %s in TieringSplit split.",
@@ -687,37 +684,6 @@ public class TieringSplitReader<WriteResult>
                         split.splitId());
                 splitsIterator.remove();
             }
-        }
-
-        // Close any remaining lake writers that don't have corresponding splits
-        for (Map.Entry<TableBucket, LakeWriter<WriteResult>> entry : lakeWriters.entrySet()) {
-            try {
-                entry.getValue().close();
-            } catch (Exception e) {
-                LOG.warn("Failed to close orphan lake writer for bucket {}", entry.getKey(), e);
-            }
-        }
-        lakeWriters.clear();
-
-        // Also handle pending snapshot splits for this table
-        while (!currentPendingSnapshotSplits.isEmpty()) {
-            TieringSnapshotSplit snapshotSplit = currentPendingSnapshotSplits.poll();
-            TableBucket bucket = snapshotSplit.getTableBucket();
-            TableBucketWriteResult<WriteResult> emptyResult =
-                    toTableBucketWriteResult(
-                            snapshotSplit.getTablePath(),
-                            bucket,
-                            snapshotSplit.getPartitionName(),
-                            null,
-                            UNKNOWN_BUCKET_OFFSET,
-                            UNKNOWN_BUCKET_TIMESTAMP,
-                            checkNotNull(currentTableNumberOfSplits),
-                            true);
-            writeResults.put(bucket, emptyResult);
-            finishedSplitIds.put(bucket, snapshotSplit.splitId());
-            LOG.info(
-                    "Pending snapshot split {} is forced to be finished due to table dropped.",
-                    snapshotSplit.splitId());
         }
 
         // Note: droppedTables.remove is handled by finishCurrentTable()

@@ -22,6 +22,7 @@ import org.apache.fluss.exception.LakeTableSnapshotNotExistException;
 import org.apache.fluss.flink.adapter.StreamOperatorParametersAdapter;
 import org.apache.fluss.flink.tiering.TestingLakeTieringFactory;
 import org.apache.fluss.flink.tiering.TestingWriteResult;
+import org.apache.fluss.flink.tiering.event.CancelledTieringEvent;
 import org.apache.fluss.flink.tiering.event.FailedTieringEvent;
 import org.apache.fluss.flink.tiering.event.FinishedTieringEvent;
 import org.apache.fluss.flink.tiering.source.TableBucketWriteResult;
@@ -534,9 +535,6 @@ class TieringCommitOperatorTest extends FlinkTestBase {
         long tableId = createTable(tablePath, DEFAULT_PK_TABLE_DESCRIPTOR);
         int numberOfWriteResults = 3;
 
-        // Record the number of events before processing
-        int eventCountBefore = mockOperatorEventGateway.getEventsSent().size();
-
         // Send all write results with cancelled=true
         for (int bucket = 0; bucket < numberOfWriteResults; bucket++) {
             TableBucket tableBucket = new TableBucket(tableId, bucket);
@@ -555,9 +553,15 @@ class TieringCommitOperatorTest extends FlinkTestBase {
         // Verify no lake snapshot was created
         verifyNoLakeSnapshot(tablePath);
 
-        // Verify no FinishedTieringEvent or FailedTieringEvent was sent
-        int eventCountAfter = mockOperatorEventGateway.getEventsSent().size();
-        assertThat(eventCountAfter).isEqualTo(eventCountBefore);
+        // Verify that a CancelledEvent was sent to notify the enumerator
+        // that the table's tiering was cancelled
+        List<OperatorEvent> operatorEvents = mockOperatorEventGateway.getEventsSent();
+        assertThat(operatorEvents).hasSize(1);
+        SourceEventWrapper sourceEventWrapper = (SourceEventWrapper) operatorEvents.get(0);
+        CancelledTieringEvent cancelledEvent =
+                (CancelledTieringEvent) sourceEventWrapper.getSourceEvent();
+        assertThat(cancelledEvent.getTableId()).isEqualTo(tableId);
+        assertThat(cancelledEvent.cancelReason()).contains("was dropped during tiering");
     }
 
     private CommittedLakeSnapshot mockCommittedLakeSnapshot(

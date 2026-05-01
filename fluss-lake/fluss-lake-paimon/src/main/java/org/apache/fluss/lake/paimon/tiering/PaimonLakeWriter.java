@@ -30,8 +30,6 @@ import org.apache.paimon.catalog.Catalog;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.sink.CommitMessage;
 
-import javax.annotation.Nullable;
-
 import java.io.IOException;
 import java.util.Collections;
 import java.util.List;
@@ -82,7 +80,6 @@ public class PaimonLakeWriter implements LakeWriter<PaimonWriteResult> {
         }
     }
 
-    @Nullable
     @Override
     public PaimonWriteResult complete() throws IOException {
         CommitMessage commitMessage;
@@ -90,10 +87,6 @@ public class PaimonLakeWriter implements LakeWriter<PaimonWriteResult> {
             commitMessage = recordWriter.complete();
         } catch (Exception e) {
             throw new IOException("Failed to complete Paimon write.", e);
-        }
-        if (commitMessage == null) {
-            // No data was written, return null to indicate empty write
-            return null;
         }
         return new PaimonWriteResult(commitMessage);
     }

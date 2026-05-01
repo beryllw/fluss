@@ -24,6 +24,7 @@ import org.apache.fluss.client.admin.Admin;
 import org.apache.fluss.client.metadata.MetadataUpdater;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.flink.metrics.FlinkMetricRegistry;
+import org.apache.fluss.flink.tiering.event.CancelledTieringEvent;
 import org.apache.fluss.flink.tiering.event.FailedTieringEvent;
 import org.apache.fluss.flink.tiering.event.FinishedTieringEvent;
 import org.apache.fluss.flink.tiering.event.TieringReachMaxDurationEvent;
@@ -113,6 +114,9 @@ public class TieringSourceEnumerator
     private final Map<Long, TieringFinishInfo> finishedTables;
     private final Set<Long> tieringReachMaxDurationsTables;
 
+    // Dropped table IDs detected by heartbeat response processing.
+    private final List<Long> pendingDroppedTableIds;
+
     // lazily instantiated
     private RpcClient rpcClient;
     private CoordinatorGateway coordinatorGateway;
@@ -142,6 +146,7 @@ public class TieringSourceEnumerator
         this.finishedTables = new ConcurrentHashMap<>();
         this.failedTableEpochs = new ConcurrentHashMap<>();
         this.tieringReachMaxDurationsTables = Collections.synchronizedSet(new TreeSet<>());
+        this.pendingDroppedTableIds = Collections.synchronizedList(new ArrayList<>());
     }
 
     @Override
@@ -264,6 +269,23 @@ public class TieringSourceEnumerator
         return integers.stream().max(Integer::compareTo).orElse(-1);
     }
 
+    /**
+     * Transition a table from tiering to failed state by moving its epoch from {@link
+     * #tieringTableEpochs} to {@link #failedTableEpochs}. If the table is not currently in tiering
+     * (e.g., already removed by a prior cancellation or failure notification), this method is a
+     * no-op.
+     *
+     * @return the epoch that was transitioned, or {@code null} if the table was not in tiering
+     */
+    @Nullable
+    private Long markTableAsFailed(long tableId) {
+        Long tieringEpoch = tieringTableEpochs.remove(tableId);
+        if (tieringEpoch != null) {
+            failedTableEpochs.put(tableId, tieringEpoch);
+        }
+        return tieringEpoch;
+    }
+
     @Override
     public void handleSourceEvent(int subtaskId, SourceEvent sourceEvent) {
         if (sourceEvent instanceof FinishedTieringEvent) {
@@ -288,18 +310,34 @@ public class TieringSourceEnumerator
         if (sourceEvent instanceof FailedTieringEvent) {
             FailedTieringEvent failedEvent = (FailedTieringEvent) sourceEvent;
             long failedTableId = failedEvent.getTableId();
-            Long tieringEpoch = tieringTableEpochs.remove(failedTableId);
             LOG.info(
                     "Tiering table {} is failed, fail reason is {}.",
                     failedTableId,
                     failedEvent.failReason());
+            Long tieringEpoch = markTableAsFailed(failedTableId);
             if (tieringEpoch == null) {
                 // shouldn't happen, warn it
                 LOG.warn(
                         "The failed table {} is not in tiering table, won't report it to Fluss to mark as failed.",
                         failedTableId);
-            } else {
-                failedTableEpochs.put(failedTableId, tieringEpoch);
+            }
+        }
+
+        if (sourceEvent instanceof CancelledTieringEvent) {
+            // Fallback: Committer-side detection when Enumerator misses the table drop via
+            // heartbeat.
+            CancelledTieringEvent cancelledEvent = (CancelledTieringEvent) sourceEvent;
+            long cancelledTableId = cancelledEvent.getTableId();
+            LOG.info(
+                    "Tiering for table {} is cancelled, cancel reason: {}.",
+                    cancelledTableId,
+                    cancelledEvent.cancelReason());
+            Long tieringEpoch = markTableAsFailed(cancelledTableId);
+            if (tieringEpoch == null) {
+                LOG.info(
+                        "Table {} was already removed from tiering state, "
+                                + "won't report it to Fluss to mark as failed.",
+                        cancelledTableId);
             }
         }
 
@@ -361,6 +399,16 @@ public class TieringSourceEnumerator
         if (throwable != null) {
             LOG.warn("Failed to request tiering table, will retry later.", throwable);
         }
+
+        // Process dropped table IDs collected during heartbeat processing.
+        if (!pendingDroppedTableIds.isEmpty()) {
+            List<Long> droppedIds = new ArrayList<>(pendingDroppedTableIds);
+            pendingDroppedTableIds.clear();
+            for (long droppedTableId : droppedIds) {
+                handleTableDropped(droppedTableId);
+            }
+        }
+
         if (tieringTable != null) {
             generateTieringSplits(tieringTable);
         }
@@ -437,8 +485,8 @@ public class TieringSourceEnumerator
                             coordinatorGateway.lakeTieringHeartbeat(tieringHeartbeatRequest));
         }
 
-        // Process tiering_table_resp to detect table deletion errors
-        handleTieringTableResponseErrors(heartbeatResponse);
+        // Collect dropped table IDs from heartbeat response for deferred processing.
+        collectDroppedTablesFromHeartbeat(heartbeatResponse);
 
         // if come to here, we can remove currentFinishedTables/failedTableEpochs to avoid send
         // in next round
@@ -447,50 +495,40 @@ public class TieringSourceEnumerator
         return lakeTieringInfo;
     }
 
-    /**
-     * Handle errors in tiering_table_resp from heartbeat response. If a table has been dropped,
-     * mark it as failed and notify readers to skip processing.
-     */
-    private void handleTieringTableResponseErrors(LakeTieringHeartbeatResponse heartbeatResponse) {
+    /** Detect table deletion errors in tiering_table_resp from heartbeat response. */
+    private void collectDroppedTablesFromHeartbeat(LakeTieringHeartbeatResponse heartbeatResponse) {
         for (PbHeartbeatRespForTable resp : heartbeatResponse.getTieringTableRespsList()) {
             if (resp.hasError()) {
                 ApiError error = ApiError.fromErrorMessage(resp.getError());
                 Errors errors = error.error();
-                // Check if the error indicates table doesn't exist or tiering epoch is fenced
-                // (which happens when table is dropped and recreated)
-                if (errors == Errors.TABLE_NOT_EXIST
-                        || errors == Errors.UNKNOWN_TABLE_OR_BUCKET_EXCEPTION
-                        || errors == Errors.FENCED_TIERING_EPOCH_EXCEPTION) {
+                if (errors == Errors.TABLE_NOT_EXIST) {
                     long tableId = resp.getTableId();
                     LOG.warn(
-                            "Table {} is dropped or epoch mismatch (error: {}), canceling tiering.",
+                            "Table {} does not exist (error: {}), will cancel tiering.",
                             tableId,
                             errors);
-                    handleTableDropped(tableId);
+                    pendingDroppedTableIds.add(tableId);
                 }
             }
         }
     }
 
     /**
-     * Handle a dropped table by marking all related splits to skip, removing from tiering epochs,
-     * and notifying readers.
+     * Handle a dropped table by treating it as a tiering cancellation, marking all related pending
+     * splits to skip, and notifying readers to stop processing.
      */
     @VisibleForTesting
     protected void handleTableDropped(long tableId) {
-        // Remove from tiering table epochs
-        Long tieringEpoch = tieringTableEpochs.remove(tableId);
+        Long epoch = markTableAsFailed(tableId);
+        if (epoch != null) {
+            LOG.info("Table {} is dropped, moved epoch {} from tiering to failed.", tableId, epoch);
+        }
 
         // Mark all pending splits for this table to skip current round
         for (TieringSplit tieringSplit : pendingSplits) {
             if (tieringSplit.getTableBucket().getTableId() == tableId) {
                 tieringSplit.skipCurrentRound();
             }
-        }
-
-        // Add to failed table epochs to notify coordinator in next heartbeat
-        if (tieringEpoch != null) {
-            failedTableEpochs.put(tableId, tieringEpoch);
         }
 
         // Broadcast the event to all readers to stop processing this table

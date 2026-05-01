@@ -21,8 +21,6 @@ import org.apache.fluss.flink.tiering.TestingWriteResult;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
 
-import org.apache.flink.core.memory.DataOutputSerializer;
-import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
@@ -77,49 +75,5 @@ class TableBucketWriteResultSerializerTest {
         byte[] serialized = tableBucketWriteResultSerializer.serialize(input);
         return tableBucketWriteResultSerializer.deserialize(
                 tableBucketWriteResultSerializer.getVersion(), serialized);
-    }
-
-    @Test
-    void testDeserializeVersion1IsBackwardCompatible() throws Exception {
-        // Manually construct a version-1 payload (no cancelled flag) and verify
-        // that it deserializes correctly with cancelled defaulting to false.
-        TablePath tablePath = TablePath.of("db1", "tb1");
-        TableBucket tableBucket = new TableBucket(1, 2);
-        TestingWriteResult testingWriteResult = new TestingWriteResult(42);
-        TestingWriteResultSerializer writeResultSerializer = new TestingWriteResultSerializer();
-
-        DataOutputSerializer out = new DataOutputSerializer(64);
-        // table path
-        out.writeUTF(tablePath.getDatabaseName());
-        out.writeUTF(tablePath.getTableName());
-        // bucket (no partition)
-        out.writeLong(tableBucket.getTableId());
-        out.writeBoolean(false);
-        out.writeInt(tableBucket.getBucket());
-        // write result
-        byte[] writeResultBytes = writeResultSerializer.serialize(testingWriteResult);
-        out.writeInt(writeResultBytes.length);
-        out.write(writeResultBytes);
-        // log end offset
-        out.writeLong(100L);
-        // max timestamp
-        out.writeLong(200L);
-        // number of write results
-        out.writeInt(3);
-        // NOTE: no cancelled flag — this is a version-1 payload
-        byte[] v1Bytes = out.getCopyOfBuffer();
-
-        TableBucketWriteResult<TestingWriteResult> deserialized =
-                tableBucketWriteResultSerializer.deserialize(1, v1Bytes);
-
-        assertThat(deserialized.tablePath()).isEqualTo(tablePath);
-        assertThat(deserialized.tableBucket()).isEqualTo(tableBucket);
-        assertThat(deserialized.writeResult()).isNotNull();
-        assertThat(deserialized.writeResult().getWriteResult()).isEqualTo(42);
-        assertThat(deserialized.logEndOffset()).isEqualTo(100L);
-        assertThat(deserialized.maxTimestamp()).isEqualTo(200L);
-        assertThat(deserialized.numberOfWriteResults()).isEqualTo(3);
-        // cancelled must default to false when deserializing a version-1 payload
-        assertThat(deserialized.isCancelled()).isFalse();
     }
 }

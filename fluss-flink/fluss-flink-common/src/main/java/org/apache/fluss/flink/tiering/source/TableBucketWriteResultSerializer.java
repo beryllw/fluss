@@ -33,10 +33,7 @@ public class TableBucketWriteResultSerializer<WriteResult>
     private static final ThreadLocal<DataOutputSerializer> SERIALIZER_CACHE =
             ThreadLocal.withInitial(() -> new DataOutputSerializer(64));
 
-    private static final int CURRENT_VERSION = 2;
-
-    // Version 1: original format without the cancelled flag
-    private static final int VERSION_1 = 1;
+    private static final int CURRENT_VERSION = 1;
 
     private final org.apache.fluss.lake.serializer.SimpleVersionedSerializer<WriteResult>
             writeResultSerializer;
@@ -105,7 +102,7 @@ public class TableBucketWriteResultSerializer<WriteResult>
     @Override
     public TableBucketWriteResult<WriteResult> deserialize(int version, byte[] serialized)
             throws IOException {
-        if (version != CURRENT_VERSION && version != VERSION_1) {
+        if (version != CURRENT_VERSION) {
             throw new IOException("Unknown version " + version);
         }
         final DataInputDeserializer in = new DataInputDeserializer(serialized);
@@ -145,8 +142,8 @@ public class TableBucketWriteResultSerializer<WriteResult>
         // deserialize number of write results
         int numberOfWriteResults = in.readInt();
 
-        // deserialize cancelled flag (added in version 2; default to false for version 1)
-        boolean cancelled = (version >= CURRENT_VERSION) && in.readBoolean();
+        // deserialize cancelled flag
+        boolean cancelled = in.readBoolean();
 
         return new TableBucketWriteResult<>(
                 tablePath,

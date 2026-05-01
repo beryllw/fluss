@@ -883,6 +883,34 @@ class TieringSourceEnumeratorTest extends TieringTestBase {
             for (Map.Entry<Integer, List<SourceEvent>> entry : eventsToReaders.entrySet()) {
                 assertThat(entry.getValue()).contains(new TieringTableDroppedEvent(tableId));
             }
+
+            // Verify that the dropped table's epoch is immediately moved to failed:
+            // after handleTableDropped, the next heartbeat should report the table as failed,
+            // allowing the coordinator to clean up and assign new tables.
+            // Create a new table to verify the enumerator can move on.
+            context.getSplitsAssignmentSequence().clear();
+            TablePath newTablePath = TablePath.of(DEFAULT_DB, "tiering-dropped-table-test-new");
+            createTable(newTablePath, DEFAULT_LOG_TABLE_DESCRIPTOR);
+            appendRow(newTablePath, DEFAULT_LOG_TABLE_DESCRIPTOR, 0, 10);
+
+            // Request splits again - should get the new table after the heartbeat reports
+            // the dropped table as failed
+            for (int subTask = 0; subTask < numSubtasks; subTask++) {
+                enumerator.handleSplitRequest(subTask, "localhost-" + subTask);
+            }
+            waitUntilTieringTableSplitAssignmentReady(context, numSubtasks, 500L);
+
+            List<TieringSplit> newAssignment = new ArrayList<>();
+            context.getSplitsAssignmentSequence()
+                    .forEach(a -> a.assignment().values().forEach(newAssignment::addAll));
+            assertThat(newAssignment).isNotEmpty();
+            // Remaining pending splits from the dropped table are assigned with
+            // skipCurrentRound=true (readers will skip them). Non-skipped splits
+            // should all belong to the new table.
+            assertThat(newAssignment)
+                    .filteredOn(split -> !split.shouldSkipCurrentRound())
+                    .isNotEmpty()
+                    .allMatch(split -> split.getTablePath().equals(newTablePath));
         }
     }
 }

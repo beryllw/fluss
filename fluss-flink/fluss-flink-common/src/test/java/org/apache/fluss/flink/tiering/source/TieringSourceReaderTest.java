@@ -290,6 +290,82 @@ class TieringSourceReaderTest extends FlinkTestBase {
         }
     }
 
+    @Test
+    void testHandleActiveTableDroppedDuringLogReading() throws Exception {
+        // Test that when a table is dropped while the reader is actively reading log splits,
+        // the reader produces a cancelled write result without throwing an exception.
+        TablePath tablePath = TablePath.of("fluss", "test_active_table_dropped");
+        long tableId = createTable(tablePath, DEFAULT_LOG_TABLE_DESCRIPTOR);
+
+        Configuration conf = new Configuration(FLUSS_CLUSTER_EXTENSION.getClientConfig());
+        conf.set(
+                ConfigOptions.CLIENT_WRITER_BUCKET_NO_KEY_ASSIGNER,
+                ConfigOptions.NoKeyAssigner.ROUND_ROBIN);
+        try (Connection connection = ConnectionFactory.createConnection(conf)) {
+            // Write some data so the reader has something to process
+            writeRows(
+                    connection,
+                    tablePath,
+                    Arrays.asList(row(0, "v0"), row(1, "v1"), row(2, "v2")),
+                    true);
+
+            FutureCompletingBlockingQueue<
+                            RecordsWithSplitIds<TableBucketWriteResult<TestingWriteResult>>>
+                    elementsQueue = new FutureCompletingBlockingQueue<>(16);
+            TestingReaderContext readerContext = new TestingReaderContext();
+            try (TieringSourceReader<TestingWriteResult> reader =
+                    new TieringSourceReader<>(
+                            elementsQueue,
+                            readerContext,
+                            connection,
+                            new TestingLakeTieringFactory(),
+                            Duration.ofMillis(500))) {
+
+                reader.start();
+
+                // Add a log split with a very high end offset so tiering doesn't finish naturally
+                TieringLogSplit split =
+                        new TieringLogSplit(
+                                tablePath,
+                                new TableBucket(tableId, 0),
+                                null,
+                                EARLIEST_OFFSET,
+                                100000L);
+                reader.addSplits(Collections.singletonList(split));
+
+                // Wait for the reader to start processing the split
+                FutureCompletingBlockingQueue<
+                                RecordsWithSplitIds<TableBucketWriteResult<TestingWriteResult>>>
+                        blockingQueue = getElementsQueue(reader);
+                waitUntil(
+                        () -> !blockingQueue.isEmpty(),
+                        Duration.ofSeconds(30),
+                        "Fail to wait element queue is not empty.");
+
+                // Send TieringTableDroppedEvent while the reader is actively reading
+                TieringTableDroppedEvent dropEvent = new TieringTableDroppedEvent(tableId);
+                reader.handleSourceEvents(dropEvent);
+
+                // The reader should force complete the dropped table with a cancelled result
+                retry(
+                        Duration.ofMinutes(1),
+                        () -> {
+                            TestingReaderOutput<TableBucketWriteResult<TestingWriteResult>> output =
+                                    new TestingReaderOutput<>();
+                            reader.pollNext(output);
+                            assertThat(output.getEmittedRecords()).hasSize(1);
+                            TableBucketWriteResult<TestingWriteResult> result =
+                                    output.getEmittedRecords().get(0);
+                            assertThat(result.tableBucket().getTableId()).isEqualTo(tableId);
+                            // Write result should be null since dropped table discards data
+                            assertThat(result.writeResult()).isNull();
+                            // Should be marked as cancelled
+                            assertThat(result.isCancelled()).isTrue();
+                        });
+            }
+        }
+    }
+
     /**
      * Get the elementsQueue from TieringSourceReader using reflection.
      *

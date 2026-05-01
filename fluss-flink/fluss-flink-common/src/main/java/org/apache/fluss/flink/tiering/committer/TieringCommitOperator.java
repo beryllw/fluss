@@ -23,6 +23,7 @@ import org.apache.fluss.client.admin.Admin;
 import org.apache.fluss.client.metadata.LakeSnapshot;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.LakeTableSnapshotNotExistException;
+import org.apache.fluss.flink.tiering.event.CancelledTieringEvent;
 import org.apache.fluss.flink.tiering.event.FailedTieringEvent;
 import org.apache.fluss.flink.tiering.event.FinishedTieringEvent;
 import org.apache.fluss.flink.tiering.source.TableBucketWriteResult;
@@ -160,6 +161,15 @@ public class TieringCommitOperator<WriteResult, Committable>
                         tableId,
                         tableBucketWriteResult.tablePath());
                 collectedTableBucketWriteResults.remove(tableId);
+                // Notify the enumerator that this table's tiering is cancelled (dropped)
+                // via CancelledEvent.
+                operatorEventGateway.sendEventToCoordinator(
+                        new SourceEventWrapper(
+                                new CancelledTieringEvent(
+                                        tableId,
+                                        "Table "
+                                                + tableBucketWriteResult.tablePath()
+                                                + " was dropped during tiering")));
                 return;
             }
             try {
