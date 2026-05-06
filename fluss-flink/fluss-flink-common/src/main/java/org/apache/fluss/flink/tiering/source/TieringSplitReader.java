@@ -301,7 +301,10 @@ public class TieringSplitReader<WriteResult>
             currentTableNumberOfSplits = split.getNumberOfSplits();
             TableInfo currentTableInfo = checkNotNull(currentTable).getTableInfo();
             // check currentTable's id for the table path is same with table id of the tiering
-            // split, if not, it means the tiering split is for a previous dropped table
+            // split, if not, it means the tiering split is for a previous dropped table. let's fail
+            // directly
+            // todo: we should skip and notify enumerator that the table id is not tiering now
+            // instead of fail directly
             checkArgument(
                     currentTableInfo.getTableId() == split.getTableBucket().getTableId(),
                     "The current table id %s for table path %s is different from the table id %s in TieringSplit split.",

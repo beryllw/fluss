@@ -22,7 +22,6 @@ import org.apache.fluss.exception.LakeTableSnapshotNotExistException;
 import org.apache.fluss.flink.adapter.StreamOperatorParametersAdapter;
 import org.apache.fluss.flink.tiering.TestingLakeTieringFactory;
 import org.apache.fluss.flink.tiering.TestingWriteResult;
-import org.apache.fluss.flink.tiering.event.CancelledTieringEvent;
 import org.apache.fluss.flink.tiering.event.FailedTieringEvent;
 import org.apache.fluss.flink.tiering.event.FinishedTieringEvent;
 import org.apache.fluss.flink.tiering.source.TableBucketWriteResult;
@@ -482,7 +481,7 @@ class TieringCommitOperatorTest extends FlinkTestBase {
         FailedTieringEvent failedTieringEvent =
                 (FailedTieringEvent) sourceEventWrapper.getSourceEvent();
         assertThat(failedTieringEvent.getTableId()).isEqualTo(tableId);
-        assertThat(failedTieringEvent.failReason()).contains(failedReason);
+        assertThat(failedTieringEvent.getFailureMessage()).contains(failedReason);
     }
 
     @Test
@@ -524,7 +523,7 @@ class TieringCommitOperatorTest extends FlinkTestBase {
         FailedTieringEvent failedTieringEvent =
                 (FailedTieringEvent) sourceEventWrapper.getSourceEvent();
         assertThat(failedTieringEvent.getTableId()).isEqualTo(originalTableId);
-        assertThat(failedTieringEvent.failReason())
+        assertThat(failedTieringEvent.getFailureMessage())
                 .contains("different from the table id")
                 .contains("dropped and recreated during tiering");
     }
@@ -553,15 +552,16 @@ class TieringCommitOperatorTest extends FlinkTestBase {
         // Verify no lake snapshot was created
         verifyNoLakeSnapshot(tablePath);
 
-        // Verify that a CancelledEvent was sent to notify the enumerator
-        // that the table's tiering was cancelled
+        // Verify that a FailedTieringEvent with TABLE_DROPPED type was sent to notify the
+        // enumerator that the table's tiering was cancelled
         List<OperatorEvent> operatorEvents = mockOperatorEventGateway.getEventsSent();
         assertThat(operatorEvents).hasSize(1);
         SourceEventWrapper sourceEventWrapper = (SourceEventWrapper) operatorEvents.get(0);
-        CancelledTieringEvent cancelledEvent =
-                (CancelledTieringEvent) sourceEventWrapper.getSourceEvent();
-        assertThat(cancelledEvent.getTableId()).isEqualTo(tableId);
-        assertThat(cancelledEvent.cancelReason()).contains("was dropped during tiering");
+        FailedTieringEvent failedTieringEvent =
+                (FailedTieringEvent) sourceEventWrapper.getSourceEvent();
+        assertThat(failedTieringEvent.getTableId()).isEqualTo(tableId);
+        assertThat(failedTieringEvent.isCancelled()).isTrue();
+        assertThat(failedTieringEvent.getFailureMessage()).contains("was dropped during tiering");
     }
 
     private CommittedLakeSnapshot mockCommittedLakeSnapshot(

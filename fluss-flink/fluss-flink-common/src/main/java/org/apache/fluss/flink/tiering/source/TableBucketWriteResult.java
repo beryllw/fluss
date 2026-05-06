@@ -30,11 +30,6 @@ import java.io.Serializable;
  * that the write result is for, the end log offset of tiering, the total number of write results in
  * one round of tiering. It'll be passed to downstream committer operator to collect all the write
  * results of a table and do commit.
- *
- * <p>When {@code cancelled} is {@code true}, it indicates this result originates from a tiering
- * round that was aborted (e.g., the table was dropped). In this case the {@link WriteResult} will
- * always be {@code null} and the downstream committer should skip the commit and instead report the
- * cancellation back to the coordinator.
  */
 public class TableBucketWriteResult<WriteResult> implements Serializable {
 

@@ -19,25 +19,47 @@ package org.apache.fluss.flink.tiering.event;
 
 import org.apache.flink.api.connector.source.SourceEvent;
 
-/** SourceEvent used to represent a Fluss table is failed during tiering. */
+import static org.apache.fluss.utils.Preconditions.checkNotNull;
+
+/** SourceEvent used to represent a Fluss table has failed during tiering. */
 public class FailedTieringEvent implements SourceEvent {
+
+    public enum FailureType {
+        TABLE_DROPPED,
+        COMMIT_FAILURE
+    }
 
     private static final long serialVersionUID = 1L;
 
     private final long tableId;
 
-    private final String failReason;
+    private final FailureType failureType;
 
-    public FailedTieringEvent(long tableId, String failReason) {
+    private final String failureMessage;
+
+    public FailedTieringEvent(long tableId, String failureMessage) {
+        this(tableId, FailureType.COMMIT_FAILURE, failureMessage);
+    }
+
+    public FailedTieringEvent(long tableId, FailureType failureType, String failureMessage) {
         this.tableId = tableId;
-        this.failReason = failReason;
+        this.failureType = checkNotNull(failureType);
+        this.failureMessage = failureMessage;
     }
 
     public long getTableId() {
         return tableId;
     }
 
-    public String failReason() {
-        return failReason;
+    public FailureType getFailureType() {
+        return failureType;
+    }
+
+    public String getFailureMessage() {
+        return failureMessage;
+    }
+
+    public boolean isCancelled() {
+        return failureType == FailureType.TABLE_DROPPED;
     }
 }

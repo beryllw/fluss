@@ -24,7 +24,6 @@ import org.apache.fluss.client.admin.Admin;
 import org.apache.fluss.client.metadata.MetadataUpdater;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.flink.metrics.FlinkMetricRegistry;
-import org.apache.fluss.flink.tiering.event.CancelledTieringEvent;
 import org.apache.fluss.flink.tiering.event.FailedTieringEvent;
 import org.apache.fluss.flink.tiering.event.FinishedTieringEvent;
 import org.apache.fluss.flink.tiering.event.TieringReachMaxDurationEvent;
@@ -271,11 +270,7 @@ public class TieringSourceEnumerator
 
     /**
      * Transition a table from tiering to failed state by moving its epoch from {@link
-     * #tieringTableEpochs} to {@link #failedTableEpochs}. If the table is not currently in tiering
-     * (e.g., already removed by a prior cancellation or failure notification), this method is a
-     * no-op.
-     *
-     * @return the epoch that was transitioned, or {@code null} if the table was not in tiering
+     * #tieringTableEpochs} to {@link #failedTableEpochs}.
      */
     @Nullable
     private Long markTableAsFailed(long tableId) {
@@ -313,31 +308,20 @@ public class TieringSourceEnumerator
             LOG.info(
                     "Tiering table {} is failed, fail reason is {}.",
                     failedTableId,
-                    failedEvent.failReason());
+                    failedEvent.getFailureMessage());
             Long tieringEpoch = markTableAsFailed(failedTableId);
             if (tieringEpoch == null) {
-                // shouldn't happen, warn it
-                LOG.warn(
-                        "The failed table {} is not in tiering table, won't report it to Fluss to mark as failed.",
-                        failedTableId);
-            }
-        }
-
-        if (sourceEvent instanceof CancelledTieringEvent) {
-            // Fallback: Committer-side detection when Enumerator misses the table drop via
-            // heartbeat.
-            CancelledTieringEvent cancelledEvent = (CancelledTieringEvent) sourceEvent;
-            long cancelledTableId = cancelledEvent.getTableId();
-            LOG.info(
-                    "Tiering for table {} is cancelled, cancel reason: {}.",
-                    cancelledTableId,
-                    cancelledEvent.cancelReason());
-            Long tieringEpoch = markTableAsFailed(cancelledTableId);
-            if (tieringEpoch == null) {
-                LOG.info(
-                        "Table {} was already removed from tiering state, "
-                                + "won't report it to Fluss to mark as failed.",
-                        cancelledTableId);
+                if (!failedEvent.isCancelled()) {
+                    // shouldn't happen, warn it
+                    LOG.warn(
+                            "The failed table {} is not in tiering table, won't report it to Fluss to mark as failed.",
+                            failedTableId);
+                } else {
+                    LOG.info(
+                            "Table {} was already removed from tiering state, "
+                                    + "won't report it to Fluss to mark as failed.",
+                            failedTableId);
+                }
             }
         }
 
