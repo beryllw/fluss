@@ -24,6 +24,7 @@ import static org.apache.fluss.utils.Preconditions.checkNotNull;
 /** SourceEvent used to represent a Fluss table has failed during tiering. */
 public class FailedTieringEvent implements SourceEvent {
 
+    /** The type of tiering failure. */
     public enum FailureType {
         TABLE_DROPPED,
         COMMIT_FAILURE
