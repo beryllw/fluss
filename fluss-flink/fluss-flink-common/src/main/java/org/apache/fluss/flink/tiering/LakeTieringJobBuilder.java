@@ -20,6 +20,7 @@ package org.apache.fluss.flink.tiering;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.flink.tiering.committer.CommittableMessageTypeInfo;
 import org.apache.fluss.flink.tiering.committer.TieringCommitOperatorFactory;
+import org.apache.fluss.flink.tiering.source.TableBucketWriteResult;
 import org.apache.fluss.flink.tiering.source.TableBucketWriteResultTypeInfo;
 import org.apache.fluss.flink.tiering.source.TieringSource;
 import org.apache.fluss.lake.lakestorage.LakeStorage;
@@ -28,8 +29,11 @@ import org.apache.fluss.lake.lakestorage.LakeStoragePluginSetUp;
 import org.apache.fluss.lake.writer.LakeTieringFactory;
 
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
+import org.apache.flink.api.common.functions.Partitioner;
+import org.apache.flink.api.java.functions.KeySelector;
 import org.apache.flink.configuration.PipelineOptions;
 import org.apache.flink.core.execution.JobClient;
+import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.datastream.DataStreamSource;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.functions.sink.v2.DiscardingSink;
@@ -101,22 +105,41 @@ public class LakeTieringJobBuilder {
 
         source.getTransformation().setUid(TIERING_SOURCE_TRANSFORMATION_UID);
 
-        source.transform(
+        DataStream rawSource = (DataStream) source;
+        rawSource
+                .partitionCustom(new TableIdPartitioner(), new TableIdKeySelector())
+                .transform(
                         "TieringCommitter",
                         CommittableMessageTypeInfo.of(
                                 () -> lakeTieringFactory.getCommittableSerializer()),
                         new TieringCommitOperatorFactory(
                                 flussConfig, lakeTieringConfig, lakeTieringFactory))
-                .setParallelism(1)
-                .setMaxParallelism(1)
                 .sinkTo(new DiscardingSink())
-                .name("end")
-                .setParallelism(1);
+                .name("end");
         String jobName =
                 env.getConfiguration()
                         .getOptional(PipelineOptions.NAME)
                         .orElse(DEFAULT_TIERING_SERVICE_JOB_NAME + " - " + dataLakeFormat);
 
         return env.executeAsync(jobName);
+    }
+
+    private static class TableIdPartitioner implements Partitioner<Long> {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public int partition(Long key, int numPartitions) {
+            return (int) (Math.abs(key) % numPartitions);
+        }
+    }
+
+    private static class TableIdKeySelector<T>
+            implements KeySelector<TableBucketWriteResult<T>, Long> {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public Long getKey(TableBucketWriteResult value) {
+            return value.tableBucket().getTableId();
+        }
     }
 }
