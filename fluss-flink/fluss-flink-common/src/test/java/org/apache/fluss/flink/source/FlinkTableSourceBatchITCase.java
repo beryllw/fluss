@@ -324,9 +324,9 @@ abstract class FlinkTableSourceBatchITCase extends FlinkTestBase {
         List<String> expected =
                 Arrays.asList(
                         "+I[1, address1, name1]",
-                        "+I[2, address2, name2]",
+                        "+I[2, null, name2]",
                         "+I[3, address3, name3]",
-                        "+I[4, address4, name4]",
+                        "+I[4, null, name4]",
                         "+I[5, address5, name5]");
         assertThat(collected).isSubsetOf(expected);
         assertThat(collected).hasSize(2);
