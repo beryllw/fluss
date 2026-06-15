@@ -17,10 +17,21 @@
 
 //! P4 — PostgreSQL wire frontend (transport / handler / adapter / compat).
 //!
-//! Read-only SQL in Phase 1. Owns the prepared-statement wire lifecycle and any
-//! protocol-local caching; translates wire auth into a neutral `Credential` and
-//! maps domain errors to PG error codes at the boundary. No global shared-session
-//! model. Design: `design/sql-path.md` P4.
+//! Read-only SQL in Phase 1. The four submodules follow the design's layering
+//! (`design/sql-path.md` §P4.1):
+//! - [`transport`]: TCP listener / accept / per-connection task (cleartext only);
+//! - [`handler`]: the pgwire protocol state machine, bridging to `Instance`;
+//! - [`adapter`]: the wire <-> gateway boundary (startup mapping, Arrow->PG
+//!   encoding, domain-error->PG mapping, the out-of-band cancel registry);
+//! - [`compat`]: BI/IDE statement classification (SET/SHOW/txn/write/probe).
+//!
+//! `Instance` carries zero pgwire dependency: the frontend depends only on the
+//! [`GatewayInstance`](crate::instance::GatewayInstance) trait, the auth seam,
+//! and the neutral domain types/errors.
 
-// TODO(P4): implement the pgwire transport, startup/auth handshake, simple/
-// extended query handlers, and Arrow->PG result encoding (via arrow-pg).
+pub mod adapter;
+pub mod compat;
+pub mod handler;
+pub mod transport;
+
+pub use transport::PgServer;

@@ -29,8 +29,9 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{DataType, SchemaRef};
 use arrow::record_batch::RecordBatch;
+use datafusion::common::ParamValues;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use tokio_util::sync::CancellationToken;
 
@@ -146,6 +147,11 @@ pub enum SessionMutation {
     SetCurrentSchema(Option<String>),
     SetEnvironmentVar { key: String, value: SessionVarValue },
     UnsetEnvironmentVar { key: String },
+    /// Reset all mutable session state to the values fixed at `open_session`
+    /// (the connection's initial [`SessionVars`]) and force a context rebuild
+    /// before the next query. Backs `DISCARD ALL` (sql-path.md §P4.3); its effect
+    /// is always `RebuildContextBeforeNextQuery`.
+    ResetAll,
 }
 
 /// How a [`SessionMutation`] affects the live `SessionContext`.
@@ -168,10 +174,15 @@ pub struct DescribeSqlRequest {
     pub statement: String,
 }
 
-/// Result of describing a SQL statement: the result schema, Arrow-native.
+/// Result of describing a SQL statement: the result schema plus the inferred
+/// parameter types, both Arrow-native. `param_types[i]` is the Arrow type of the
+/// `$(i+1)` placeholder; the protocol boundary maps these to PG type OIDs for the
+/// `ParameterDescription` reply (sql-path.md §P4.4). An empty vec means the
+/// statement is non-parameterized (or the environment cannot infer parameters).
 #[derive(Debug, Clone)]
 pub struct SqlDescription {
     pub schema: SchemaRef,
+    pub param_types: Vec<DataType>,
 }
 
 /// Per-execution overrides; merged with session vars at execution time.
@@ -183,10 +194,18 @@ pub struct SqlExecutionOptions {
 }
 
 /// Request to execute a SQL statement within a session.
+///
+/// `params` carries the bound positional parameter values for a parameterized
+/// statement (the `$1..$N` placeholders), already decoded to DataFusion-native
+/// [`ParamValues`] at the protocol boundary (PG wire text/binary -> `ScalarValue`,
+/// sql-path.md §P4.4). It is `None` for a plain, non-parameterized statement
+/// (e.g. the simple-query path), and the SQL service applies it to the logical
+/// plan before execution.
 #[derive(Debug, Clone)]
 pub struct ExecuteSqlRequest {
     pub session_id: SessionId,
     pub statement: String,
+    pub params: Option<ParamValues>,
     pub options: SqlExecutionOptions,
 }
 

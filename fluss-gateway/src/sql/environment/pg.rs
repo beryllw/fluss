@@ -157,6 +157,8 @@ fn classify_effect(mutation: &SessionMutation) -> SessionMutationEffect {
             "pg.search_path" => SessionMutationEffect::RebuildContextBeforeNextQuery,
             _ => SessionMutationEffect::SessionOnly,
         },
+        // DISCARD ALL: full reset always rebuilds before the next query.
+        SessionMutation::ResetAll => SessionMutationEffect::RebuildContextBeforeNextQuery,
     }
 }
 

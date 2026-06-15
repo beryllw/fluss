@@ -61,6 +61,11 @@ serde_json = "1"
 thiserror = "2"
 bytes = "1"
 tracing = "0.1"
+# Unguessable per-connection PG cancel backend-key secret (§P4.6).
+rand = "0.8"
 
 [dev-dependencies]
 tracing-subscriber = "0.3"
+# Real PostgreSQL wire client for protocol integration tests (P4). Drives the
+# gateway over loopback TCP with no Fluss cluster, against a fake GatewayInstance.
+tokio-postgres = "0.7"

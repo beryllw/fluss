@@ -64,6 +64,15 @@ pub fn apply_session_mutation(
             vars.environment.remove(key);
             classify_environment_key(key)
         }
+        // Full session reset (DISCARD ALL). The authoritative "reset to the
+        // connection's initial vars" happens in `GatewaySession::apply_mutation`,
+        // which holds the initial snapshot; at the bare-vars level we can only
+        // clear to defaults. Either way name resolution may change, so the effect
+        // is always a rebuild before the next query.
+        SessionMutation::ResetAll => {
+            *vars = SessionVars::default();
+            SessionMutationEffect::RebuildContextBeforeNextQuery
+        }
     }
 }
 

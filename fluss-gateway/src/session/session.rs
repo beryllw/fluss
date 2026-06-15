@@ -76,6 +76,9 @@ pub struct GatewaySession {
     pub cluster: ClusterId,
     pub sql_environment: Option<SqlEnvironmentId>,
     vars: Arc<SyncRwLock<SessionVars>>,
+    /// Connection-time initial vars, kept immutably so `SessionMutation::ResetAll`
+    /// (DISCARD ALL) can restore them verbatim instead of clearing to defaults.
+    initial_vars: SessionVars,
     pub client_info: ClientInfo,
     operation_manager: OperationManager,
     /// Current per-session context; `None` until first describe/execute (lazy).
@@ -108,7 +111,8 @@ impl GatewaySession {
             principal,
             cluster,
             sql_environment,
-            vars: Arc::new(SyncRwLock::new(initial_vars)),
+            vars: Arc::new(SyncRwLock::new(initial_vars.clone())),
+            initial_vars,
             client_info,
             operation_manager: OperationManager::new(),
             sql_context: AsyncRwLock::new(None),
@@ -170,7 +174,16 @@ impl GatewaySession {
     pub fn apply_mutation(&self, mutation: &SessionMutation) -> SessionMutationEffect {
         let effect = {
             let mut vars = self.vars.write().unwrap();
-            apply_session_mutation(&mut vars, mutation)
+            match mutation {
+                // ResetAll restores the connection's initial vars (DISCARD ALL).
+                // The bare-vars helper can only clear to defaults, so the session —
+                // which owns the initial snapshot — applies the reset itself.
+                SessionMutation::ResetAll => {
+                    *vars = self.initial_vars.clone();
+                    SessionMutationEffect::RebuildContextBeforeNextQuery
+                }
+                _ => apply_session_mutation(&mut vars, mutation),
+            }
         };
         if effect == SessionMutationEffect::RebuildContextBeforeNextQuery {
             self.sql_context_dirty.store(true, Ordering::Release);
@@ -358,6 +371,43 @@ mod tests {
         let snap2 = s.snapshot().vars.environment.clone();
         assert_eq!(e1, e2);
         assert_eq!(snap1, snap2);
+    }
+
+    // §P4.3 — ResetAll (DISCARD ALL) restores the connection's initial vars and
+    // forces a rebuild before the next query.
+    #[tokio::test]
+    async fn reset_all_restores_initial_vars_and_rebuilds() {
+        let initial = SessionVars {
+            timezone: Some("Asia/Shanghai".into()),
+            ..SessionVars::default()
+        };
+        let s = session(initial.clone());
+        let b = CountingBuilder::new();
+        s.context_for_query(&b).await.unwrap();
+
+        // Drift the session away from its initial state.
+        s.apply_mutation(&SessionMutation::SetTimezone(Some("UTC".into())));
+        s.apply_mutation(&SessionMutation::SetEnvironmentVar {
+            key: "pg.search_path".into(),
+            value: SessionVarValue::String("custom".into()),
+        });
+        assert_eq!(s.snapshot().vars.timezone.as_deref(), Some("UTC"));
+
+        let effect = s.apply_mutation(&SessionMutation::ResetAll);
+        assert_eq!(effect, SessionMutationEffect::RebuildContextBeforeNextQuery);
+        assert!(s.is_dirty());
+
+        let vars = s.snapshot().vars;
+        assert_eq!(vars.timezone.as_deref(), Some("Asia/Shanghai"));
+        assert!(
+            !vars.environment.contains_key("pg.search_path"),
+            "all drifted vars reset to initial"
+        );
+
+        // Next query rebuilds with the restored vars.
+        s.context_for_query(&b).await.unwrap();
+        assert_eq!(b.count(), 2);
+        assert!(!s.is_dirty());
     }
 
     // §P2.6 — close marks closed and cancels active ops.
