@@ -15,12 +15,77 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! P3 — SqlEnvironmentProvider / Registry + PgSqlEnvironmentProvider.
+//! P3 — SQL environment assembly layer.
 //!
-//! SQL environment differences (pg_catalog overlay, session vars defaults) are
-//! installed through a provider, never hardcoded into `Instance`. The Registry
-//! selects the provider per SQL frontend (PG today).
-//! Design: `design/sql-path.md` P3.
+//! SQL environment differences (catalog wiring, pg_catalog base + overlay,
+//! initial session vars) are installed through a [`SqlEnvironmentProvider`],
+//! never hardcoded into `Instance`. A [`SqlEnvironmentRegistry`] selects the
+//! provider per SQL frontend (PostgreSQL today). `PgSqlEnvironmentProvider`
+//! implements the fixed 5-step assembly order. The provider owns only
+//! *SessionContext content*; the wire belongs to the PG adapter (P4).
+//! Design: `design/sql-path.md` §P3.1-§P3.4 and `design/datafusion-contract.md` D1.
+//!
+//! Submodules:
+//! - `provider`      — the [`SqlEnvironmentProvider`] trait (§P3.1).
+//! - `registry`      — [`SqlEnvironmentRegistry`] (§P3.2).
+//! - `collaborators` — stub seams for the not-yet-ready external steps (2 & 4).
+//! - `apply`         — step-5 session-vars snapshot applier (gateway-owned).
+//! - `pg`            — [`PgSqlEnvironmentProvider`] + the 5-step order (§P3.3).
+//! - `bridge`        — adapts registry+provider onto the P2 builder seam (§P3.4).
 
-// TODO(P3): define SqlEnvironmentProvider, SqlEnvironmentRegistry, and the
-// PgSqlEnvironmentProvider (installs pg_catalog via datafusion-pg-catalog).
+pub mod apply;
+pub mod bridge;
+pub mod collaborators;
+pub mod pg;
+pub mod provider;
+pub mod registry;
+
+pub use bridge::EnvironmentContextBuilder;
+pub use collaborators::{
+    FlussCatalogInstaller, PgCatalogOverlayInstaller, StubFlussCatalogInstaller,
+    StubPgCatalogOverlayInstaller,
+};
+pub use pg::{PgSqlEnvironmentProvider, FLUSS_CATALOG};
+pub use provider::SqlEnvironmentProvider;
+pub use registry::SqlEnvironmentRegistry;
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+    use crate::error::GatewayError;
+    use crate::types::SqlEnvironmentId;
+    use std::sync::Arc;
+
+    /// Test 4: registry register / lookup; unknown id gives a clear error.
+    #[test]
+    fn register_and_lookup() {
+        let mut reg = SqlEnvironmentRegistry::new();
+        assert!(reg.is_empty());
+        let provider: Arc<dyn SqlEnvironmentProvider> = Arc::new(PgSqlEnvironmentProvider::with_stubs());
+        reg.register(SqlEnvironmentId("postgres".into()), provider);
+        assert_eq!(reg.len(), 1);
+        assert!(reg.contains(&SqlEnvironmentId("postgres".into())));
+        assert!(reg.get(&SqlEnvironmentId("postgres".into())).is_ok());
+    }
+
+    #[test]
+    fn unknown_environment_errors_clearly() {
+        let reg = SqlEnvironmentRegistry::new();
+        match reg.get(&SqlEnvironmentId("mysql".into())) {
+            Err(GatewayError::Unsupported(msg)) => assert!(msg.contains("mysql")),
+            Err(other) => panic!("expected Unsupported error, got {other:?}"),
+            Ok(_) => panic!("expected an error for an unregistered environment"),
+        }
+    }
+
+    #[test]
+    fn phase1_registers_only_postgres() {
+        let mut reg = SqlEnvironmentRegistry::new();
+        reg.register(
+            SqlEnvironmentId("postgres".into()),
+            Arc::new(PgSqlEnvironmentProvider::with_stubs()),
+        );
+        assert_eq!(reg.len(), 1);
+        assert!(reg.contains(&SqlEnvironmentId("postgres".into())));
+    }
+}

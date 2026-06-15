@@ -46,10 +46,15 @@ use crate::types::{
 /// environment). This trait is the injection point the P3 environment provider
 /// implements; P2 tests supply a fake builder to exercise the dirty -> rebuild ->
 /// generation lifecycle without touching DataFusion catalog wiring.
+///
+/// `build` is async because the real P3 assembly (`prepare_session_context`,
+/// design §P3.1) installs catalogs / pg_catalog asynchronously; the rebuild path
+/// (`context_for_query`) is already async, so the seam stays async end-to-end.
+#[async_trait::async_trait]
 pub trait SessionContextBuilder: Send + Sync {
     /// Build a fresh context for `vars`. The previous context (if any) is passed
     /// so an implementation may reuse shared heavy objects; P2 ignores it.
-    fn build(
+    async fn build(
         &self,
         vars: &SessionVars,
         previous: Option<&Arc<SessionContext>>,
@@ -188,7 +193,7 @@ impl GatewaySession {
         let needs_build = guard.is_none() || self.sql_context_dirty.load(Ordering::Acquire);
         if needs_build {
             let vars = self.vars.read().unwrap().clone();
-            let new_ctx = builder.build(&vars, guard.as_ref())?;
+            let new_ctx = builder.build(&vars, guard.as_ref()).await?;
             // Swap the pointer; the previous Arc is dropped from the session slot
             // but any running operation still holds its own clone.
             *guard = Some(Arc::clone(&new_ctx));
@@ -265,8 +270,9 @@ mod tests {
             self.builds.load(Ordering::Acquire)
         }
     }
+    #[async_trait::async_trait]
     impl SessionContextBuilder for CountingBuilder {
-        fn build(
+        async fn build(
             &self,
             _vars: &SessionVars,
             _previous: Option<&Arc<SessionContext>>,
