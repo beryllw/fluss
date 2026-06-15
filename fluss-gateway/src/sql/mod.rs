@@ -23,3 +23,5 @@
 
 pub mod gateway_service;
 pub mod environment;
+
+pub use gateway_service::SqlGatewayService;

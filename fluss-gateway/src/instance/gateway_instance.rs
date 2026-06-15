@@ -24,10 +24,10 @@
 //! - operation cancel/status -> the owning session's `OperationManager` (P2.10),
 //!   resolved through a small op->session index.
 //!
-//! SQL `describe_sql` / `execute_sql` are deliberately `Unsupported` here: the
-//! SQL execution orchestration (per-session `SessionContext` build + DataFusion
-//! planning) lands in the next task (sql/gateway_service, design P3). Returning
-//! `Unsupported` keeps the facade honest rather than faking a SQL path.
+//! SQL `describe_sql` / `execute_sql` delegate to the [`SqlGatewayService`]
+//! (sql/gateway_service, design P3): per-session `SessionContext` build/rebuild +
+//! DataFusion planning/execution. `execute_sql` also records the produced
+//! operation in `op_index` so cancel/status route to the owning session.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -38,6 +38,8 @@ use crate::backend::BackendFacade;
 use crate::error::{GatewayError, GatewayResult};
 use crate::instance::GatewayInstance;
 use crate::session::manager::SessionManager;
+use crate::sql::environment::SqlEnvironmentRegistry;
+use crate::sql::SqlGatewayService;
 use crate::types::{
     CancelResult, DescribeSqlRequest, DirectReadRequest, DirectReadResult, DirectWriteRequest,
     DirectWriteResult, ExecuteSqlRequest, MetadataScope, OpenSessionRequest, OperationId,
@@ -54,18 +56,29 @@ use crate::types::{
 pub struct GatewayInstanceImpl {
     sessions: Arc<SessionManager>,
     backend: Arc<dyn BackendFacade>,
+    /// SQL execution orchestration (P3): per-session context build/rebuild +
+    /// DataFusion planning/execution. Shares the same `SessionManager` so the
+    /// operations it registers live on the very sessions this facade owns.
+    sql: SqlGatewayService,
     /// op -> owning session, so `cancel_operation` / `get_operation_status` can
-    /// route to the right `OperationManager` without scanning every session. The
-    /// SQL execution task populates this when it registers operations; this task
-    /// only reads it (no instance-created operations exist yet).
+    /// route to the right `OperationManager` without scanning every session.
+    /// `execute_sql` populates this for each Query it produces.
     op_index: Mutex<HashMap<OperationId, SessionId>>,
 }
 
 impl GatewayInstanceImpl {
-    pub fn new(sessions: Arc<SessionManager>, backend: Arc<dyn BackendFacade>) -> Self {
+    /// Construct with the shared SQL environment registry (selects the per-session
+    /// SQL environment provider, e.g. `"postgres"`).
+    pub fn new(
+        sessions: Arc<SessionManager>,
+        backend: Arc<dyn BackendFacade>,
+        sql_environments: Arc<SqlEnvironmentRegistry>,
+    ) -> Self {
+        let sql = SqlGatewayService::new(Arc::clone(&sessions), sql_environments);
         Self {
             sessions,
             backend,
+            sql,
             op_index: Mutex::new(HashMap::new()),
         }
     }
@@ -110,18 +123,22 @@ impl GatewayInstance for GatewayInstanceImpl {
         Ok(session.snapshot())
     }
 
-    // --- SQL: deferred to the SQL-orchestration task ---
+    // --- SQL: delegate to the SQL gateway service (P3) ---
 
-    async fn describe_sql(&self, _req: DescribeSqlRequest) -> GatewayResult<SqlDescription> {
-        Err(GatewayError::Unsupported(
-            "SQL describe lands in the SQL execution task (sql/gateway_service, P3)".into(),
-        ))
+    async fn describe_sql(&self, req: DescribeSqlRequest) -> GatewayResult<SqlDescription> {
+        self.sql.describe_sql(req).await
     }
 
-    async fn execute_sql(&self, _req: ExecuteSqlRequest) -> GatewayResult<SqlExecution> {
-        Err(GatewayError::Unsupported(
-            "SQL execute lands in the SQL execution task (sql/gateway_service, P3)".into(),
-        ))
+    async fn execute_sql(&self, req: ExecuteSqlRequest) -> GatewayResult<SqlExecution> {
+        let session_id = req.session_id.clone();
+        let exec = self.sql.execute_sql(req).await?;
+        // Index the produced operation so cancel/status route to its owning session.
+        let op_id = match &exec {
+            SqlExecution::Query { operation_id, .. } => operation_id.clone(),
+            SqlExecution::Command { operation_id, .. } => operation_id.clone(),
+        };
+        self.op_index.lock().unwrap().insert(op_id, session_id);
+        Ok(exec)
     }
 
     // --- Operation: route to the owning session's OperationManager (P2.10) ---
@@ -174,17 +191,15 @@ impl GatewayInstance for GatewayInstanceImpl {
         self.backend.list_databases(&scope).await
     }
 
-    async fn list_tables(&self, _scope: MetadataScope) -> GatewayResult<Vec<String>> {
-        // Known facade gap (P1/P5): the trait's `list_tables(scope)` carries no
-        // database, but the backend `list_tables(db)` requires one. The REST
-        // metadata endpoint receives the database in its path; wiring that through
-        // needs a `database` on the facade method (a P1 trait change, out of scope
-        // for this task). Until then this is `Unsupported` rather than a
-        // misleading empty list. The backend-level `list_tables(db)` is fully
-        // implemented; its live behavior is left for the final end-to-end task.
-        Err(GatewayError::Unsupported(
-            "facade list_tables needs a database arg; backend list_tables(db) is implemented".into(),
-        ))
+    async fn list_tables(
+        &self,
+        scope: MetadataScope,
+        database: String,
+    ) -> GatewayResult<Vec<String>> {
+        // P1 facade gap closed: delegate to the database-scoped backend surface and
+        // project to bare table names (the REST view returns names within a `{db}`).
+        let tables = self.backend.list_tables(&scope, &database).await?;
+        Ok(tables.into_iter().map(|t| t.table).collect())
     }
 
     async fn get_table_info(
@@ -274,8 +289,14 @@ mod tests {
     }
 
     fn instance() -> GatewayInstanceImpl {
+        use crate::sql::environment::{PgSqlEnvironmentProvider, SqlEnvironmentRegistry};
         let mgr = Arc::new(SessionManager::new(SessionManagerConfig::default()));
-        GatewayInstanceImpl::new(mgr, Arc::new(RecordingBackend::new()))
+        let mut reg = SqlEnvironmentRegistry::new();
+        reg.register(
+            SqlEnvironmentId("postgres".into()),
+            Arc::new(PgSqlEnvironmentProvider::with_stubs()),
+        );
+        GatewayInstanceImpl::new(mgr, Arc::new(RecordingBackend::new()), Arc::new(reg))
     }
 
     fn open_req() -> OpenSessionRequest {
@@ -377,18 +398,57 @@ mod tests {
         assert!(matches!(err, GatewayError::TableNotFound { .. }));
     }
 
-    // SQL path is honestly Unsupported until the SQL execution task lands.
+    // SQL path now executes through the SQL gateway service; the produced
+    // operation is indexed so cancel/status route to its owning session (P3).
     #[tokio::test]
-    async fn sql_paths_are_unsupported_this_phase() {
+    async fn sql_execute_runs_and_indexes_operation() {
+        use futures::TryStreamExt;
+
         let inst = instance();
         let snap = inst.open_session(open_req()).await.unwrap();
-        let d = inst
+
+        let desc = inst
             .describe_sql(DescribeSqlRequest {
                 session_id: snap.id.clone(),
-                statement: "SELECT 1".into(),
+                statement: "SELECT 1 AS one".into(),
             })
-            .await;
-        assert!(matches!(d, Err(GatewayError::Unsupported(_))));
+            .await
+            .unwrap();
+        assert_eq!(desc.schema.fields().len(), 1);
+
+        let exec = inst
+            .execute_sql(ExecuteSqlRequest {
+                session_id: snap.id.clone(),
+                statement: "SELECT 1 AS one".into(),
+                params: None,
+                options: Default::default(),
+            })
+            .await
+            .unwrap();
+        let op_id = match exec {
+            SqlExecution::Query {
+                operation_id,
+                stream,
+                ..
+            } => {
+                let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+                assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+                operation_id
+            }
+            _ => panic!("SELECT must be a Query"),
+        };
+
+        // Status routes through op_index to the owning session.
+        let st = inst.get_operation_status(op_id).await.unwrap();
+        assert_eq!(st.state, crate::types::OperationState::Finished);
+    }
+
+    // list_tables now delegates to the backend with the database arg.
+    #[tokio::test]
+    async fn list_tables_delegates_with_database() {
+        let inst = instance();
+        let tables = inst.list_tables(scope(), "db".into()).await.unwrap();
+        assert!(tables.is_empty(), "RecordingBackend returns no tables");
     }
 
     // Unknown operation: cancel -> NotFound, status -> OperationNotFound.

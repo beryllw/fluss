@@ -343,7 +343,11 @@ impl GatewayInstance for FakeInstance {
         Ok(vec!["fluss".into()])
     }
 
-    async fn list_tables(&self, _scope: MetadataScope) -> GatewayResult<Vec<String>> {
+    async fn list_tables(
+        &self,
+        _scope: MetadataScope,
+        _database: String,
+    ) -> GatewayResult<Vec<String>> {
         Ok(vec!["t".into()])
     }
 

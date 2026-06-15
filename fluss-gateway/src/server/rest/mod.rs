@@ -329,7 +329,7 @@ async fn handle_list_databases(
 
 async fn handle_list_tables(
     State(state): State<RestState>,
-    Path((cluster, _db)): Path<(String, String)>,
+    Path((cluster, db)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
     let result = async {
@@ -338,7 +338,7 @@ async fn handle_list_tables(
             principal: ctx.principal,
             cluster: ctx.cluster,
         };
-        state.instance.list_tables(scope).await
+        state.instance.list_tables(scope, db).await
     }
     .await;
     match result {

@@ -71,7 +71,14 @@ pub trait GatewayInstance: Send + Sync {
 
     // --- Metadata ---
     async fn list_databases(&self, scope: MetadataScope) -> GatewayResult<Vec<String>>;
-    async fn list_tables(&self, scope: MetadataScope) -> GatewayResult<Vec<String>>;
+    /// List table names within `database`. The `database` arg closes the P1 facade
+    /// gap: the backend `list_tables(db)` is database-scoped, and protocol frontends
+    /// (REST `{db}` path segment, PG catalog views) always carry one.
+    async fn list_tables(
+        &self,
+        scope: MetadataScope,
+        database: String,
+    ) -> GatewayResult<Vec<String>>;
     async fn get_table_info(
         &self,
         scope: MetadataScope,
