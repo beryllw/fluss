@@ -24,3 +24,6 @@
 
 pub mod postgres;
 pub mod rest;
+
+pub use postgres::PgServer;
+pub use rest::RestServer;

@@ -21,7 +21,13 @@
 //! frontend so protocol behavior can be driven by a real wire client
 //! (`tokio-postgres`) over loopback TCP with no Fluss cluster (P4 test
 //! strategy). `FakeInstance` returns deterministic Arrow results for fixed
-//! SELECTs, treats SET/SHOW/BEGIN as `Command`, and records cancel calls.
+//! SELECTs, treats SET/SHOW/BEGIN as `Command`, and records cancel calls. The
+//! REST frontend (P5) reuses the same `FakeInstance`, which additionally records
+//! direct writes and opened-session counts.
+//!
+//! Each integration test binary includes this module, so items used by only one
+//! binary look "dead" to the other; silence that here.
+#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -40,12 +46,32 @@ use fluss_gateway::auth::TrustAuthenticator;
 use fluss_gateway::error::{GatewayError, GatewayResult};
 use fluss_gateway::instance::GatewayInstance;
 use fluss_gateway::server::postgres::PgServer;
+use fluss_gateway::server::rest::RestServer;
 use fluss_gateway::types::{
     CancelResult, DescribeSqlRequest, DirectReadRequest, DirectReadResult, DirectWriteRequest,
     DirectWriteResult, ExecuteSqlRequest, MetadataScope, OpenSessionRequest, OperationId,
     OperationState, OperationStatusSnapshot, SessionId, SessionMutation, SessionSnapshot,
     SqlDescription, SqlExecution, TableInfo, TableRef,
 };
+
+/// One recorded direct write, so REST tests can assert the request reached the
+/// instance with the right shape, table, principal, and row count — and that no
+/// session was opened along the way (the direct path is stateless).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedWrite {
+    pub kind: WriteKind,
+    pub table: TableRef,
+    pub principal: String,
+    pub cluster: String,
+    pub rows: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteKind {
+    KvUpsert,
+    KvDelete,
+    LogAppend,
+}
 
 /// Deterministic in-memory [`GatewayInstance`] for protocol tests.
 ///
@@ -56,6 +82,14 @@ pub struct FakeInstance {
     sessions: Mutex<HashMap<String, SessionSnapshot>>,
     next_id: Mutex<u64>,
     pub cancelled: Mutex<Vec<String>>,
+    /// Every direct write that reached the instance (REST path assertions).
+    pub writes: Mutex<Vec<RecordedWrite>>,
+    /// Tables that should resolve as not-found from metadata (drives the 404
+    /// mapping test). Anything not listed resolves to the canned schema.
+    pub missing_tables: Mutex<Vec<String>>,
+    /// Number of sessions ever opened. Direct (REST) requests must NOT increment
+    /// this — it backs the "direct path has no session" semantic test.
+    pub sessions_opened: Mutex<u64>,
 }
 
 impl FakeInstance {
@@ -144,6 +178,7 @@ fn count_placeholders(sql: &str) -> usize {
 #[async_trait]
 impl GatewayInstance for FakeInstance {
     async fn open_session(&self, req: OpenSessionRequest) -> GatewayResult<SessionSnapshot> {
+        *self.sessions_opened.lock().unwrap() += 1;
         let id = SessionId(self.next("sess-"));
         let snap = SessionSnapshot {
             id: id.clone(),
@@ -273,8 +308,35 @@ impl GatewayInstance for FakeInstance {
         Err(GatewayError::Unsupported("direct read deferred".into()))
     }
 
-    async fn write_direct(&self, _req: DirectWriteRequest) -> GatewayResult<DirectWriteResult> {
-        Err(GatewayError::Unsupported("not used in PG tests".into()))
+    async fn write_direct(&self, req: DirectWriteRequest) -> GatewayResult<DirectWriteResult> {
+        let (kind, context, table, rows) = match req {
+            DirectWriteRequest::KvUpsert {
+                context,
+                table,
+                rows,
+            } => (WriteKind::KvUpsert, context, table, rows),
+            DirectWriteRequest::KvDelete {
+                context,
+                table,
+                keys,
+            } => (WriteKind::KvDelete, context, table, keys),
+            DirectWriteRequest::LogAppend {
+                context,
+                table,
+                rows,
+            } => (WriteKind::LogAppend, context, table, rows),
+        };
+        let n = rows.num_rows();
+        self.writes.lock().unwrap().push(RecordedWrite {
+            kind,
+            table,
+            principal: context.principal.name.clone(),
+            cluster: context.cluster.0.clone(),
+            rows: n,
+        });
+        Ok(DirectWriteResult {
+            rows_written: n as u64,
+        })
     }
 
     async fn list_databases(&self, _scope: MetadataScope) -> GatewayResult<Vec<String>> {
@@ -282,7 +344,7 @@ impl GatewayInstance for FakeInstance {
     }
 
     async fn list_tables(&self, _scope: MetadataScope) -> GatewayResult<Vec<String>> {
-        Ok(vec![])
+        Ok(vec!["t".into()])
     }
 
     async fn get_table_info(
@@ -290,6 +352,12 @@ impl GatewayInstance for FakeInstance {
         _scope: MetadataScope,
         table: TableRef,
     ) -> GatewayResult<TableInfo> {
+        if self.missing_tables.lock().unwrap().contains(&table.table) {
+            return Err(GatewayError::TableNotFound {
+                database: table.database,
+                table: table.table,
+            });
+        }
         let (schema, _) = Self::canned_result();
         Ok(TableInfo { name: table, schema })
     }
@@ -325,5 +393,35 @@ impl PgTestServer {
             "host=127.0.0.1 port={} user=alice password=ignored dbname=fluss",
             self.port
         )
+    }
+}
+
+/// A running REST frontend bound to an ephemeral loopback port, backed by a
+/// shared [`FakeInstance`] so tests can assert on recorded writes / sessions.
+pub struct RestTestServer {
+    pub port: u16,
+    pub instance: Arc<FakeInstance>,
+}
+
+impl RestTestServer {
+    pub async fn start() -> RestTestServer {
+        Self::start_with(Arc::new(FakeInstance::new())).await
+    }
+
+    pub async fn start_with(instance: Arc<FakeInstance>) -> RestTestServer {
+        let server = RestServer::new(instance.clone(), Arc::new(TrustAuthenticator::new()));
+        let (listener, addr) = RestServer::bind("127.0.0.1:0").await.unwrap();
+        tokio::spawn(async move {
+            let _ = server.serve(listener).await;
+        });
+        RestTestServer {
+            port: addr.port(),
+            instance,
+        }
+    }
+
+    /// Base URL for the frozen `default` cluster prefix.
+    pub fn base_url(&self) -> String {
+        format!("http://127.0.0.1:{}/v1/clusters/default", self.port)
     }
 }

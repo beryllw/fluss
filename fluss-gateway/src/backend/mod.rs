@@ -51,6 +51,9 @@ use crate::types::{
     TableInfo, TableRef,
 };
 
+mod row_convert;
+pub use row_convert::batch_to_generic_rows;
+
 /// Default metadata cache TTL. Should be aligned with fluss-datafusion's own
 /// metadata cache TTL (design/infra.md §P6.4) to bound SQL/REST view drift.
 pub const DEFAULT_METADATA_CACHE_TTL: Duration = Duration::from_secs(30);
@@ -117,18 +120,29 @@ pub trait BackendFacade: Send + Sync {
 // Real Fluss-backed facade (skeleton)
 // ---------------------------------------------------------------------------
 
-/// Phase 1 production facade backed by a real shared `FlussConnection`.
+/// Phase 1 production facade backed by a real shared `FlussConnection`
+/// (design/infra.md §P6.2/§P6.5, direct-path.md §P5).
 ///
-/// Skeleton: direct *write* truly lands in P5 (direct-path / REST), so `write`
-/// here is a documented `Unsupported` placeholder until then. Metadata reads
-/// could be implemented against `connection.get_admin()`, but are also left as a
-/// P5-time wiring point to avoid live-cluster coupling before the REST metadata
-/// endpoints exist. The type exists now to pin the construction shape (it holds
-/// the shared connection + the metadata cache TTL) and to prove the trait fits
-/// the real client. Not unit-tested (no live cluster); behavior coverage is via
-/// [`tests`]'s fake.
+/// Direct writes are orchestrated onto the Fluss client:
+/// - `KvUpsert` / `KvDelete`: per-row `RecordBatch -> GenericRow` conversion
+///   (see [`row_convert`]) fed to a fresh `UpsertWriter`, then `flush()`.
+/// - `LogAppend`: the `RecordBatch` is handed straight to an `AppendWriter` via
+///   `append_arrow_batch`, then `flush()`.
+///
+/// at-least-once (direct-path.md §6): a returned `Ok` means `flush()` acked. A
+/// mid-flight failure may have partially written and is NOT rolled back. The
+/// writer is created per request (Phase 1 ingest volumes are modest); a pooled /
+/// long-lived writer is a later refinement.
+///
+/// Metadata reads go through `connection.get_admin()`. Every raw fluss-rs error
+/// is mapped to a [`GatewayError`] right here — this is the backend→domain
+/// boundary; no fluss-rs error type escapes upward.
+///
+/// Not unit-tested (no live cluster in CI): the live path is compile-checked
+/// here and is left for the final end-to-end task (write -> readback against a
+/// real Fluss cluster). Trait *behavior* (caching, error mapping) is covered by
+/// [`tests`]'s in-memory fake.
 pub struct FlussBackendFacade {
-    #[allow(dead_code)]
     connection: Arc<fluss::client::FlussConnection>,
     #[allow(dead_code)]
     metadata_cache_ttl: Duration,
@@ -146,44 +160,156 @@ impl FlussBackendFacade {
         self.metadata_cache_ttl = ttl;
         self
     }
+
+    fn admin(&self) -> GatewayResult<Arc<fluss::client::FlussAdmin>> {
+        self.connection
+            .get_admin()
+            .map_err(|e| GatewayError::Backend(format!("get_admin: {e}")))
+    }
+
+    /// KV upsert/delete: convert each batch row to a Fluss `GenericRow` and feed
+    /// the per-request upsert writer. `delete` is true for `KvDelete`.
+    async fn kv_write(
+        &self,
+        table: &TableRef,
+        batch: &arrow::record_batch::RecordBatch,
+        delete: bool,
+    ) -> GatewayResult<u64> {
+        let path = fluss::metadata::TablePath::new(table.database.clone(), table.table.clone());
+        let handle = self
+            .connection
+            .get_table(&path)
+            .await
+            .map_err(|e| map_table_err(table, e))?;
+        let writer = handle
+            .new_upsert()
+            .and_then(|u| u.create_writer())
+            .map_err(|e| GatewayError::Backend(format!("create upsert writer: {e}")))?;
+
+        let rows = row_convert::batch_to_generic_rows(batch)?;
+        let n = rows.len() as u64;
+        for row in &rows {
+            let res = if delete {
+                writer.delete(row)
+            } else {
+                writer.upsert(row)
+            };
+            res.map_err(|e| GatewayError::Backend(format!("kv write: {e}")))?;
+        }
+        // at-least-once: success is defined as the backend acking the flush.
+        writer
+            .flush()
+            .await
+            .map_err(|e| GatewayError::Backend(format!("kv flush: {e}")))?;
+        Ok(n)
+    }
+
+    /// Log append: hand the Arrow batch straight to the append writer.
+    async fn log_append(
+        &self,
+        table: &TableRef,
+        batch: arrow::record_batch::RecordBatch,
+    ) -> GatewayResult<u64> {
+        let path = fluss::metadata::TablePath::new(table.database.clone(), table.table.clone());
+        let handle = self
+            .connection
+            .get_table(&path)
+            .await
+            .map_err(|e| map_table_err(table, e))?;
+        let writer = handle
+            .new_append()
+            .and_then(|a| a.create_writer())
+            .map_err(|e| GatewayError::Backend(format!("create append writer: {e}")))?;
+        let n = batch.num_rows() as u64;
+        writer
+            .append_arrow_batch(batch)
+            .map_err(|e| GatewayError::Backend(format!("log append: {e}")))?;
+        writer
+            .flush()
+            .await
+            .map_err(|e| GatewayError::Backend(format!("log flush: {e}")))?;
+        Ok(n)
+    }
+}
+
+/// Map a fluss-rs error from a `get_table` lookup into a domain error. A missing
+/// table surfaces as `TableNotFound`; anything else as `Backend`. The string
+/// match is best-effort (fluss-rs does not expose a typed not-found here), but it
+/// keeps the common 404 path clean.
+fn map_table_err(table: &TableRef, e: fluss::error::Error) -> GatewayError {
+    let msg = e.to_string();
+    let lower = msg.to_lowercase();
+    if lower.contains("not exist") || lower.contains("not found") || lower.contains("nonexistent") {
+        GatewayError::TableNotFound {
+            database: table.database.clone(),
+            table: table.table.clone(),
+        }
+    } else {
+        GatewayError::Backend(format!("get_table {}.{}: {msg}", table.database, table.table))
+    }
 }
 
 #[async_trait]
 impl BackendFacade for FlussBackendFacade {
-    async fn write(&self, _request: DirectWriteRequest) -> GatewayResult<DirectWriteResult> {
-        // direct write truly lands in P5 (direct-path.md §3/§6). Until then this
-        // is an explicit Unsupported rather than a silent no-op.
-        Err(GatewayError::Unsupported(
-            "FlussBackendFacade.write lands in P5".to_string(),
-        ))
+    async fn write(&self, request: DirectWriteRequest) -> GatewayResult<DirectWriteResult> {
+        let rows_written = match request {
+            DirectWriteRequest::KvUpsert { table, rows, .. } => {
+                self.kv_write(&table, &rows, false).await?
+            }
+            DirectWriteRequest::KvDelete { table, keys, .. } => {
+                self.kv_write(&table, &keys, true).await?
+            }
+            DirectWriteRequest::LogAppend { table, rows, .. } => {
+                self.log_append(&table, rows).await?
+            }
+        };
+        Ok(DirectWriteResult { rows_written })
     }
 
     async fn list_databases(&self, _scope: &MetadataScope) -> GatewayResult<Vec<String>> {
-        // Wiring onto connection.get_admin() lands with the REST metadata
-        // endpoints (P5). backend→domain mapping will happen right here.
-        Err(GatewayError::Unsupported(
-            "FlussBackendFacade.list_databases lands in P5".to_string(),
-        ))
+        self.admin()?
+            .list_databases()
+            .await
+            .map_err(|e| GatewayError::Backend(format!("list_databases: {e}")))
     }
 
     async fn list_tables(
         &self,
         _scope: &MetadataScope,
-        _database: &str,
+        database: &str,
     ) -> GatewayResult<Vec<TableRef>> {
-        Err(GatewayError::Unsupported(
-            "FlussBackendFacade.list_tables lands in P5".to_string(),
-        ))
+        let names = self
+            .admin()?
+            .list_tables(database)
+            .await
+            .map_err(|e| GatewayError::Backend(format!("list_tables {database}: {e}")))?;
+        Ok(names
+            .into_iter()
+            .map(|table| TableRef {
+                database: database.to_string(),
+                table,
+            })
+            .collect())
     }
 
     async fn get_table_info(
         &self,
         _scope: &MetadataScope,
-        _table: &TableRef,
+        table: &TableRef,
     ) -> GatewayResult<TableInfo> {
-        Err(GatewayError::Unsupported(
-            "FlussBackendFacade.get_table_info lands in P5".to_string(),
-        ))
+        let path = fluss::metadata::TablePath::new(table.database.clone(), table.table.clone());
+        let info = self
+            .admin()?
+            .get_table_info(&path)
+            .await
+            .map_err(|e| map_table_err(table, e))?;
+        // Fluss row type -> Arrow schema, keeping the metadata surface Arrow-native.
+        let schema = fluss::record::to_arrow_schema(info.row_type())
+            .map_err(|e| GatewayError::Backend(format!("to_arrow_schema: {e}")))?;
+        Ok(TableInfo {
+            name: table.clone(),
+            schema,
+        })
     }
 }
 

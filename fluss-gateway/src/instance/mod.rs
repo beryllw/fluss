@@ -30,6 +30,9 @@
 
 use async_trait::async_trait;
 
+mod gateway_instance;
+pub use gateway_instance::GatewayInstanceImpl;
+
 use crate::error::GatewayResult;
 use crate::types::{
     CancelResult, DescribeSqlRequest, DirectReadRequest, DirectReadResult, DirectWriteRequest,

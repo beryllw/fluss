@@ -37,7 +37,7 @@ futures = "0.3"
 
 # --- SQL engine (public crates; df52/arrow57 line) ---
 datafusion = "52.0.0"
-arrow = { version = "57.0.0", features = ["ipc_compression", "ffi"] }
+arrow = { version = "57.0.0", features = ["ipc_compression", "ffi", "json"] }
 arrow-schema = "57.0.0"
 
 # --- PostgreSQL wire / compatibility stack ---
@@ -69,3 +69,6 @@ tracing-subscriber = "0.3"
 # Real PostgreSQL wire client for protocol integration tests (P4). Drives the
 # gateway over loopback TCP with no Fluss cluster, against a fake GatewayInstance.
 tokio-postgres = "0.7"
+# Real HTTP client for REST direct-path integration tests (P5). Drives the axum
+# frontend over loopback TCP with no Fluss cluster, against a fake GatewayInstance.
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
