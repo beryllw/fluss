@@ -1,0 +1,57 @@
+# Fluss Gateway — Phase 1 dependency version matrix (P0, see DESIGN.md §3).
+#
+# This crate must align with the upstream `fluss-rust-community` workspace line:
+#   datafusion = 52.0.0, arrow = 57.0.0, tokio = 1.44.2
+# The PostgreSQL compatibility stack is pinned around that line:
+#   pgwire 0.38.x         -> matches arrow-pg 0.12.2 (pgwire ^0.38)
+#   arrow-pg 0.12.2       -> targets arrow ^57 / datafusion ^52 (feature "datafusion")
+#   datafusion-pg-catalog 0.15.0 -> targets datafusion ^52
+# The newer datafusion-postgres family (df53/arrow58/pgwire0.40) is intentionally
+# NOT used: it would pull arrow 58 / datafusion 53 and break alignment with the
+# upstream df52/arrow57 line. Dependency upgrades are a separate, later work item.
+#
+# Phase 1 deliberately does NOT depend on `fluss-datafusion` / `fluss-rs`. Fluss
+# access is isolated behind gateway-defined contract traits with stub/fake impls;
+# the real upstream crates are swapped in later. `datafusion` + `arrow` ARE direct
+# public dependencies because the SQL path needs SessionContext / RecordBatch.
+
+[package]
+name = "fluss-gateway"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "SQL/REST gateway for Apache Fluss (PostgreSQL read-only + REST direct write)"
+publish = false
+
+[dependencies]
+# --- Core async runtime ---
+tokio = { version = "1.44.2", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# --- SQL engine (public crates; df52/arrow57 line) ---
+datafusion = "52.0.0"
+arrow = { version = "57.0.0", features = ["ipc_compression", "ffi"] }
+arrow-schema = "57.0.0"
+
+# --- PostgreSQL wire / compatibility stack ---
+# NOTE: pgwire must stay semver-compatible with the pgwire arrow-pg pulls in, so
+# cargo unifies both to ONE pgwire instance — otherwise arrow-pg's encoded row
+# types cannot be fed into our pgwire server handlers. Do not bump pgwire alone.
+pgwire = "0.38"
+arrow-pg = { version = "0.12.2", features = ["datafusion"] }
+datafusion-pg-catalog = "0.15.0"
+
+# --- HTTP (REST direct path) ---
+axum = "0.8"
+
+# --- Serialization / error / misc ---
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+bytes = "1"
+tracing = "0.1"
+
+[dev-dependencies]
+tracing-subscriber = "0.3"
