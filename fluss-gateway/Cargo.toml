@@ -10,10 +10,15 @@
 # NOT used: it would pull arrow 58 / datafusion 53 and break alignment with the
 # upstream df52/arrow57 line. Dependency upgrades are a separate, later work item.
 #
-# Phase 1 deliberately does NOT depend on `fluss-datafusion` / `fluss-rs`. Fluss
-# access is isolated behind gateway-defined contract traits with stub/fake impls;
-# the real upstream crates are swapped in later. `datafusion` + `arrow` ARE direct
-# public dependencies because the SQL path needs SessionContext / RecordBatch.
+# Fluss access uses the upstream `fluss-datafusion` + `fluss-rs` crates as pinned
+# git dependencies pinned to rev dc6db2f (head of branch datafusion-v0.2.0 at
+# integration time). They share this exact
+# df52/arrow57/tokio-1.44 line, so cargo unifies cleanly. Gateway code still talks
+# to Fluss only through narrow gateway-defined contract traits (e.g.
+# `FlussCatalogInstaller`, `FlussConnectionProvider`, `BackendFacade`): the real
+# crates back those traits in production while fakes back them in tests, so the
+# gateway never absorbs catalog/execution/type logic. `datafusion` + `arrow` are
+# also direct public deps because the SQL path needs SessionContext / RecordBatch.
 
 [package]
 name = "fluss-gateway"
@@ -42,6 +47,10 @@ arrow-schema = "57.0.0"
 pgwire = "0.38"
 arrow-pg = { version = "0.12.2", features = ["datafusion"] }
 datafusion-pg-catalog = "0.15.0"
+
+# --- Fluss access (git deps; datafusion-v0.2.0 line aligns df52/arrow57) ---
+fluss = { package = "fluss-rs", git = "https://github.com/beryllw/fluss-rust.git", rev = "dc6db2f2889fda71d875a9e11a4dce2555c732fb", features = ["storage-all"] }
+fluss-datafusion = { git = "https://github.com/beryllw/fluss-rust.git", rev = "dc6db2f2889fda71d875a9e11a4dce2555c732fb" }
 
 # --- HTTP (REST direct path) ---
 axum = "0.8"

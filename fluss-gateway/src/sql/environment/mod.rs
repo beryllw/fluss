@@ -42,8 +42,8 @@ pub mod registry;
 
 pub use bridge::EnvironmentContextBuilder;
 pub use collaborators::{
-    FlussCatalogInstaller, PgCatalogOverlayInstaller, StubFlussCatalogInstaller,
-    StubPgCatalogOverlayInstaller,
+    FlussCatalogInstaller, FlussDatafusionCatalogInstaller, PgCatalogOverlayInstaller,
+    StubFlussCatalogInstaller, StubPgCatalogOverlayInstaller,
 };
 pub use pg::{PgSqlEnvironmentProvider, FLUSS_CATALOG};
 pub use provider::SqlEnvironmentProvider;

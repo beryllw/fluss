@@ -74,15 +74,62 @@ pub trait PgCatalogOverlayInstaller: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
+// Real adapter — backs step 2 with the upstream `fluss-datafusion` crate.
+// ---------------------------------------------------------------------------
+
+/// Step 2 production adapter over `fluss_datafusion::FlussDatafusion`.
+///
+/// Holds the shared installer (one per `(cluster, proxy connection)`, contract
+/// D1) and delegates each per-session call to `FlussDatafusion::register_catalog`,
+/// installing ONLY the Fluss catalog. `FlussDatafusionError` is mapped into the
+/// gateway domain taxonomy here, at the crate boundary (contract D3) — no
+/// DataFusion/Fluss error type leaks past this point.
+///
+/// Construction needs a live `FlussConnection`, so the instance is built in P6
+/// (connection provider) and injected into `PgSqlEnvironmentProvider`; tests use
+/// [`StubFlussCatalogInstaller`] instead.
+pub struct FlussDatafusionCatalogInstaller {
+    inner: Arc<fluss_datafusion::FlussDatafusion>,
+}
+
+impl FlussDatafusionCatalogInstaller {
+    /// Wrap a shared `FlussDatafusion` installer.
+    pub fn new(inner: Arc<fluss_datafusion::FlussDatafusion>) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait::async_trait]
+impl FlussCatalogInstaller for FlussDatafusionCatalogInstaller {
+    async fn register_catalog(
+        &self,
+        ctx: &SessionContext,
+        catalog_name: &str,
+    ) -> GatewayResult<()> {
+        self.inner
+            .register_catalog(
+                ctx,
+                catalog_name,
+                fluss_datafusion::RegisterCatalogOptions::default(),
+            )
+            .await
+            .map_err(|e: fluss_datafusion::FlussDatafusionError| {
+                crate::error::GatewayError::Backend(e.to_string())
+            })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Phase 1 default implementations (no real Fluss / P6 metadata available).
 // ---------------------------------------------------------------------------
 
-/// Phase 1 default Fluss catalog installer.
+/// Test/default Fluss catalog installer.
 ///
-/// `fluss-datafusion` is intentionally not a dependency yet, so this registers a
-/// minimal empty schema under `catalog_name` to stand in for the real catalog —
-/// just enough for steps 3/4 (which need the catalog to exist) and for the order
-/// contract to hold. Replaced by the real `FlussDatafusion::register_catalog`.
+/// Registers a minimal empty schema under `catalog_name` to stand in for the real
+/// catalog — just enough for steps 3/4 (which need the catalog to exist) and for
+/// the order contract to hold. Used by unit/harness tests that exercise the
+/// assembly order without a live Fluss cluster; production wires
+/// [`FlussDatafusionCatalogInstaller`] instead.
 #[derive(Debug, Default)]
 pub struct StubFlussCatalogInstaller;
 
