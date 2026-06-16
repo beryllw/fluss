@@ -264,6 +264,16 @@ impl OperationManager {
     ) -> Option<R> {
         self.operations.lock().unwrap().get_mut(id).map(f)
     }
+
+    #[cfg(test)]
+    pub fn snapshots_for_test(&self) -> Vec<OperationStatusSnapshot> {
+        self.operations
+            .lock()
+            .unwrap()
+            .values()
+            .map(Operation::status_snapshot)
+            .collect()
+    }
 }
 
 #[cfg(test)]

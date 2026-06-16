@@ -168,9 +168,8 @@ impl GatewaySession {
     }
 
     /// §P2.3 / §P2.4 — apply a mutation: ① update vars, ② classify effect,
-    /// ③ act on the live context. Only `RebuildContextBeforeNextQuery` sets the
-    /// dirty flag here; `ApplyToExistingContext` is acted on lazily by P3 at
-    /// rebuild/build time (P2 has no real context to mutate in place). Idempotent.
+    /// ③ let the caller decide whether to live-apply or lazily rebuild. Only
+    /// `RebuildContextBeforeNextQuery` sets the dirty flag here. Idempotent.
     pub fn apply_mutation(&self, mutation: &SessionMutation) -> SessionMutationEffect {
         let effect = {
             let mut vars = self.vars.write().unwrap();
@@ -189,6 +188,23 @@ impl GatewaySession {
             self.sql_context_dirty.store(true, Ordering::Release);
         }
         effect
+    }
+
+    /// Mark the SQL context dirty so the next query rebuilds it from the
+    /// authoritative SessionVars snapshot.
+    pub fn mark_context_dirty(&self) {
+        self.sql_context_dirty.store(true, Ordering::Release);
+    }
+
+    /// Return the currently built SessionContext, if one exists.
+    pub async fn current_context(&self) -> Option<Arc<SessionContext>> {
+        self.sql_context.read().await.as_ref().map(Arc::clone)
+    }
+
+    #[cfg(test)]
+    pub async fn replace_context_for_test(&self, ctx: Arc<SessionContext>) {
+        *self.sql_context.write().await = Some(ctx);
+        self.sql_context_dirty.store(false, Ordering::Release);
     }
 
     /// §P2.5 — obtain the context for the next query, building or rebuilding as

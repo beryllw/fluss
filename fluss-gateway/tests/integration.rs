@@ -129,6 +129,28 @@ async fn set_then_show_roundtrips() {
     assert_eq!(value.as_deref(), Some("Asia/Shanghai"));
 }
 
+/// `SET TimeZone = DEFAULT` clears the session override and makes `SHOW timezone`
+/// fall back to the default value again.
+#[tokio::test]
+async fn set_timezone_default_clears_override() {
+    let server = PgTestServer::start().await;
+    let (client, conn) = tokio_postgres::connect(&server.conn_string(), tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    client.batch_execute("SET TimeZone = 'Asia/Shanghai'").await.unwrap();
+    client.batch_execute("SET TimeZone = DEFAULT").await.unwrap();
+    let rows = client.simple_query("SHOW timezone").await.unwrap();
+    let value = rows.iter().find_map(|m| match m {
+        tokio_postgres::SimpleQueryMessage::Row(r) => r.get("timezone").map(|s| s.to_string()),
+        _ => None,
+    });
+    assert_eq!(value.as_deref(), Some("UTC"));
+}
+
 /// BEGIN/COMMIT are accepted as autocommit no-ops (BI tools must not break).
 #[tokio::test]
 async fn transaction_control_is_noop() {

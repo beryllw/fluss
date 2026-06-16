@@ -61,7 +61,8 @@ use crate::session::GatewaySession;
 use crate::sql::environment::bridge::EnvironmentContextBuilder;
 use crate::sql::environment::registry::SqlEnvironmentRegistry;
 use crate::types::{
-    DescribeSqlRequest, ExecuteSqlRequest, OperationId, SqlDescription, SqlExecution,
+    DescribeSqlRequest, ExecuteSqlRequest, OperationId, SessionMutation, SessionMutationEffect,
+    SqlDescription, SqlExecution,
 };
 
 /// A freshly registered operation whose state the caller must drive: the id (to
@@ -81,6 +82,32 @@ pub struct SqlGatewayService {
 impl SqlGatewayService {
     pub fn new(sessions: Arc<SessionManager>, registry: Arc<SqlEnvironmentRegistry>) -> Self {
         Self { sessions, registry }
+    }
+
+    /// Apply one session mutation, including any live SessionContext update the
+    /// selected SQL environment can perform in-place.
+    pub async fn apply_session_mutation(
+        &self,
+        session: &Arc<GatewaySession>,
+        mutation: &SessionMutation,
+    ) -> GatewayResult<SessionMutationEffect> {
+        let effect = session.apply_mutation(mutation);
+        if effect != SessionMutationEffect::ApplyToExistingContext {
+            return Ok(effect);
+        }
+
+        let Some(ctx) = session.current_context().await else {
+            return Ok(effect);
+        };
+        let Some(sql_environment) = session.sql_environment.as_ref() else {
+            return Ok(effect);
+        };
+        let provider = self.registry.get(sql_environment)?;
+        if let Err(err) = provider.apply_session_mutation(session, &ctx, mutation).await {
+            session.mark_context_dirty();
+            return Err(err);
+        }
+        Ok(effect)
     }
 
     /// Build (or rebuild, if dirty) the session's `SessionContext` through the P2
@@ -155,7 +182,17 @@ impl SqlGatewayService {
             }
         } else {
             let schema: SchemaRef = Arc::new(df.schema().as_arrow().clone());
-            let stream = df.execute_stream().await.map_err(map_exec_err)?;
+            let stream = match df.execute_stream().await {
+                Ok(stream) => stream,
+                Err(e) => {
+                    let msg = e.to_string();
+                    session.operation_manager().with_operation(&op.id, |o| {
+                        o.mark_running();
+                        o.mark_failed(msg);
+                    });
+                    return Err(map_exec_err(e));
+                }
+            };
             let tracked = tracked_stream(
                 stream,
                 schema.clone(),
@@ -366,8 +403,15 @@ fn map_exec_err(e: datafusion::error::DataFusionError) -> GatewayError {
 mod tests {
     use super::*;
 
+    use std::any::Any;
+    use std::sync::Arc as StdArc;
+
     use arrow::record_batch::RecordBatch;
     use datafusion::common::ScalarValue;
+    use datafusion::datasource::{TableProvider, TableType};
+    use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
+    use datafusion::physical_plan::ExecutionPlan;
+    use datafusion::catalog::Session as CatalogSession;
     use futures::TryStreamExt;
 
     use crate::session::manager::SessionManagerConfig;
@@ -417,6 +461,45 @@ mod tests {
                 (operation_id, batches)
             }
             SqlExecution::Command { operation_id, .. } => (operation_id, Vec::new()),
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailingScanTable {
+        schema: SchemaRef,
+    }
+
+    #[async_trait::async_trait]
+    impl TableProvider for FailingScanTable {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn schema(&self) -> SchemaRef {
+            StdArc::clone(&self.schema)
+        }
+
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+
+        async fn scan(
+            &self,
+            _state: &dyn CatalogSession,
+            _projection: Option<&Vec<usize>>,
+            _filters: &[Expr],
+            _limit: Option<usize>,
+        ) -> datafusion::error::Result<StdArc<dyn ExecutionPlan>> {
+            Err(datafusion::error::DataFusionError::Execution(
+                "synthetic execute_stream setup failure".into(),
+            ))
+        }
+
+        fn supports_filters_pushdown(
+            &self,
+            filters: &[&Expr],
+        ) -> datafusion::error::Result<Vec<TableProviderFilterPushDown>> {
+            Ok(vec![TableProviderFilterPushDown::Unsupported; filters.len()])
         }
     }
 
@@ -682,5 +765,49 @@ mod tests {
         assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
         let gen2 = sessions.get(&sid).unwrap().generation();
         assert!(gen2 > gen1, "dirty forced a context rebuild");
+    }
+
+    // If query planning succeeds but execute_stream construction fails, the
+    // registered operation must transition to Failed rather than staying Pending.
+    #[tokio::test]
+    async fn execute_stream_failure_marks_operation_failed() {
+        let sessions = Arc::new(SessionManager::new(SessionManagerConfig::default()));
+        let sid = open(&sessions);
+        let session = sessions.get(&sid).unwrap();
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let ctx = SessionContext::new();
+        ctx.register_table(
+            "failing_table",
+            StdArc::new(FailingScanTable { schema: StdArc::clone(&schema) }),
+        )
+        .unwrap();
+        session.replace_context_for_test(StdArc::new(ctx)).await;
+
+        let reg = Arc::new(SqlEnvironmentRegistry::new());
+        let svc = SqlGatewayService::new(Arc::clone(&sessions), reg);
+        let err = into_err(
+            svc.execute_sql(ExecuteSqlRequest {
+                session_id: sid.clone(),
+                statement: "SELECT id FROM failing_table".into(),
+                params: None,
+                options: SqlExecutionOptions::default(),
+            })
+            .await,
+        );
+        assert!(matches!(err, GatewayError::Backend(_)));
+
+        let session = sessions.get(&sid).unwrap();
+        let statuses = session.operation_manager().snapshots_for_test();
+        assert_eq!(statuses.len(), 1, "one operation was registered");
+        assert_eq!(statuses[0].state, OperationState::Failed);
+        assert!(statuses[0]
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("synthetic execute_stream setup failure"));
     }
 }

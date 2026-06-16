@@ -38,6 +38,7 @@ use std::sync::Arc;
 use datafusion::execution::context::SessionContext;
 
 use crate::error::{GatewayError, GatewayResult};
+use crate::session::apply_session_mutation as apply_vars_mutation;
 use crate::session::GatewaySession;
 use crate::sql::environment::apply::apply_vars_snapshot;
 use crate::sql::environment::collaborators::{
@@ -146,20 +147,8 @@ impl SqlEnvironmentProvider for PgSqlEnvironmentProvider {
 /// provider acts on. P3 does not re-implement the classification table — it
 /// applies the same rules read-only here.
 fn classify_effect(mutation: &SessionMutation) -> SessionMutationEffect {
-    match mutation {
-        SessionMutation::SetStatementTimeout(_) => SessionMutationEffect::SessionOnly,
-        SessionMutation::SetTimezone(_) => SessionMutationEffect::ApplyToExistingContext,
-        SessionMutation::SetCurrentCatalog(_) | SessionMutation::SetCurrentSchema(_) => {
-            SessionMutationEffect::RebuildContextBeforeNextQuery
-        }
-        SessionMutation::SetEnvironmentVar { key, .. }
-        | SessionMutation::UnsetEnvironmentVar { key } => match key.as_str() {
-            "pg.search_path" => SessionMutationEffect::RebuildContextBeforeNextQuery,
-            _ => SessionMutationEffect::SessionOnly,
-        },
-        // DISCARD ALL: full reset always rebuilds before the next query.
-        SessionMutation::ResetAll => SessionMutationEffect::RebuildContextBeforeNextQuery,
-    }
+    let mut vars = crate::types::SessionVars::default();
+    apply_vars_mutation(&mut vars, mutation)
 }
 
 #[cfg(test)]
@@ -417,5 +406,32 @@ mod tests {
         let after_second = ctx.state().config().options().execution.time_zone.clone();
         assert_eq!(after_first, after_second);
         assert_eq!(after_second.as_deref(), Some("UTC"));
+    }
+
+    /// Clearing a live-applied timezone resets the SessionContext to DataFusion's
+    /// default (`None`) rather than leaving the old value stuck.
+    #[tokio::test]
+    async fn clearing_timezone_resets_live_context() {
+        let provider = PgSqlEnvironmentProvider::with_stubs();
+        let s = session(SessionVars::default());
+        let ctx = SessionContext::new();
+        provider.prepare_session_context(&s, &ctx).await.unwrap();
+
+        s.vars().write().unwrap().timezone = Some("UTC".into());
+        provider
+            .apply_session_mutation(&s, &ctx, &SessionMutation::SetTimezone(Some("UTC".into())))
+            .await
+            .unwrap();
+        assert_eq!(
+            ctx.state().config().options().execution.time_zone.as_deref(),
+            Some("UTC")
+        );
+
+        s.vars().write().unwrap().timezone = None;
+        provider
+            .apply_session_mutation(&s, &ctx, &SessionMutation::SetTimezone(None))
+            .await
+            .unwrap();
+        assert_eq!(ctx.state().config().options().execution.time_zone, None);
     }
 }

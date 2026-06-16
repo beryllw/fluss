@@ -38,15 +38,14 @@ use crate::types::SessionVars;
 
 /// Apply the full `vars` snapshot to `ctx`. Idempotent.
 pub async fn apply_vars_snapshot(ctx: &SessionContext, vars: &SessionVars) -> GatewayResult<()> {
-    if let Some(tz) = &vars.timezone {
-        // Mutate the live execution time zone in place (idempotent).
-        ctx.state_ref()
-            .write()
-            .config_mut()
-            .options_mut()
-            .execution
-            .time_zone = Some(tz.clone());
-    }
+    // Mutate the live execution time zone in place (idempotent), including
+    // clearing it back to DataFusion's default when the session var is unset.
+    ctx.state_ref()
+        .write()
+        .config_mut()
+        .options_mut()
+        .execution
+        .time_zone = vars.timezone.clone();
     if let Some(catalog) = &vars.current_catalog {
         ctx.state_ref()
             .write()

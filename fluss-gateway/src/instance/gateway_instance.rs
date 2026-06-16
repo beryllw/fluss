@@ -111,10 +111,10 @@ impl GatewayInstance for GatewayInstanceImpl {
         mutation: SessionMutation,
     ) -> GatewayResult<SessionSnapshot> {
         let session = self.sessions.get(&session_id)?;
-        // ① update vars, ② classify effect, ③ act on the live context (P2.4).
-        // The dirty/rebuild bookkeeping lives inside the session; the next query
-        // rebuilds lazily.
-        session.apply_mutation(&mutation);
+        // ① update vars, ② classify effect, ③ apply any live-context change the
+        // SQL environment supports in-place. Rebuild bookkeeping stays on the
+        // session and is observed lazily by the next query when needed.
+        self.sql.apply_session_mutation(&session, &mutation).await?;
         Ok(session.snapshot())
     }
 
@@ -361,6 +361,40 @@ mod tests {
             inst.get_session(id).await,
             Err(GatewayError::SessionNotFound(_))
         ));
+    }
+
+    // Live-applied session mutations update an already-built SessionContext rather
+    // than only the SessionVars snapshot.
+    #[tokio::test]
+    async fn alter_session_live_applies_timezone_to_existing_context() {
+        let inst = instance();
+        let snap = inst.open_session(open_req()).await.unwrap();
+
+        let _ = inst
+            .execute_sql(ExecuteSqlRequest {
+                session_id: snap.id.clone(),
+                statement: "SELECT 1 AS one".into(),
+                params: None,
+                options: Default::default(),
+            })
+            .await
+            .unwrap();
+
+        let altered = inst
+            .alter_session(
+                snap.id.clone(),
+                SessionMutation::SetTimezone(Some("Asia/Shanghai".into())),
+            )
+            .await
+            .unwrap();
+        assert_eq!(altered.vars.timezone.as_deref(), Some("Asia/Shanghai"));
+
+        let session = inst.sessions.get(&snap.id).unwrap();
+        let ctx = session.current_context().await.expect("context built by first query");
+        assert_eq!(
+            ctx.state().config().options().execution.time_zone.as_deref(),
+            Some("Asia/Shanghai")
+        );
     }
 
     // write_direct delegates to the backend.

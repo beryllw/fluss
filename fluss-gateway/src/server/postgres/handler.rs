@@ -391,10 +391,10 @@ impl PgConnection {
                     // initial values and forces a rebuild before the next query
                     // (§P4.3), not just search_path.
                     let session_id = self.require_session().map_err(to_pg_err)?;
-                    let _ = self
-                        .instance
+                    self.instance
                         .alter_session(session_id, SessionMutation::ResetAll)
-                        .await;
+                        .await
+                        .map_err(to_pg_err)?;
                 }
                 let tag = compat::transaction_command_tag(&class).unwrap_or("OK");
                 Ok(Response::Execution(Tag::new(tag)))
@@ -501,6 +501,7 @@ impl PgConnection {
 /// `pg.<name>` so it round-trips through `SHOW`.
 fn set_to_mutation(name: &str, value: &str) -> SessionMutation {
     match name {
+        "timezone" if value.eq_ignore_ascii_case("default") => SessionMutation::SetTimezone(None),
         "timezone" => SessionMutation::SetTimezone(Some(value.to_string())),
         _ => SessionMutation::SetEnvironmentVar {
             key: format!("pg.{name}"),
