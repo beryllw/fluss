@@ -98,6 +98,45 @@ static PG_COLLATION_SUBQUERY: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
+/// psql `\d+`'s verbose attribute query renders per-column comments via
+/// `col_description(attrelid, attnum)`. That function is not registered, and
+/// Fluss columns carry no catalog comments, so it degrades to `NULL`.
+static COL_DESCRIPTION: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(?:pg_catalog\.)?col_description\s*\([^)]*\)").unwrap()
+});
+
+/// psql `\d`'s RLS-policy probe aggregates the policy's roles with the
+/// PostgreSQL `array(SELECT ...)` constructor wrapped in `array_to_string(...)`.
+/// DataFusion has no `array` constructor function ("Invalid function 'array'"),
+/// and `pg_policy` is always empty for Fluss tables, so the whole role-name
+/// expression is degraded to `NULL` — faithful (no policies) and lets `\d` plan.
+static PG_POLICY_ROLES_ARRAY: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?is)pg_catalog\.array_to_string\s*\(\s*array\s*\(\s*select\b.*?order\s+by\s+1\s*\)\s*,\s*'[^']*'\s*\)",
+    )
+    .unwrap()
+});
+
+/// psql `\d+`'s class-info query renders `reloptions` with
+/// `array_to_string(c.reloptions || array(select ... unnest(tc.reloptions) ...), ', ')`.
+/// The `array(SELECT ...)` constructor is unsupported, and Fluss tables carry no
+/// reloptions, so the whole expression degrades to an empty string. (The rest of
+/// that row is needed, so this is a sub-expression rewrite, not a probe skip.)
+static RELOPTIONS_ARRAY: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?is)pg_catalog\.array_to_string\s*\(\s*c\.reloptions\s*\|\|\s*array\(\s*select.*?\)\s*,\s*', '\s*\)",
+    )
+    .unwrap()
+});
+
+/// psql `\d`'s extended-statistics probe tests membership in `stxkind` (a
+/// `char[]`) via `'d' = any(stxkind)`. DataFusion lowers `= ANY(<text>)` to
+/// `array_has(Utf8, Utf8)`, which does not type-check. `pg_statistic_ext` is
+/// always empty for Fluss tables, so each flag expression degrades to `false`.
+static STXKIND_ANY: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)'[a-z]'\s*=\s*any\s*\(\s*stxkind\s*\)").unwrap()
+});
+
 /// Schema-qualified `pg_catalog.<fn>(` function calls. DataFusion registers the
 /// `datafusion-pg-catalog` UDFs under their bare name and cannot resolve a
 /// schema-qualified function name (e.g. `pg_catalog.pg_table_is_visible(...)`),
@@ -113,10 +152,26 @@ static PG_CATALOG_FN: LazyLock<Regex> = LazyLock::new(|| {
 /// no change are returned unchanged. The always-correct path for tools is direct
 /// `information_schema` / `pg_catalog` SQL — this only smooths psql `\d*` & friends.
 pub fn rewrite_introspection(sql: &str) -> String {
+    // Some psql `\d` section probes are built entirely from PostgreSQL-only
+    // constructs (ARRAY constructors / indexing, `string_agg` over
+    // `generate_series`, `int2[]` casts) that DataFusion cannot plan, and they
+    // target catalogs that are always empty for Fluss tables. Short-circuit the
+    // whole statement to a zero-row result with the same column arity psql reads
+    // positionally — faithful (no such objects) and trivially plannable.
+    if let Some(canned) = empty_probe_replacement(sql) {
+        return canned;
+    }
     // Drop the correlated scalar subqueries first, before function de-qualifying,
     // so they match the raw `pg_catalog.*` text.
-    let s = PG_ATTRDEF_SUBQUERY.replace_all(sql, "NULL");
+    // Each dropped column expression gets a distinct alias: psql reads these
+    // columns positionally, but DataFusion rejects a projection with two
+    // identically-named (`NULL`) columns, which `\d+` would otherwise produce.
+    let s = PG_ATTRDEF_SUBQUERY.replace_all(sql, "NULL AS gw_attrdef");
     let s = PG_COLLATION_SUBQUERY.replace_all(&s, "NULL");
+    let s = PG_POLICY_ROLES_ARRAY.replace_all(&s, "NULL");
+    let s = RELOPTIONS_ARRAY.replace_all(&s, "''");
+    let s = COL_DESCRIPTION.replace_all(&s, "NULL AS gw_coldesc");
+    let s = STXKIND_ANY.replace_all(&s, "false");
     let s = PG_CATALOG_OPERATOR.replace_all(&s, "${1}");
     let s = REGTYPE_TO_TEXT_CAST.replace_all(&s, "::text");
     let s = PG_OID_ALIAS_CAST.replace_all(&s, "::text");
@@ -124,6 +179,35 @@ pub fn rewrite_introspection(sql: &str) -> String {
     let s = COLLATE_DEFAULT.replace_all(&s, "");
     let s = PG_CATALOG_FN.replace_all(&s, "${1}(");
     s.into_owned()
+}
+
+/// Short-circuit a psql `\d` section probe that DataFusion cannot plan to an
+/// always-empty result with the column arity psql expects positionally. Returns
+/// `None` for statements that should go through the normal rewrite chain.
+fn empty_probe_replacement(sql: &str) -> Option<String> {
+    let lower = sql.to_ascii_lowercase();
+    // Publications probe: a 3-way UNION over pg_publication using ARRAY indexing,
+    // `string_agg` over `generate_series`, and `int2[]` casts. Three output
+    // columns (pubname, qual, attrs); always empty for Fluss tables.
+    if lower.contains("pg_catalog.pg_publication") {
+        return Some(
+            "SELECT NULL AS pubname, NULL AS pubqual, NULL AS pubattrs \
+             FROM pg_catalog.pg_publication WHERE false"
+                .to_string(),
+        );
+    }
+    // NOT NULL constraint probe (`\d+`, PG18): joins on `c.conkey[1]` (array
+    // indexing into a column DataFusion models as Utf8). Six output columns;
+    // always empty for Fluss tables.
+    if lower.contains("conkey[1]") {
+        return Some(
+            "SELECT NULL AS conname, NULL AS attname, NULL AS connoinherit, \
+             NULL AS conislocal, NULL AS coninh, NULL AS convalidated \
+             FROM pg_catalog.pg_constraint WHERE false"
+                .to_string(),
+        );
+    }
+    None
 }
 
 /// What kind of statement an incoming SQL string is, for routing purposes.
@@ -458,7 +542,73 @@ mod tests {
         assert!(!out.contains("pg_attrdef"), "default subquery must be dropped: {out}");
         assert!(!out.contains("pg_collation"), "collation subquery must be dropped: {out}");
         assert!(out.contains("a.attnotnull, NULL AS attcollation"), "collation -> NULL: {out}");
-        assert!(out.contains(", NULL,"), "default -> NULL: {out}");
+        assert!(out.contains("NULL AS gw_attrdef"), "default -> aliased NULL: {out}");
+    }
+
+    #[test]
+    fn rewrite_drops_policy_roles_array_constructor() {
+        // psql \d's RLS-policy probe aggregates roles with array(SELECT ...),
+        // which DataFusion has no `array` function for.
+        let sql = "CASE WHEN pol.polroles = '{0}' THEN NULL ELSE \
+            pg_catalog.array_to_string(array(select rolname from pg_catalog.pg_roles \
+            where oid = any (pol.polroles) order by 1),',') END";
+        let out = rewrite_introspection(sql);
+        assert!(!out.contains("array("), "array constructor must be gone: {out}");
+        assert!(!out.contains("array_to_string"), "array_to_string must be gone: {out}");
+        assert!(out.contains("THEN NULL ELSE NULL END"), "roles -> NULL: {out}");
+    }
+
+    #[test]
+    fn rewrite_degrades_stxkind_membership_to_false() {
+        // 'd' = any(stxkind) lowers to array_has(Utf8, Utf8), which fails to plan.
+        let sql = "  'd' = any(stxkind) AS ndist_enabled,\n  'f' = any(stxkind) AS deps_enabled";
+        let out = rewrite_introspection(sql);
+        assert!(!out.contains("stxkind"), "stxkind membership must be gone: {out}");
+        assert_eq!(
+            out,
+            "  false AS ndist_enabled,\n  false AS deps_enabled"
+        );
+    }
+
+    #[test]
+    fn rewrite_blanks_reloptions_array_in_verbose_class_query() {
+        // \d+'s reloptions display uses the array(SELECT ...) constructor.
+        let sql = "c.relispartition, pg_catalog.array_to_string(c.reloptions || \
+            array(select 'toast.' || x from pg_catalog.unnest(tc.reloptions) x), ', ')\n, c.reltablespace";
+        let out = rewrite_introspection(sql);
+        assert!(!out.contains("array("), "array constructor must be gone: {out}");
+        assert!(out.contains("c.relispartition, ''\n, c.reltablespace"), "reloptions -> '': {out}");
+    }
+
+    #[test]
+    fn rewrite_degrades_col_description_to_aliased_null() {
+        let sql = "a.attstorage, pg_catalog.col_description(a.attrelid, a.attnum)\nFROM pg_catalog.pg_attribute a";
+        let out = rewrite_introspection(sql);
+        assert!(!out.contains("col_description"), "col_description must be gone: {out}");
+        assert!(out.contains("NULL AS gw_coldesc"), "col_description -> aliased NULL: {out}");
+    }
+
+    #[test]
+    fn rewrite_short_circuits_publication_probe() {
+        // The pg_publication probe is a 3-way UNION of PG-only constructs.
+        let sql = "SELECT pubname, NULL, NULL FROM pg_catalog.pg_publication p \
+            WHERE p.puballtables AND pg_catalog.pg_relation_is_publishable('16386')";
+        let out = rewrite_introspection(sql);
+        assert!(out.contains("WHERE false"), "publication probe must be emptied: {out}");
+        assert!(out.contains("AS pubname"), "must keep 3-col arity: {out}");
+        assert!(out.contains("AS pubattrs"), "must keep 3-col arity: {out}");
+    }
+
+    #[test]
+    fn rewrite_short_circuits_not_null_constraint_probe() {
+        // The PG18 NOT NULL constraint probe indexes conkey[1] (array element).
+        let sql = "SELECT c.conname, a.attname, c.connoinherit, c.conislocal, \
+            c.coninhcount <> 0, c.convalidated FROM pg_catalog.pg_constraint c JOIN \
+            pg_catalog.pg_attribute a ON (a.attrelid = c.conrelid AND a.attnum = c.conkey[1]) \
+            WHERE c.contype = 'n' AND c.conrelid = '16386'::pg_catalog.regclass ORDER BY a.attnum";
+        let out = rewrite_introspection(sql);
+        assert!(out.contains("WHERE false"), "not-null probe must be emptied: {out}");
+        assert!(!out.contains("conkey[1]"), "array indexing must be gone: {out}");
     }
 
     #[test]

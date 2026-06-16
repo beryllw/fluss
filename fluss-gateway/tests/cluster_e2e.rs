@@ -622,6 +622,50 @@ async fn cluster_rest_kv_and_log_then_pg_selects() {
     .expect("psql \\d FK query timed out")
     .expect("psql \\d FK query (regclass cast rewrite)");
 
+    // The remaining psql `\d` / `\d+` section probes target catalogs that are
+    // always empty for a Fluss table but are built from PostgreSQL-only constructs
+    // (ARRAY constructors, `'x' = any(stxkind)`, ARRAY indexing) that DataFusion
+    // cannot otherwise plan. Replay the exact SQL psql emits and assert each one
+    // executes — this pins the policy / statistics_ext / publication / NOT NULL
+    // rewrites so `\d` and `\d+` keep working against the real catalog.
+    let d_probes = [
+        // RLS-policy probe — array(SELECT ...) role aggregation -> NULL.
+        format!(
+            "SELECT pol.polname, pol.polpermissive, \
+             CASE WHEN pol.polroles = '{{0}}' THEN NULL ELSE \
+             pg_catalog.array_to_string(array(select rolname from pg_catalog.pg_roles \
+             where oid = any (pol.polroles) order by 1),',') END, \
+             pg_catalog.pg_get_expr(pol.polqual, pol.polrelid), \
+             pg_catalog.pg_get_expr(pol.polwithcheck, pol.polrelid) \
+             FROM pg_catalog.pg_policy pol WHERE pol.polrelid = '{oid_row}' ORDER BY 1"
+        ),
+        // Extended-statistics probe — 'd' = any(stxkind) -> false.
+        format!(
+            "SELECT oid, stxname, 'd' = any(stxkind) AS ndist_enabled, \
+             'f' = any(stxkind) AS deps_enabled, 'm' = any(stxkind) AS mcv_enabled \
+             FROM pg_catalog.pg_statistic_ext WHERE stxrelid = '{oid_row}' ORDER BY stxname"
+        ),
+        // Publication probe — 3-way UNION of PG-only constructs (short-circuited).
+        format!(
+            "SELECT pubname, NULL, NULL FROM pg_catalog.pg_publication p \
+             WHERE p.puballtables AND pg_catalog.pg_relation_is_publishable('{oid_row}') ORDER BY 1"
+        ),
+        // NOT NULL constraint probe — conkey[1] array indexing (short-circuited).
+        format!(
+            "SELECT c.conname, a.attname, c.connoinherit, c.conislocal, \
+             c.coninhcount <> 0, c.convalidated \
+             FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_attribute a ON \
+             (a.attrelid = c.conrelid AND a.attnum = c.conkey[1]) \
+             WHERE c.contype = 'n' AND c.conrelid = '{oid_row}'::pg_catalog.regclass ORDER BY a.attnum"
+        ),
+    ];
+    for probe in &d_probes {
+        tokio::time::timeout(Duration::from_secs(30), pg_client.simple_query(probe))
+            .await
+            .expect("psql \\d section probe timed out")
+            .expect("psql \\d/\\d+ section probe must plan against the real catalog");
+    }
+
     // (f) DDL over REST (design/direct-path.md "表管理（DDL）API"): create a table
     // through the gateway's own POST, prove it is visible + usable, that a
     // duplicate is rejected 409, and that DELETE drops it.
@@ -709,6 +753,127 @@ async fn cluster_rest_kv_and_log_then_pg_selects() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 204, "REST drop returns 204");
+
+    // (g) comprehensive column-type coverage: create a wide table exercising every
+    // `ColumnType` variant (incl. precision/scale and not-null) via REST, assert
+    // the Arrow data_type each maps to, then replay the psql `\d` column query
+    // against it so `format_type` renders every type without a planning error.
+    let wide = "gw_types_e2e";
+    let wide_body = format!(
+        r#"{{"table_name":"{wide}","columns":[
+          {{"name":"id","type":"INT","nullable":false}},
+          {{"name":"c_bool","type":"BOOLEAN"}},
+          {{"name":"c_tinyint","type":"TINYINT"}},
+          {{"name":"c_smallint","type":"SMALLINT"}},
+          {{"name":"c_bigint","type":"BIGINT"}},
+          {{"name":"c_float","type":"FLOAT"}},
+          {{"name":"c_double","type":"DOUBLE"}},
+          {{"name":"c_decimal","type":"DECIMAL(10,2)"}},
+          {{"name":"c_char","type":"CHAR(8)"}},
+          {{"name":"c_string","type":"STRING"}},
+          {{"name":"c_binary","type":"BINARY(16)"}},
+          {{"name":"c_bytes","type":"BYTES"}},
+          {{"name":"c_date","type":"DATE"}},
+          {{"name":"c_time","type":"TIME(3)"}},
+          {{"name":"c_timestamp","type":"TIMESTAMP(6)"}},
+          {{"name":"c_notnull","type":"BIGINT","nullable":false}}
+        ],"primary_key":["id"],"distribution":{{"bucket_keys":["id"],"bucket_count":1}}}}"#
+    );
+    let resp = tokio::time::timeout(
+        Duration::from_secs(30),
+        http.post(format!("{rest_base}/databases/{DATABASE}/tables"))
+            .header("Authorization", &auth)
+            .header("Content-Type", JSON)
+            .body(wide_body)
+            .send(),
+    )
+    .await
+    .expect("REST create wide table timed out")
+    .unwrap();
+    assert_eq!(resp.status(), 201, "REST create wide-type table returns 201");
+    let wbody: serde_json::Value = resp.json().await.unwrap();
+    let dtype = |name: &str| -> String {
+        wbody["columns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == name)
+            .and_then(|c| c["data_type"].as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    assert_eq!(dtype("c_bool"), "Boolean");
+    assert_eq!(dtype("c_tinyint"), "Int8");
+    assert_eq!(dtype("c_smallint"), "Int16");
+    assert_eq!(dtype("id"), "Int32");
+    assert_eq!(dtype("c_bigint"), "Int64");
+    assert_eq!(dtype("c_float"), "Float32");
+    assert_eq!(dtype("c_double"), "Float64");
+    assert_eq!(dtype("c_decimal"), "Decimal128(10, 2)");
+    assert_eq!(dtype("c_char"), "Utf8");
+    assert_eq!(dtype("c_string"), "Utf8");
+    assert_eq!(dtype("c_binary"), "FixedSizeBinary(16)");
+    assert_eq!(dtype("c_bytes"), "Binary");
+    assert_eq!(dtype("c_date"), "Date32");
+    assert!(dtype("c_time").starts_with("Time32"), "TIME(3) -> {}", dtype("c_time"));
+    assert!(dtype("c_timestamp").starts_with("Timestamp"), "TIMESTAMP(6) -> {}", dtype("c_timestamp"));
+    let wide_not_null = wbody["columns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "c_notnull")
+        .unwrap()["nullable"]
+        .as_bool()
+        .unwrap();
+    assert!(!wide_not_null, "explicit nullable:false is preserved");
+
+    // psql `\d <wide>` column query must plan and render every type via format_type.
+    let wide_oid = tokio::time::timeout(
+        Duration::from_secs(30),
+        pg_client.simple_query(&format!(
+            "SELECT c.oid, c.relname FROM pg_catalog.pg_class c \
+             WHERE c.relname OPERATOR(pg_catalog.~) '^({wide})$' COLLATE pg_catalog.default \
+             AND pg_catalog.pg_table_is_visible(c.oid)"
+        )),
+    )
+    .await
+    .expect("wide \\d name query timed out")
+    .expect("wide \\d name query")
+    .iter()
+    .find_map(|m| match m {
+        tokio_postgres::SimpleQueryMessage::Row(r) if r.get("relname") == Some(wide) => {
+            r.get("oid").map(|s| s.to_string())
+        }
+        _ => None,
+    })
+    .expect("wide \\d name query resolves oid");
+    let wide_cols = tokio::time::timeout(
+        Duration::from_secs(30),
+        pg_client.simple_query(&format!(
+            "SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod), \
+             (SELECT pg_catalog.pg_get_expr(d.adbin, d.adrelid, true) FROM pg_catalog.pg_attrdef d \
+              WHERE d.adrelid = a.attrelid AND d.adnum = a.attnum AND a.atthasdef), \
+             a.attnotnull, a.attidentity, a.attgenerated \
+             FROM pg_catalog.pg_attribute a \
+             WHERE a.attrelid = '{wide_oid}' AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum"
+        )),
+    )
+    .await
+    .expect("wide \\d column query timed out")
+    .expect("wide \\d column query renders all types")
+    .iter()
+    .filter_map(|m| match m {
+        tokio_postgres::SimpleQueryMessage::Row(r) => r.get("attname").map(|s| s.to_string()),
+        _ => None,
+    })
+    .count();
+    assert_eq!(wide_cols, 16, "psql \\d lists all 16 columns of the wide-type table");
+
+    http.delete(format!("{rest_base}/databases/{DATABASE}/tables/{wide}"))
+        .header("Authorization", &auth)
+        .send()
+        .await
+        .unwrap();
 
     drop(pg_client);
     tokio::time::sleep(Duration::from_millis(300)).await;
