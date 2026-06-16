@@ -47,8 +47,8 @@ use async_trait::async_trait;
 
 use crate::error::{GatewayError, GatewayResult};
 use crate::types::{
-    DirectReadRequest, DirectReadResult, DirectWriteRequest, DirectWriteResult, MetadataScope,
-    TableInfo, TableRef,
+    ColumnType, CreateTableRequest, DirectReadRequest, DirectReadResult, DirectWriteRequest,
+    DirectWriteResult, MetadataScope, TableInfo, TableRef,
 };
 
 mod row_convert;
@@ -101,6 +101,29 @@ pub trait BackendFacade: Send + Sync {
         scope: &MetadataScope,
         table: &TableRef,
     ) -> GatewayResult<TableInfo>;
+
+    // --- table management / DDL (design/direct-path.md "表管理（DDL）API") ---
+
+    /// Create a table. `TableAlreadyExists` on conflict (unless
+    /// `req.ignore_if_exists`); `InvalidArgument` for an invalid schema/type.
+    /// Default impl rejects as `Unsupported` so only the real facade implements it.
+    async fn create_table(
+        &self,
+        _scope: &MetadataScope,
+        _req: CreateTableRequest,
+    ) -> GatewayResult<()> {
+        Err(GatewayError::Unsupported("create_table not supported".into()))
+    }
+
+    /// Drop a table. `TableNotFound` when absent (unless `ignore_if_not_exists`).
+    async fn drop_table(
+        &self,
+        _scope: &MetadataScope,
+        _table: &TableRef,
+        _ignore_if_not_exists: bool,
+    ) -> GatewayResult<()> {
+        Err(GatewayError::Unsupported("drop_table not supported".into()))
+    }
 
     // --- direct read (DEFERRED this phase) ---
 
@@ -321,6 +344,141 @@ impl BackendFacade for FlussBackendFacade {
             name: table.clone(),
             schema,
         })
+    }
+
+    async fn create_table(
+        &self,
+        _scope: &MetadataScope,
+        req: CreateTableRequest,
+    ) -> GatewayResult<()> {
+        use fluss::metadata::{Schema, TableDescriptor, TablePath};
+
+        if req.columns.is_empty() {
+            return Err(GatewayError::InvalidArgument(
+                "create table requires at least one column".into(),
+            ));
+        }
+
+        // Build the Fluss schema: map each neutral column type to a Fluss DataType
+        // (the single place Fluss type names are touched). PK columns are coerced
+        // non-null by Fluss; we still honor explicit nullable=false on any column.
+        let mut schema_builder = Schema::builder();
+        for col in &req.columns {
+            let dt = column_type_to_fluss(&col.data_type)?;
+            let dt = if col.nullable { dt } else { dt.as_non_nullable() };
+            schema_builder = schema_builder.column(col.name.clone(), dt);
+        }
+        if !req.primary_key.is_empty() {
+            schema_builder = schema_builder.primary_key(req.primary_key.clone());
+        }
+        let schema = schema_builder
+            .build()
+            .map_err(|e| GatewayError::InvalidArgument(format!("invalid schema: {e}")))?;
+
+        let mut desc_builder = TableDescriptor::builder().schema(schema);
+        if let Some(dist) = &req.distribution {
+            desc_builder = desc_builder.distributed_by(dist.bucket_count, dist.bucket_keys.clone());
+        }
+        if let Some(comment) = &req.comment {
+            desc_builder = desc_builder.comment(comment.clone());
+        }
+        for (k, v) in &req.properties {
+            desc_builder = desc_builder.property(k.clone(), v.clone());
+        }
+        let descriptor = desc_builder
+            .build()
+            .map_err(|e| GatewayError::InvalidArgument(format!("invalid table descriptor: {e}")))?;
+
+        let path = TablePath::new(req.table.database.clone(), req.table.table.clone());
+        self.admin()?
+            .create_table(&path, &descriptor, req.ignore_if_exists)
+            .await
+            .map_err(|e| map_create_err(&req.table, e))
+    }
+
+    async fn drop_table(
+        &self,
+        _scope: &MetadataScope,
+        table: &TableRef,
+        ignore_if_not_exists: bool,
+    ) -> GatewayResult<()> {
+        let path = fluss::metadata::TablePath::new(table.database.clone(), table.table.clone());
+        self.admin()?
+            .drop_table(&path, ignore_if_not_exists)
+            .await
+            .map_err(|e| map_table_err(table, e))
+    }
+}
+
+/// Map a neutral [`ColumnType`] to a Fluss `DataType`. Validates precision/length
+/// ranges up front and returns `InvalidArgument` rather than letting the
+/// `DataTypes` constructors panic on out-of-range parameters.
+fn column_type_to_fluss(ct: &ColumnType) -> GatewayResult<fluss::metadata::DataType> {
+    use fluss::metadata::DataTypes;
+    let bad = |m: String| GatewayError::InvalidArgument(m);
+    Ok(match ct {
+        ColumnType::Boolean => DataTypes::boolean(),
+        ColumnType::TinyInt => DataTypes::tinyint(),
+        ColumnType::SmallInt => DataTypes::smallint(),
+        ColumnType::Int => DataTypes::int(),
+        ColumnType::BigInt => DataTypes::bigint(),
+        ColumnType::Float => DataTypes::float(),
+        ColumnType::Double => DataTypes::double(),
+        ColumnType::Decimal { precision, scale } => {
+            if *precision < 1 || *precision > 38 || *scale > *precision {
+                return Err(bad(format!(
+                    "DECIMAL(precision, scale) requires 1<=precision<=38 and scale<=precision, got ({precision},{scale})"
+                )));
+            }
+            DataTypes::decimal(*precision, *scale)
+        }
+        ColumnType::Char { length } => {
+            if *length == 0 {
+                return Err(bad("CHAR(length) requires length>=1".into()));
+            }
+            DataTypes::char(*length)
+        }
+        ColumnType::String => DataTypes::string(),
+        ColumnType::Binary { length } => {
+            if *length == 0 {
+                return Err(bad("BINARY(length) requires length>=1".into()));
+            }
+            DataTypes::binary(*length as usize)
+        }
+        ColumnType::Bytes => DataTypes::bytes(),
+        ColumnType::Date => DataTypes::date(),
+        ColumnType::Time { precision } => {
+            if *precision > 9 {
+                return Err(bad(format!("TIME(precision) requires precision<=9, got {precision}")));
+            }
+            DataTypes::time_with_precision(*precision)
+        }
+        ColumnType::Timestamp { precision } => {
+            if *precision > 9 {
+                return Err(bad(format!(
+                    "TIMESTAMP(precision) requires precision<=9, got {precision}"
+                )));
+            }
+            DataTypes::timestamp_with_precision(*precision)
+        }
+    })
+}
+
+/// Map a fluss-rs `create_table` error: "already exists" → `TableAlreadyExists`
+/// (the 409 path), anything else → `Backend`. The string match mirrors
+/// `map_table_err` (fluss-rs does not surface a typed conflict here).
+fn map_create_err(table: &TableRef, e: fluss::error::Error) -> GatewayError {
+    let lower = e.to_string().to_lowercase();
+    if lower.contains("already exist") {
+        GatewayError::TableAlreadyExists {
+            database: table.database.clone(),
+            table: table.table.clone(),
+        }
+    } else {
+        GatewayError::Backend(format!(
+            "create_table {}.{}: {e}",
+            table.database, table.table
+        ))
     }
 }
 

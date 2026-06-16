@@ -43,6 +43,9 @@
 //!    and assert it executes against the real catalog (pins the PG introspection
 //!    rewrite: OPERATOR/COLLATE/pg_table_is_visible + regtype cast + correlated
 //!    scalar subqueries).
+//! 4c. (f) REST DDL: create a table via `POST .../tables`, confirm it is listed,
+//!    a duplicate is rejected 409, the table is writable + PG-readable, and
+//!    `DELETE` drops it (204).
 //! 5. T4 semantics that need a cluster: at-least-once (REST 2xx == backend ack)
 //!    and "direct path opens no session" are asserted here against the real
 //!    instance. The cluster-free T4 semantics (SessionContext dirty/rebuild,
@@ -342,6 +345,11 @@ async fn cluster_rest_kv_and_log_then_pg_selects() {
 
     // (b3) Populate the composite-PK prefix table via REST: three rows share
     // `c1 = 10` so a later `WHERE c1 = 10` prefix lookup returns exactly three.
+    // Wait for the bucket to be readable first; composite/bucket-key metadata can
+    // lag just after CREATE TABLE, and the REST write would otherwise time out.
+    tokio::time::timeout(Duration::from_secs(30), wait_for_bucket0(&gw_conn, KV_PREFIX_TABLE))
+        .await
+        .expect("prefix table bucket never became readable before REST upsert");
     let resp = tokio::time::timeout(
         Duration::from_secs(30),
         http.post(format!("{rest_base}/databases/{DATABASE}/tables/{KV_PREFIX_TABLE}/records"))
@@ -595,6 +603,112 @@ async fn cluster_rest_kv_and_log_then_pg_selects() {
         })
         .collect();
     assert_eq!(d_cols, vec!["id", "name"], "psql \\d lists the KV table columns");
+
+    // psql `\d`'s foreign-key query casts `conrelid::pg_catalog.regclass` — an
+    // OID-alias type DataFusion can't execute; the rewrite degrades it to ::text.
+    // (No FKs on a Fluss table, so this returns no rows — it just has to plan.)
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        pg_client.simple_query(&format!(
+            "SELECT true as sametable, conname, \
+             pg_catalog.pg_get_constraintdef(r.oid, true) as condef, \
+             conrelid::pg_catalog.regclass AS ontable \
+             FROM pg_catalog.pg_constraint r \
+             WHERE r.conrelid = '{oid_row}' AND r.contype = 'f' AND conparentid = 0 \
+             ORDER BY conname"
+        )),
+    )
+    .await
+    .expect("psql \\d FK query timed out")
+    .expect("psql \\d FK query (regclass cast rewrite)");
+
+    // (f) DDL over REST (design/direct-path.md "表管理（DDL）API"): create a table
+    // through the gateway's own POST, prove it is visible + usable, that a
+    // duplicate is rejected 409, and that DELETE drops it.
+    let rest_created = "gw_rest_kv";
+    let create_body = format!(
+        r#"{{"table_name":"{rest_created}","columns":[{{"name":"id","type":"INT","nullable":false}},{{"name":"name","type":"STRING"}}],"primary_key":["id"],"distribution":{{"bucket_keys":["id"],"bucket_count":1}}}}"#
+    );
+    let resp = tokio::time::timeout(
+        Duration::from_secs(30),
+        http.post(format!("{rest_base}/databases/{DATABASE}/tables"))
+            .header("Authorization", &auth)
+            .header("Content-Type", JSON)
+            .body(create_body.clone())
+            .send(),
+    )
+    .await
+    .expect("REST create table timed out")
+    .unwrap();
+    assert_eq!(resp.status(), 201, "REST create returns 201");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["table"], rest_created, "create returns the new table metadata");
+    let cols: Vec<&str> = body["columns"].as_array().unwrap().iter().filter_map(|c| c["name"].as_str()).collect();
+    assert_eq!(cols, vec!["id", "name"], "created table has the (id, name) schema");
+
+    // list now includes the just-created table
+    let tables = http
+        .get(format!("{rest_base}/databases/{DATABASE}/tables"))
+        .header("Authorization", &auth)
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    assert!(
+        tables["tables"].as_array().unwrap().iter().any(|t| t == rest_created),
+        "REST-created table appears in the table list"
+    );
+
+    // duplicate create -> 409
+    let resp = http
+        .post(format!("{rest_base}/databases/{DATABASE}/tables"))
+        .header("Authorization", &auth)
+        .header("Content-Type", JSON)
+        .body(create_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409, "duplicate create returns 409");
+
+    // the created table is usable: REST write + PG read back
+    let resp = http
+        .post(format!("{rest_base}/databases/{DATABASE}/tables/{rest_created}/records"))
+        .header("Authorization", &auth)
+        .header("Content-Type", JSON)
+        .body(r#"[{"id":7,"name":"zoe"}]"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "write into the REST-created table");
+
+    let rows = tokio::time::timeout(
+        Duration::from_secs(30),
+        pg_client.simple_query(&format!(
+            "SELECT id, name FROM fluss.{DATABASE}.{rest_created} WHERE id = 7"
+        )),
+    )
+    .await
+    .expect("PG read of REST-created table timed out")
+    .expect("PG read of REST-created table");
+    let n = rows
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(r) if r.get("name") == Some("zoe") => Some(()),
+            _ => None,
+        })
+        .count();
+    assert_eq!(n, 1, "row written into the REST-created table reads back via PG");
+
+    // DELETE drops it -> 204
+    let resp = http
+        .delete(format!("{rest_base}/databases/{DATABASE}/tables/{rest_created}"))
+        .header("Authorization", &auth)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204, "REST drop returns 204");
 
     drop(pg_client);
     tokio::time::sleep(Duration::from_millis(300)).await;

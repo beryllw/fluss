@@ -35,10 +35,10 @@ pub use gateway_instance::GatewayInstanceImpl;
 
 use crate::error::GatewayResult;
 use crate::types::{
-    CancelResult, DescribeSqlRequest, DirectReadRequest, DirectReadResult, DirectWriteRequest,
-    DirectWriteResult, ExecuteSqlRequest, MetadataScope, OpenSessionRequest, OperationId,
-    OperationStatusSnapshot, SessionId, SessionMutation, SessionSnapshot, SqlDescription,
-    SqlExecution, TableInfo, TableRef,
+    CancelResult, CreateTableRequest, DescribeSqlRequest, DirectReadRequest, DirectReadResult,
+    DirectWriteRequest, DirectWriteResult, ExecuteSqlRequest, MetadataScope, OpenSessionRequest,
+    OperationId, OperationStatusSnapshot, SessionId, SessionMutation, SessionSnapshot,
+    SqlDescription, SqlExecution, TableInfo, TableRef,
 };
 
 /// The single core facade exposed to protocol modules.
@@ -84,4 +84,17 @@ pub trait GatewayInstance: Send + Sync {
         scope: MetadataScope,
         table: TableRef,
     ) -> GatewayResult<TableInfo>;
+
+    // --- Table management / DDL ---
+    async fn create_table(
+        &self,
+        scope: MetadataScope,
+        request: CreateTableRequest,
+    ) -> GatewayResult<()>;
+    async fn drop_table(
+        &self,
+        scope: MetadataScope,
+        table: TableRef,
+        ignore_if_not_exists: bool,
+    ) -> GatewayResult<()>;
 }

@@ -64,6 +64,18 @@ static PG_CATALOG_TEXT_CAST: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)::\s*pg_catalog\.text\b").unwrap()
 });
 
+/// PostgreSQL OID-alias type casts (`regclass`, `regproc`, `regtype`, …), which
+/// DataFusion does not support. psql introspection uses them only to render an
+/// object's name (e.g. `conrelid::regclass`); degrade them to `::text` (the oid
+/// rendered as text). Harmless for our results — the rows that would show such a
+/// name (foreign keys, indexes, …) are empty for Fluss tables anyway.
+static PG_OID_ALIAS_CAST: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)::\s*(?:pg_catalog\.)?reg(?:class|collation|config|dictionary|namespace|oper|operator|procedure|proc|role|type)\b",
+    )
+    .unwrap()
+});
+
 /// psql `\d`'s column query carries two correlated scalar subqueries that
 /// DataFusion's analyzer rejects ("Correlated scalar subquery must be aggregated
 /// to return at most one row"): the column default (from `pg_attrdef`) and the
@@ -107,6 +119,7 @@ pub fn rewrite_introspection(sql: &str) -> String {
     let s = PG_COLLATION_SUBQUERY.replace_all(&s, "NULL");
     let s = PG_CATALOG_OPERATOR.replace_all(&s, "${1}");
     let s = REGTYPE_TO_TEXT_CAST.replace_all(&s, "::text");
+    let s = PG_OID_ALIAS_CAST.replace_all(&s, "::text");
     let s = PG_CATALOG_TEXT_CAST.replace_all(&s, "::text");
     let s = COLLATE_DEFAULT.replace_all(&s, "");
     let s = PG_CATALOG_FN.replace_all(&s, "${1}(");
@@ -417,6 +430,17 @@ mod tests {
             rewrite_introspection("x::pg_catalog.text"),
             "x::text"
         );
+    }
+
+    #[test]
+    fn rewrite_degrades_oid_alias_casts() {
+        // psql \d's FK/index queries cast oids to regclass/regproc etc.
+        assert_eq!(
+            rewrite_introspection("conrelid::pg_catalog.regclass AS ontable"),
+            "conrelid::text AS ontable"
+        );
+        assert_eq!(rewrite_introspection("x::regclass"), "x::text");
+        assert_eq!(rewrite_introspection("p.proname::regproc"), "p.proname::text");
     }
 
     #[test]

@@ -283,6 +283,10 @@ pub fn error_to_pg(err: &GatewayError) -> ErrorInfo {
         GatewayError::TableNotFound { database, table } => {
             ("42P01", format!("table not found: {database}.{table}"))
         }
+        // 42P07 = duplicate_table.
+        GatewayError::TableAlreadyExists { database, table } => {
+            ("42P07", format!("table already exists: {database}.{table}"))
+        }
         // 0A000 = feature_not_supported; message must point at the REST write path.
         GatewayError::Unsupported(m) => ("0A000", m.clone()),
         GatewayError::Timeout(m) => ("57014", format!("timed out: {m}")),

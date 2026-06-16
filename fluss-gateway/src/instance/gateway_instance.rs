@@ -41,10 +41,10 @@ use crate::session::manager::SessionManager;
 use crate::sql::environment::SqlEnvironmentRegistry;
 use crate::sql::SqlGatewayService;
 use crate::types::{
-    CancelResult, DescribeSqlRequest, DirectReadRequest, DirectReadResult, DirectWriteRequest,
-    DirectWriteResult, ExecuteSqlRequest, MetadataScope, OpenSessionRequest, OperationId,
-    OperationStatusSnapshot, SessionId, SessionMutation, SessionSnapshot, SqlDescription,
-    SqlExecution, TableInfo, TableRef,
+    CancelResult, CreateTableRequest, DescribeSqlRequest, DirectReadRequest, DirectReadResult,
+    DirectWriteRequest, DirectWriteResult, ExecuteSqlRequest, MetadataScope, OpenSessionRequest,
+    OperationId, OperationStatusSnapshot, SessionId, SessionMutation, SessionSnapshot,
+    SqlDescription, SqlExecution, TableInfo, TableRef,
 };
 
 /// Phase 1 concrete gateway facade.
@@ -208,6 +208,27 @@ impl GatewayInstance for GatewayInstanceImpl {
         table: TableRef,
     ) -> GatewayResult<TableInfo> {
         self.backend.get_table_info(&scope, &table).await
+    }
+
+    // --- Table management / DDL: delegate to the backend (design/direct-path.md) ---
+
+    async fn create_table(
+        &self,
+        scope: MetadataScope,
+        request: CreateTableRequest,
+    ) -> GatewayResult<()> {
+        self.backend.create_table(&scope, request).await
+    }
+
+    async fn drop_table(
+        &self,
+        scope: MetadataScope,
+        table: TableRef,
+        ignore_if_not_exists: bool,
+    ) -> GatewayResult<()> {
+        self.backend
+            .drop_table(&scope, &table, ignore_if_not_exists)
+            .await
     }
 }
 

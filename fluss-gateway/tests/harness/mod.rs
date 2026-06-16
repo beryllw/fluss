@@ -48,10 +48,10 @@ use fluss_gateway::instance::GatewayInstance;
 use fluss_gateway::server::postgres::PgServer;
 use fluss_gateway::server::rest::RestServer;
 use fluss_gateway::types::{
-    CancelResult, DescribeSqlRequest, DirectReadRequest, DirectReadResult, DirectWriteRequest,
-    DirectWriteResult, ExecuteSqlRequest, MetadataScope, OpenSessionRequest, OperationId,
-    OperationState, OperationStatusSnapshot, SessionId, SessionMutation, SessionSnapshot,
-    SqlDescription, SqlExecution, TableInfo, TableRef,
+    CancelResult, CreateTableRequest, DescribeSqlRequest, DirectReadRequest, DirectReadResult,
+    DirectWriteRequest, DirectWriteResult, ExecuteSqlRequest, MetadataScope, OpenSessionRequest,
+    OperationId, OperationState, OperationStatusSnapshot, SessionId, SessionMutation,
+    SessionSnapshot, SqlDescription, SqlExecution, TableInfo, TableRef,
 };
 
 /// One recorded direct write, so REST tests can assert the request reached the
@@ -90,6 +90,13 @@ pub struct FakeInstance {
     /// Number of sessions ever opened. Direct (REST) requests must NOT increment
     /// this — it backs the "direct path has no session" semantic test.
     pub sessions_opened: Mutex<u64>,
+    /// Every CREATE TABLE that reached the instance (REST DDL assertions).
+    pub created_tables: Mutex<Vec<CreateTableRequest>>,
+    /// Tables that should resolve as already-existing from create (drives the 409
+    /// mapping test).
+    pub existing_tables: Mutex<Vec<String>>,
+    /// Every dropped table name (REST DDL assertions).
+    pub dropped_tables: Mutex<Vec<String>>,
 }
 
 impl FakeInstance {
@@ -364,6 +371,44 @@ impl GatewayInstance for FakeInstance {
         }
         let (schema, _) = Self::canned_result();
         Ok(TableInfo { name: table, schema })
+    }
+
+    async fn create_table(
+        &self,
+        _scope: MetadataScope,
+        request: CreateTableRequest,
+    ) -> GatewayResult<()> {
+        // Conflict path: tables listed in `existing_tables` already exist.
+        if self
+            .existing_tables
+            .lock()
+            .unwrap()
+            .contains(&request.table.table)
+            && !request.ignore_if_exists
+        {
+            return Err(GatewayError::TableAlreadyExists {
+                database: request.table.database.clone(),
+                table: request.table.table.clone(),
+            });
+        }
+        self.created_tables.lock().unwrap().push(request);
+        Ok(())
+    }
+
+    async fn drop_table(
+        &self,
+        _scope: MetadataScope,
+        table: TableRef,
+        ignore_if_not_exists: bool,
+    ) -> GatewayResult<()> {
+        if self.missing_tables.lock().unwrap().contains(&table.table) && !ignore_if_not_exists {
+            return Err(GatewayError::TableNotFound {
+                database: table.database,
+                table: table.table,
+            });
+        }
+        self.dropped_tables.lock().unwrap().push(table.table);
+        Ok(())
     }
 }
 

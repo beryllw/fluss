@@ -45,6 +45,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use serde::Deserialize;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
@@ -53,8 +54,8 @@ use crate::direct::{decode_write_body, WriteEncoding};
 use crate::error::GatewayError;
 use crate::instance::GatewayInstance;
 use crate::types::{
-    ClusterId, DirectWriteRequest, MetadataScope, Principal, RequestExecutionContext, RequestId,
-    TableRef,
+    ClusterId, ColumnSpec, ColumnType, CreateTableRequest, DirectWriteRequest, MetadataScope,
+    Principal, RequestExecutionContext, RequestId, TableDistribution, TableRef,
 };
 
 /// Shared, cheaply-cloneable REST wiring: the gateway facade and the auth seam.
@@ -105,13 +106,15 @@ impl RestServer {
                 "/v1/clusters/{cluster}/databases",
                 get(handle_list_databases),
             )
+            // List tables (GET) + create table (POST) on the collection resource.
             .route(
                 "/v1/clusters/{cluster}/databases/{db}/tables",
-                get(handle_list_tables),
+                get(handle_list_tables).post(handle_create_table),
             )
+            // Get table (GET) + drop table (DELETE) on the instance resource.
             .route(
                 "/v1/clusters/{cluster}/databases/{db}/tables/{table}",
-                get(handle_get_table),
+                get(handle_get_table).delete(handle_drop_table),
             )
             // --- direct read (path frozen, NOT implemented this phase) ---
             .route(
@@ -396,6 +399,235 @@ async fn handle_get_table(
 }
 
 // ---------------------------------------------------------------------------
+// handlers: table management / DDL (design/direct-path.md "表管理（DDL）API")
+// ---------------------------------------------------------------------------
+
+/// JSON body for `POST .../tables` (kafka-rest-style: name in body, configs as a
+/// name/value array, `validate_only` dry-run). Wire-only; mapped to the neutral
+/// [`CreateTableRequest`] domain type before reaching the instance.
+#[derive(Debug, Deserialize)]
+struct CreateTableBody {
+    table_name: String,
+    columns: Vec<ColumnBody>,
+    #[serde(default)]
+    primary_key: Vec<String>,
+    #[serde(default)]
+    distribution: Option<DistributionBody>,
+    #[serde(default)]
+    comment: Option<String>,
+    #[serde(default)]
+    configs: Vec<ConfigEntry>,
+    #[serde(default)]
+    validate_only: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ColumnBody {
+    name: String,
+    #[serde(rename = "type")]
+    data_type: String,
+    #[serde(default = "default_true")]
+    nullable: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct DistributionBody {
+    #[serde(default)]
+    bucket_keys: Vec<String>,
+    #[serde(default)]
+    bucket_count: Option<i32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConfigEntry {
+    name: String,
+    value: String,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Parse a column `type` string (case-insensitive) into a [`ColumnType`], honoring
+/// parameterized forms `DECIMAL(p,s)`, `CHAR(n)`, `BINARY(n)`, `TIME(p)`,
+/// `TIMESTAMP(p)`. Range validation is deferred to the backend mapping.
+fn parse_column_type(raw: &str) -> Result<ColumnType, GatewayError> {
+    let s = raw.trim();
+    let bad = || GatewayError::InvalidArgument(format!("unsupported column type: {raw}"));
+    let (base, args) = match s.split_once('(') {
+        Some((b, rest)) => {
+            let inner = rest.strip_suffix(')').ok_or_else(bad)?;
+            let nums: Result<Vec<u32>, _> =
+                inner.split(',').map(|p| p.trim().parse::<u32>()).collect();
+            (b.trim(), nums.map_err(|_| bad())?)
+        }
+        None => (s, Vec::new()),
+    };
+    let up = base.to_ascii_uppercase();
+    let ct = match up.as_str() {
+        "BOOLEAN" | "BOOL" => ColumnType::Boolean,
+        "TINYINT" => ColumnType::TinyInt,
+        "SMALLINT" => ColumnType::SmallInt,
+        "INT" | "INTEGER" => ColumnType::Int,
+        "BIGINT" => ColumnType::BigInt,
+        "FLOAT" | "REAL" => ColumnType::Float,
+        "DOUBLE" => ColumnType::Double,
+        "STRING" | "TEXT" | "VARCHAR" => ColumnType::String,
+        "BYTES" => ColumnType::Bytes,
+        "DATE" => ColumnType::Date,
+        "DECIMAL" | "NUMERIC" => {
+            let precision = *args.first().ok_or_else(bad)?;
+            let scale = args.get(1).copied().unwrap_or(0);
+            if args.len() > 2 {
+                return Err(bad());
+            }
+            ColumnType::Decimal { precision, scale }
+        }
+        "CHAR" => ColumnType::Char {
+            length: *args.first().ok_or_else(bad)?,
+        },
+        "BINARY" => ColumnType::Binary {
+            length: *args.first().ok_or_else(bad)?,
+        },
+        "TIME" => ColumnType::Time {
+            precision: args.first().copied().unwrap_or(0),
+        },
+        "TIMESTAMP" => ColumnType::Timestamp {
+            precision: args.first().copied().unwrap_or(6),
+        },
+        _ => return Err(bad()),
+    };
+    Ok(ct)
+}
+
+/// Build the JSON metadata view of a table (same shape as `GET .../tables/{t}`).
+fn table_info_json(info: &crate::types::TableInfo) -> serde_json::Value {
+    let fields: Vec<_> = info
+        .schema
+        .fields()
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "name": f.name(),
+                "data_type": f.data_type().to_string(),
+                "nullable": f.is_nullable(),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "database": info.name.database,
+        "table": info.name.table,
+        "columns": fields,
+    })
+}
+
+async fn handle_create_table(
+    State(state): State<RestState>,
+    Path((cluster, db)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let result = async {
+        let ctx = make_context(&state, &headers, &cluster).await?;
+        let scope = MetadataScope {
+            principal: ctx.principal,
+            cluster: ctx.cluster,
+        };
+
+        let spec: CreateTableBody = serde_json::from_slice(&body)
+            .map_err(|e| GatewayError::InvalidArgument(format!("invalid create-table body: {e}")))?;
+        if spec.table_name.trim().is_empty() {
+            return Err(GatewayError::InvalidArgument("table_name is required".into()));
+        }
+        let columns = spec
+            .columns
+            .iter()
+            .map(|c| {
+                Ok(ColumnSpec {
+                    name: c.name.clone(),
+                    data_type: parse_column_type(&c.data_type)?,
+                    nullable: c.nullable,
+                })
+            })
+            .collect::<Result<Vec<_>, GatewayError>>()?;
+
+        let table = TableRef {
+            database: db.clone(),
+            table: spec.table_name.clone(),
+        };
+        let req = CreateTableRequest {
+            table: table.clone(),
+            columns,
+            primary_key: spec.primary_key,
+            distribution: spec.distribution.map(|d| TableDistribution {
+                bucket_keys: d.bucket_keys,
+                bucket_count: d.bucket_count,
+            }),
+            comment: spec.comment,
+            properties: spec
+                .configs
+                .into_iter()
+                .map(|c| (c.name, c.value))
+                .collect(),
+            // CREATE returns 409 on conflict (kafka-rest semantics), so do not
+            // silently ignore an existing table here.
+            ignore_if_exists: false,
+        };
+
+        if spec.validate_only {
+            // Dry-run: validate column types (already parsed above) without
+            // creating. Reflect back the request shape; no Fluss call.
+            return Ok((StatusCode::OK, validate_only_json(&req)));
+        }
+
+        state.instance.create_table(scope.clone(), req).await?;
+        // Return the freshly-created table's metadata (201).
+        let info = state.instance.get_table_info(scope, table).await?;
+        Ok((StatusCode::CREATED, table_info_json(&info)))
+    }
+    .await;
+    match result {
+        Ok((status, body)) => (status, Json(body)).into_response(),
+        Err(e) => error_response(e),
+    }
+}
+
+/// JSON echoed back for a successful `validate_only` create (HTTP 200, not created).
+fn validate_only_json(req: &CreateTableRequest) -> serde_json::Value {
+    serde_json::json!({
+        "validate_only": true,
+        "database": req.table.database,
+        "table": req.table.table,
+        "column_count": req.columns.len(),
+        "primary_key": req.primary_key,
+    })
+}
+
+async fn handle_drop_table(
+    State(state): State<RestState>,
+    Path((cluster, db, table)): Path<(String, String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let result = async {
+        let ctx = make_context(&state, &headers, &cluster).await?;
+        let scope = MetadataScope {
+            principal: ctx.principal,
+            cluster: ctx.cluster,
+        };
+        let table_ref = TableRef {
+            database: db,
+            table,
+        };
+        state.instance.drop_table(scope, table_ref, false).await
+    }
+    .await;
+    match result {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => error_response(e),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // handlers: deferred direct read (path frozen, §4 / Backlog §7)
 // ---------------------------------------------------------------------------
 
@@ -424,6 +656,7 @@ pub fn status_for(err: &GatewayError) -> StatusCode {
         | GatewayError::OperationNotFound(_)
         | GatewayError::DatabaseNotFound { .. }
         | GatewayError::TableNotFound { .. } => StatusCode::NOT_FOUND, // 404
+        GatewayError::TableAlreadyExists { .. } => StatusCode::CONFLICT, // 409
         GatewayError::Unsupported(_) => StatusCode::NOT_IMPLEMENTED, // 501
         GatewayError::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,     // 504
         GatewayError::Cancelled(_) => StatusCode::from_u16(499).unwrap(),
@@ -443,6 +676,7 @@ fn error_code(err: &GatewayError) -> &'static str {
         GatewayError::OperationNotFound(_) => "operation_not_found",
         GatewayError::DatabaseNotFound { .. } => "database_not_found",
         GatewayError::TableNotFound { .. } => "table_not_found",
+        GatewayError::TableAlreadyExists { .. } => "table_already_exists",
         GatewayError::Unsupported(_) => "unsupported",
         GatewayError::Timeout(_) => "timeout",
         GatewayError::Cancelled(_) => "cancelled",
@@ -589,6 +823,41 @@ mod tests {
     }
 
     #[test]
+    fn parse_column_type_handles_simple_and_parameterized() {
+        assert_eq!(parse_column_type("int").unwrap(), ColumnType::Int);
+        assert_eq!(parse_column_type("  STRING ").unwrap(), ColumnType::String);
+        assert_eq!(parse_column_type("BigInt").unwrap(), ColumnType::BigInt);
+        assert_eq!(
+            parse_column_type("DECIMAL(10, 2)").unwrap(),
+            ColumnType::Decimal { precision: 10, scale: 2 }
+        );
+        assert_eq!(
+            parse_column_type("decimal(5)").unwrap(),
+            ColumnType::Decimal { precision: 5, scale: 0 }
+        );
+        assert_eq!(
+            parse_column_type("TIMESTAMP(3)").unwrap(),
+            ColumnType::Timestamp { precision: 3 }
+        );
+        assert_eq!(
+            parse_column_type("TIMESTAMP").unwrap(),
+            ColumnType::Timestamp { precision: 6 }
+        );
+        assert_eq!(
+            parse_column_type("CHAR(8)").unwrap(),
+            ColumnType::Char { length: 8 }
+        );
+        assert!(matches!(
+            parse_column_type("nope"),
+            Err(GatewayError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            parse_column_type("DECIMAL(x)"),
+            Err(GatewayError::InvalidArgument(_))
+        ));
+    }
+
+    #[test]
     fn status_map_covers_every_variant() {
         use GatewayError::*;
         assert_eq!(status_for(&InvalidArgument("x".into())), StatusCode::BAD_REQUEST);
@@ -604,6 +873,13 @@ mod tests {
         assert_eq!(
             status_for(&DatabaseNotFound { database: "d".into() }),
             StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            status_for(&TableAlreadyExists {
+                database: "d".into(),
+                table: "t".into()
+            }),
+            StatusCode::CONFLICT
         );
         assert_eq!(status_for(&SessionNotFound("s".into())), StatusCode::NOT_FOUND);
         assert_eq!(status_for(&OperationNotFound("o".into())), StatusCode::NOT_FOUND);

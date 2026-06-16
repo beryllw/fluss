@@ -105,19 +105,38 @@ eval $PSQL -c "SELECT * FROM <log_table> LIMIT 10;"
 A KV scan with neither a key predicate nor a `LIMIT` is rejected with a clear
 error rather than running an unbounded full scan.
 
-REST (metadata + write):
+REST (metadata + DDL + write):
 
 ```bash
 # list databases
 curl -u alice:ignored http://127.0.0.1:8080/v1/clusters/default/databases
 
+# create a table (POST to the tables collection; name in body)
+curl -u alice:ignored -H 'Content-Type: application/json' \
+  -X POST http://127.0.0.1:8080/v1/clusters/default/databases/fluss/tables \
+  -d '{
+        "table_name": "gw_kv",
+        "columns": [
+          {"name": "id",   "type": "INT",    "nullable": false},
+          {"name": "name", "type": "STRING"}
+        ],
+        "primary_key": ["id"],
+        "distribution": {"bucket_keys": ["id"], "bucket_count": 1}
+      }'
+
 # write rows into an existing KV/Log table `t` in database `db`
 curl -u alice:ignored -H 'Content-Type: application/json' \
   -X POST http://127.0.0.1:8080/v1/clusters/default/databases/db/tables/t/records \
   -d '[{"id":1,"name":"alice"}]'
+
+# drop a table
+curl -u alice:ignored -X DELETE \
+  http://127.0.0.1:8080/v1/clusters/default/databases/fluss/tables/gw_kv
 ```
 
-(Writes target an existing table; the gateway does not create tables.)
+Create returns `201` (or `200` with `"validate_only": true` to dry-run), `409`
+if the table already exists. See `fluss-gateway/design/direct-path.md` for the
+full request schema (column types, `configs`, `validate_only`).
 
 ## Local test stack
 

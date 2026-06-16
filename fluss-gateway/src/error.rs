@@ -61,6 +61,10 @@ pub enum GatewayError {
     #[error("table not found: {database}.{table}")]
     TableNotFound { database: String, table: String },
 
+    /// A table to be created already exists.
+    #[error("table already exists: {database}.{table}")]
+    TableAlreadyExists { database: String, table: String },
+
     /// The requested capability is not supported in this phase / build.
     #[error("unsupported: {0}")]
     Unsupported(String),

@@ -376,6 +376,66 @@ pub struct TableInfo {
     pub schema: SchemaRef,
 }
 
+// ---------------------------------------------------------------------------
+// DDL domain (table management; see design/direct-path.md "表管理（DDL）API")
+// ---------------------------------------------------------------------------
+
+/// A neutral column data type for CREATE TABLE. Protocol-agnostic and free of
+/// Fluss types: the backend maps each variant to `fluss::metadata::DataTypes`
+/// (the single place Fluss type names are touched). Mirrors the REST `type`
+/// vocabulary documented in `design/direct-path.md`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ColumnType {
+    Boolean,
+    TinyInt,
+    SmallInt,
+    Int,
+    BigInt,
+    Float,
+    Double,
+    Decimal { precision: u32, scale: u32 },
+    Char { length: u32 },
+    String,
+    Binary { length: u32 },
+    Bytes,
+    Date,
+    Time { precision: u32 },
+    Timestamp { precision: u32 },
+}
+
+/// One column in a CREATE TABLE request. `nullable` defaults to true at the
+/// protocol boundary; primary-key columns are forced non-null by Fluss.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnSpec {
+    pub name: String,
+    pub data_type: ColumnType,
+    pub nullable: bool,
+}
+
+/// Bucket distribution for a table. `bucket_keys` empty means "let Fluss decide"
+/// (defaults to the primary key for KV tables).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TableDistribution {
+    pub bucket_keys: Vec<String>,
+    pub bucket_count: Option<i32>,
+}
+
+/// A request to create a table. Cluster-scoped metadata mutation (paired with a
+/// [`MetadataScope`] at the instance boundary), not a direct-path write.
+#[derive(Debug, Clone)]
+pub struct CreateTableRequest {
+    pub table: TableRef,
+    pub columns: Vec<ColumnSpec>,
+    /// Empty => Log table; non-empty => KV (primary-key) table.
+    pub primary_key: Vec<String>,
+    pub distribution: Option<TableDistribution>,
+    pub comment: Option<String>,
+    /// Table properties (name/value), passed through to Fluss table options.
+    pub properties: Vec<(String, String)>,
+    /// When true, suppress the "already exists" error (CREATE TABLE IF NOT EXISTS).
+    pub ignore_if_exists: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

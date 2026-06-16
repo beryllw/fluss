@@ -55,10 +55,60 @@ POST /v1/clusters/{cluster}/databases/{db}/tables/{table}/records:delete    # kv
 GET /v1/clusters/{cluster}/databases
 GET /v1/clusters/{cluster}/databases/{db}/tables
 GET /v1/clusters/{cluster}/databases/{db}/tables/{table}
+
+# table management（DDL，见下一节）
+POST   /v1/clusters/{cluster}/databases/{db}/tables          # 建表（表名在 body）
+DELETE /v1/clusters/{cluster}/databases/{db}/tables/{table}  # 删表
 ```
 
 - read 端点保留在路径表里以固定 URL 形态；当前返回 `501`。
 - 资源命名与错误返回风格参考 Kafka REST 习惯，但写语义按 Fluss 表类型走。
+
+### 表管理（DDL）API —— 对标 Kafka REST 的 topic 资源
+
+建表/删表是 **cluster-scoped 的元数据变更**，不是 direct write（不带 `RequestExecutionContext`，走 `MetadataScope`）。设计对标 Kafka REST 的 topic 资源：**POST 到集合资源、名字放 body、`configs` 用 name/value 数组、支持 `validate_only` dry-run**。Fluss 表比 topic 多出 schema 与主键，故 body 增加 `columns` / `primary_key` / `distribution`。
+
+#### 路径与动词
+
+- `POST   /v1/clusters/{cluster}/databases/{db}/tables`           建表（集合资源，表名在 body）
+- `DELETE /v1/clusters/{cluster}/databases/{db}/tables/{table}`   删表
+- 复用既有 `GET .../tables`（list）、`GET .../tables/{table}`（get）
+
+#### 建表请求体（`application/json`）
+
+```json
+{
+  "table_name": "gw_kv",
+  "columns": [
+    {"name": "id",   "type": "INT",    "nullable": false},
+    {"name": "name", "type": "STRING", "nullable": true}
+  ],
+  "primary_key": ["id"],
+  "distribution": { "bucket_keys": ["id"], "bucket_count": 1 },
+  "comment": "optional",
+  "configs": [ {"name": "table.log.ttl", "value": "7d"} ],
+  "validate_only": false
+}
+```
+
+- 列 `type` 词表（大小写不敏感），映射到 Fluss `DataTypes`：
+  `BOOLEAN, TINYINT, SMALLINT, INT, BIGINT, FLOAT, DOUBLE, DECIMAL(p,s), CHAR(n), STRING, BINARY(n), BYTES, DATE, TIME[(p)], TIMESTAMP[(p)]`。
+- `nullable` 默认 `true`；主键列按 Fluss 语义强制 non-null。
+- `primary_key` 为空 ⇒ Log 表；非空 ⇒ KV 表。`distribution` 可选；KV 表的 `bucket_keys` 必须 ⊆ 主键。
+- `configs`：name/value 数组（对齐 Kafka REST，不用自由 map），落到 Fluss 表 properties。
+- `validate_only=true`：仅校验 schema/类型/存在性，**不真正建表**（Fluss 无服务端 dry-run，网关做本地校验 + `table_exists` 检查）。
+
+#### 响应（对齐 Kafka REST 语义）
+
+- `201` 建表成功，返回该表的 metadata（同 `GET .../tables/{table}` 形状）
+- `200` 当 `validate_only=true`（已校验、未建）
+- `400` 列/类型/主键非法；`401/403` 认证/授权；`404` database 不存在；`409` 表已存在；`5xx` 后端失败
+- 删表：`204` 成功
+
+#### 一致性说明
+
+- 建表成功后，**REST metadata 端点立即可见**该表。
+- PG / SQL 视图可能短暂滞后（fluss-datafusion 自带独立 metadata cache，按其 TTL 失效），属已知行为，不在本层处理。
 
 ### direct write 的 at-least-once 与错误返回边界
 

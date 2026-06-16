@@ -355,3 +355,146 @@ async fn successful_write_is_backend_ack() {
     // Exactly one ack recorded, with the rows we submitted (no phantom retries).
     assert_eq!(server.instance.writes.lock().unwrap().len(), 1);
 }
+
+// ---------------------------------------------------------------------------
+// table management (DDL) — design/direct-path.md "表管理（DDL）API"
+// ---------------------------------------------------------------------------
+
+const CREATE_BODY: &str = r#"{
+  "table_name": "gw_kv",
+  "columns": [
+    {"name": "id",   "type": "INT",    "nullable": false},
+    {"name": "name", "type": "STRING"}
+  ],
+  "primary_key": ["id"],
+  "distribution": {"bucket_keys": ["id"], "bucket_count": 1},
+  "configs": [{"name": "k", "value": "v"}]
+}"#;
+
+#[tokio::test]
+async fn create_table_succeeds_and_reaches_instance() {
+    let server = RestTestServer::start().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{}/databases/db/tables", server.base_url()))
+        .header("Authorization", format!("Basic {}", basic("alice")))
+        .header("Content-Type", JSON)
+        .body(CREATE_BODY)
+        .send()
+        .await
+        .unwrap();
+
+    // 201 Created, returning the new table's metadata (from the fake's get_table_info).
+    assert_eq!(resp.status(), 201);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["database"], "db");
+    assert_eq!(body["table"], "gw_kv");
+
+    let created = server.instance.created_tables.lock().unwrap();
+    assert_eq!(created.len(), 1, "create reached the instance exactly once");
+    assert_eq!(created[0].table.database, "db");
+    assert_eq!(created[0].table.table, "gw_kv");
+    assert_eq!(created[0].primary_key, vec!["id".to_string()]);
+    assert_eq!(created[0].columns.len(), 2);
+    assert!(!created[0].columns[0].nullable, "id parsed as NOT NULL");
+    assert!(created[0].columns[1].nullable, "name defaults to nullable");
+}
+
+#[tokio::test]
+async fn create_table_validate_only_does_not_create() {
+    let server = RestTestServer::start().await;
+    let client = reqwest::Client::new();
+
+    let vbody = r#"{"table_name":"gw_kv","columns":[{"name":"id","type":"INT"}],"validate_only":true}"#;
+    let resp = client
+        .post(format!("{}/databases/db/tables", server.base_url()))
+        .header("Authorization", format!("Basic {}", basic("alice")))
+        .header("Content-Type", JSON)
+        .body(vbody)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200, "validate_only returns 200, not 201");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["validate_only"], true);
+    assert!(
+        server.instance.created_tables.lock().unwrap().is_empty(),
+        "validate_only must not create the table"
+    );
+}
+
+#[tokio::test]
+async fn create_table_duplicate_maps_to_409() {
+    let instance = Arc::new(FakeInstance::new());
+    instance.existing_tables.lock().unwrap().push("gw_kv".into());
+    let server = RestTestServer::start_with(instance).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{}/databases/db/tables", server.base_url()))
+        .header("Authorization", format!("Basic {}", basic("alice")))
+        .header("Content-Type", JSON)
+        .body(CREATE_BODY)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 409);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "table_already_exists");
+}
+
+#[tokio::test]
+async fn create_table_bad_type_maps_to_400() {
+    let server = RestTestServer::start().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{}/databases/db/tables", server.base_url()))
+        .header("Authorization", format!("Basic {}", basic("alice")))
+        .header("Content-Type", JSON)
+        .body(r#"{"table_name":"t","columns":[{"name":"c","type":"NOTATYPE"}]}"#)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "invalid_argument");
+}
+
+#[tokio::test]
+async fn create_table_requires_auth() {
+    let server = RestTestServer::start().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{}/databases/db/tables", server.base_url()))
+        .header("Content-Type", JSON)
+        .body(CREATE_BODY)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 401);
+    assert!(server.instance.created_tables.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn drop_table_succeeds() {
+    let server = RestTestServer::start().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .delete(format!("{}/databases/db/tables/gw_kv", server.base_url()))
+        .header("Authorization", format!("Basic {}", basic("alice")))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 204);
+    let dropped = server.instance.dropped_tables.lock().unwrap();
+    assert_eq!(dropped.as_slice(), ["gw_kv"]);
+}
