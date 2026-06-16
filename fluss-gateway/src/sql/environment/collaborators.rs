@@ -106,6 +106,7 @@ impl FlussCatalogInstaller for FlussDatafusionCatalogInstaller {
         ctx: &SessionContext,
         catalog_name: &str,
     ) -> GatewayResult<()> {
+        // ① Install the live Fluss catalog (the real, read-only provider).
         self.inner
             .register_catalog(
                 ctx,
@@ -115,7 +116,85 @@ impl FlussCatalogInstaller for FlussDatafusionCatalogInstaller {
             .await
             .map_err(|e: fluss_datafusion::FlussDatafusionError| {
                 crate::error::GatewayError::Backend(e.to_string())
-            })
+            })?;
+
+        // ② Re-register it wrapped so the gateway can add its own schemas
+        // (`pg_catalog` in assembly step 3, overlay views in step 4) under the
+        // SAME catalog name. The real `FlussCatalogProvider` rejects
+        // `register_schema` ("Registering new schemas is not supported"), but the
+        // P3.3 contract installs pg_catalog UNDER the fluss catalog; the wrapper
+        // satisfies both: it delegates Fluss database/table resolution to the live
+        // provider and keeps gateway-registered schemas in a small overlay map.
+        let live = ctx.catalog(catalog_name).ok_or_else(|| {
+            crate::error::GatewayError::Internal(format!(
+                "fluss catalog {catalog_name} missing right after registration"
+            ))
+        })?;
+        ctx.register_catalog(catalog_name, Arc::new(OverlayCatalogProvider::new(live)));
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OverlayCatalogProvider — fluss catalog + gateway-registered schemas
+// ---------------------------------------------------------------------------
+
+/// Wraps the live Fluss [`CatalogProvider`] so the gateway can register extra
+/// schemas (`pg_catalog`, overlay views) under the same catalog name.
+///
+/// The real `FlussCatalogProvider` is read-only and its default
+/// `register_schema` returns "not supported"; `datafusion-pg-catalog`'s
+/// `setup_pg_catalog` needs to `register_schema("pg_catalog", …)` under the
+/// fluss catalog (assembly step 3). This wrapper resolves the conflict without
+/// the gateway absorbing any catalog logic: Fluss databases/tables resolve
+/// through the live provider; gateway-installed schemas live in a small in-memory
+/// overlay that takes precedence on name collision.
+#[derive(Debug)]
+struct OverlayCatalogProvider {
+    fluss: Arc<dyn datafusion::catalog::CatalogProvider>,
+    overlay: std::sync::Mutex<
+        std::collections::HashMap<String, Arc<dyn datafusion::catalog::SchemaProvider>>,
+    >,
+}
+
+impl OverlayCatalogProvider {
+    fn new(fluss: Arc<dyn datafusion::catalog::CatalogProvider>) -> Self {
+        Self {
+            fluss,
+            overlay: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+}
+
+impl datafusion::catalog::CatalogProvider for OverlayCatalogProvider {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn schema_names(&self) -> Vec<String> {
+        let mut names = self.fluss.schema_names();
+        for k in self.overlay.lock().unwrap().keys() {
+            if !names.contains(k) {
+                names.push(k.clone());
+            }
+        }
+        names
+    }
+
+    fn schema(&self, name: &str) -> Option<Arc<dyn datafusion::catalog::SchemaProvider>> {
+        // Gateway-registered schemas win over Fluss databases on name collision.
+        if let Some(s) = self.overlay.lock().unwrap().get(name) {
+            return Some(s.clone());
+        }
+        self.fluss.schema(name)
+    }
+
+    fn register_schema(
+        &self,
+        name: &str,
+        schema: Arc<dyn datafusion::catalog::SchemaProvider>,
+    ) -> datafusion::error::Result<Option<Arc<dyn datafusion::catalog::SchemaProvider>>> {
+        Ok(self.overlay.lock().unwrap().insert(name.to_string(), schema))
     }
 }
 

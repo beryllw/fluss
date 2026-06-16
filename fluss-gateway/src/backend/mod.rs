@@ -167,20 +167,15 @@ impl FlussBackendFacade {
             .map_err(|e| GatewayError::Backend(format!("get_admin: {e}")))
     }
 
-    /// KV upsert/delete: convert each batch row to a Fluss `GenericRow` and feed
-    /// the per-request upsert writer. `delete` is true for `KvDelete`.
+    /// KV upsert/delete on an already-resolved table handle: convert each batch
+    /// row to a Fluss `GenericRow` and feed the per-request upsert writer.
+    /// `delete` is true for `KvDelete`.
     async fn kv_write(
         &self,
-        table: &TableRef,
+        handle: &fluss::client::FlussTable<'_>,
         batch: &arrow::record_batch::RecordBatch,
         delete: bool,
     ) -> GatewayResult<u64> {
-        let path = fluss::metadata::TablePath::new(table.database.clone(), table.table.clone());
-        let handle = self
-            .connection
-            .get_table(&path)
-            .await
-            .map_err(|e| map_table_err(table, e))?;
         let writer = handle
             .new_upsert()
             .and_then(|u| u.create_writer())
@@ -204,18 +199,13 @@ impl FlussBackendFacade {
         Ok(n)
     }
 
-    /// Log append: hand the Arrow batch straight to the append writer.
+    /// Log append on an already-resolved table handle: hand the Arrow batch
+    /// straight to the append writer.
     async fn log_append(
         &self,
-        table: &TableRef,
+        handle: &fluss::client::FlussTable<'_>,
         batch: arrow::record_batch::RecordBatch,
     ) -> GatewayResult<u64> {
-        let path = fluss::metadata::TablePath::new(table.database.clone(), table.table.clone());
-        let handle = self
-            .connection
-            .get_table(&path)
-            .await
-            .map_err(|e| map_table_err(table, e))?;
         let writer = handle
             .new_append()
             .and_then(|a| a.create_writer())
@@ -229,6 +219,15 @@ impl FlussBackendFacade {
             .await
             .map_err(|e| GatewayError::Backend(format!("log flush: {e}")))?;
         Ok(n)
+    }
+
+    /// Resolve the table handle once, mapping a missing table to `TableNotFound`.
+    async fn table_handle(&self, table: &TableRef) -> GatewayResult<fluss::client::FlussTable<'_>> {
+        let path = fluss::metadata::TablePath::new(table.database.clone(), table.table.clone());
+        self.connection
+            .get_table(&path)
+            .await
+            .map_err(|e| map_table_err(table, e))
     }
 }
 
@@ -253,14 +252,26 @@ fn map_table_err(table: &TableRef, e: fluss::error::Error) -> GatewayError {
 impl BackendFacade for FlussBackendFacade {
     async fn write(&self, request: DirectWriteRequest) -> GatewayResult<DirectWriteResult> {
         let rows_written = match request {
+            // REST `records` always arrives as KvUpsert (the transport does not
+            // know the table kind). The backend reinterprets it against the
+            // resolved table: a PK table upserts, a PK-less (Log) table appends.
+            // This is the "backend reinterprets KvUpsert as LogAppend for a Log
+            // table" contract documented on the REST handler (server/rest §3).
             DirectWriteRequest::KvUpsert { table, rows, .. } => {
-                self.kv_write(&table, &rows, false).await?
+                let handle = self.table_handle(&table).await?;
+                if handle.get_table_info().has_primary_key() {
+                    self.kv_write(&handle, &rows, false).await?
+                } else {
+                    self.log_append(&handle, rows).await?
+                }
             }
             DirectWriteRequest::KvDelete { table, keys, .. } => {
-                self.kv_write(&table, &keys, true).await?
+                let handle = self.table_handle(&table).await?;
+                self.kv_write(&handle, &keys, true).await?
             }
             DirectWriteRequest::LogAppend { table, rows, .. } => {
-                self.log_append(&table, rows).await?
+                let handle = self.table_handle(&table).await?;
+                self.log_append(&handle, rows).await?
             }
         };
         Ok(DirectWriteResult { rows_written })
