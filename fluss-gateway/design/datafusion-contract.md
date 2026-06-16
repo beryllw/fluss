@@ -16,17 +16,14 @@ gateway 只通过两个东西与该 crate 交互：**一个共享 `FlussDatafusi
 
 ### SQL 能力边界（gateway 依赖的下推语义）
 
+下面的能力以 `datafusion-v0.2.4` 为准（gateway 已在 cluster e2e 中端到端验证，自身无需改动，全部经由公共 `register_catalog` 契约消费）：
+
 - KV point lookup 下推：完整主键等值 → 单次 point lookup，**不经全表扫**。
-- Log bounded scan 下推：**LIMIT required**、offset ascending、默认 earliest（与 DESIGN.md 的 Log 语义一致）。
-- prefix scan：仅当底层 client 支持单列 string/binary 主键前缀。
-- 非下推 SQL 的保守处理：KV 无完整主键 / Log 无 LIMIT → **返回清晰错误**，不伪装成全表扫（gateway 据此把错误映射到协议层）。
-- **KV bounded scan（待上游实现的契约）**：为支持 `SELECT * FROM kv LIMIT n` 这类无完整主键的查询，`FlussKvTableProvider::scan` 在没有完整主键等值谓词时，应执行 **接受 DataFusion `limit` 参数的 bounded scan**（行为对标 `FlussLogScanExec`），而不是直接返回 `UnsupportedQueryPattern`。要求：
-  - **LIMIT required**：无 `limit` 时仍按现状返回清晰错误，不做无界全表扫。
-  - **limit 下推**：把 `limit` 下推进底层 KV/changelog 扫描，避免读全表再截断。
-  - **顺序语义**：返回顺序可不保证（按 bucket / 存储顺序即可），但需在契约中写明，gateway 不假设有序。
-  - **cancel 协作性**：与 Log scan 一致，stream 被 drop 或触发 cancel/timeout 时尽快协作退出并释放资源。
-  - gateway 侧无需改动即可消费：当前 gateway 把上游错误映射成清晰报错；该能力在上游 `fluss-datafusion` 落地后，KV 的 `SELECT * ... LIMIT n` 自动可用。Log scan 已满足该契约，作为参考实现形状。
-- **cancel 协作性（crate-facing 契约）**：下推的 KV lookup / Log scan 对应的 `ExecutionPlan` / stream 必须接受协作取消（`CancellationToken` 或在 `poll_next` 中响应取消信号），在执行过程中尽快协作退出并释放底层资源。gateway 的 tracked stream 停止 poll 或触发 cancel/timeout 时，依赖这点真正中止后端读取——否则 [`core-session.md`](core-session.md) 的 cooperative cancel / timeout 语义无法落地。
+- KV prefix lookup 下推：当 bucket key 是物理主键的严格前缀时，bucket key 的完整等值谓词（如 `PRIMARY KEY (c1, c2)` + bucket key `c1` 上的 `WHERE c1 = ...`）→ prefix lookup，返回该前缀下的多行；分区 KV 表还要求所有分区键带等值谓词。
+- KV bounded scan 下推：无完整主键/前缀谓词但带 `LIMIT n` → **接受 `limit` 的 bounded KV scan**，返回至多 n 行（v0.2.4 起支持，`SELECT * FROM kv LIMIT n` 可用）。顺序不保证（按 bucket / 存储顺序），gateway 不假设有序。
+- Log scan 下推：带 `LIMIT n` → 从 earliest 起的前 n 行；不带 `LIMIT` → 取查询开始时的 latest offset 快照做有限全量扫描（v0.2.4 起）。
+- 非下推 SQL 的保守处理：KV 既无完整主键/前缀等值、又无 `LIMIT` → **返回清晰错误**，不伪装成无界全表扫（gateway 据此把错误映射到协议层）。
+- **cancel 协作性（crate-facing 契约）**：下推的 KV lookup / KV scan / Log scan 对应的 `ExecutionPlan` / stream 必须接受协作取消（`CancellationToken` 或在 `poll_next` 中响应取消信号），在执行过程中尽快协作退出并释放底层资源。gateway 的 tracked stream 停止 poll 或触发 cancel/timeout 时，依赖这点真正中止后端读取——否则 [`core-session.md`](core-session.md) 的 cooperative cancel / timeout 语义无法落地。
 
 ### 类型与错误边界（跨 crate 的对接面）
 

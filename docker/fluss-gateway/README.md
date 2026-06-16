@@ -89,18 +89,21 @@ eval $PSQL -c "\dt"
 eval $PSQL -c "\d <table>"
 ```
 
-Read data (KV point lookup by full primary key; Log bounded scan with LIMIT):
+Read data:
 
 ```bash
-# KV: full primary-key equality
+# KV: full primary-key point lookup
 eval $PSQL -c "SELECT * FROM <kv_table> WHERE id = 1;"
-# Log: bounded scan
+# KV: prefix lookup (bucket key is a strict prefix of the PK)
+eval $PSQL -c "SELECT * FROM <kv_table> WHERE c1 = 10;"
+# KV: bounded scan
+eval $PSQL -c "SELECT * FROM <kv_table> LIMIT 10;"
+# Log: bounded scan / full snapshot
 eval $PSQL -c "SELECT * FROM <log_table> LIMIT 10;"
 ```
 
-`SELECT * FROM <kv_table> LIMIT 10` (KV scan without a primary key) is not
-supported yet — it needs a bounded-scan capability in `fluss-datafusion`
-(tracked in `fluss-gateway/design/datafusion-contract.md`).
+A KV scan with neither a key predicate nor a `LIMIT` is rejected with a clear
+error rather than running an unbounded full scan.
 
 REST (metadata + write):
 

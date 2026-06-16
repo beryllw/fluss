@@ -32,9 +32,10 @@
 //!    (JSON body) and a Log append (Arrow IPC body) — then read the rows back
 //!    with the Fluss client (KV `Lookuper`) to prove the write actually landed.
 //! 3. (c) PG SELECT: drive the spawned `PgServer` with `tokio-postgres` — a
-//!    full-PK point lookup on the KV table and a `LIMIT` bounded scan on the Log
-//!    table — and assert the just-written rows come back through the gateway's
-//!    own SQL catalog path.
+//!    full-PK point lookup on the KV table, a KV bounded `LIMIT` scan, a KV
+//!    prefix lookup (`WHERE c1 = ...` on a composite-PK table, datafusion-v0.2.4),
+//!    and a `LIMIT` bounded scan on the Log table — asserting the just-written
+//!    rows come back through the gateway's own SQL catalog path.
 //! 4. (d) REST METADATA: list databases, list the tables in the database, and
 //!    fetch each table's schema (getMetadata) straight from the live Fluss
 //!    catalog through the gateway's metadata surface.
@@ -90,6 +91,10 @@ const READY_TIMEOUT: Duration = Duration::from_secs(30);
 const DATABASE: &str = "fluss";
 const KV_TABLE: &str = "gw_kv";
 const LOG_TABLE: &str = "gw_log";
+// Composite-PK KV table whose bucket key (`c1`) is a STRICT prefix of the PK
+// `(c1, c2)`, so a `WHERE c1 = ...` predicate exercises KV prefix lookup
+// (datafusion-v0.2.4). Seeded so one `c1` matches several rows.
+const KV_PREFIX_TABLE: &str = "gw_kv_prefix";
 
 const JSON: &str = "application/json";
 const ARROW: &str = "application/vnd.apache.arrow.stream";
@@ -163,11 +168,38 @@ async fn create_log_table(conn: &FlussConnection) {
     admin.create_table(&path, &descriptor, true).await.unwrap();
 }
 
+/// Composite-PK KV table `(c1 int, c2 int, name string)` with `PRIMARY KEY
+/// (c1, c2)` and bucket key `c1` (a strict prefix of the PK). A `WHERE c1 = ...`
+/// query then routes to KV prefix lookup. Created empty; populated through REST.
+async fn create_kv_prefix_table(conn: &FlussConnection) {
+    let path = TablePath::new(DATABASE, KV_PREFIX_TABLE);
+    let admin = conn.get_admin().unwrap();
+    let descriptor = TableDescriptor::builder()
+        .schema(
+            Schema::builder()
+                .column("c1", DataTypes::int())
+                .column("c2", DataTypes::int())
+                .column("name", DataTypes::string())
+                .primary_key(vec!["c1", "c2"])
+                .build()
+                .unwrap(),
+        )
+        .distributed_by(Some(1), vec!["c1".to_string()])
+        .build()
+        .unwrap();
+    admin.create_table(&path, &descriptor, true).await.unwrap();
+}
+
 /// Wait until bucket 0 of `table` can serve reads (REST append acked != bucket
 /// readable; a bounded scan needs the offsets to exist first).
 async fn wait_for_log_offsets(conn: &FlussConnection) {
+    wait_for_bucket0(conn, LOG_TABLE).await;
+}
+
+/// Wait until bucket 0 of `table_name` (under `DATABASE`) can serve reads.
+async fn wait_for_bucket0(conn: &FlussConnection, table_name: &str) {
     let admin = conn.get_admin().unwrap();
-    let path = TablePath::new(DATABASE, LOG_TABLE);
+    let path = TablePath::new(DATABASE, table_name);
     let start = std::time::Instant::now();
     loop {
         if admin
@@ -178,7 +210,7 @@ async fn wait_for_log_offsets(conn: &FlussConnection) {
             return;
         }
         if start.elapsed() >= READY_TIMEOUT {
-            panic!("log bucket not ready in {READY_TIMEOUT:?}");
+            panic!("{table_name} bucket not ready in {READY_TIMEOUT:?}");
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
@@ -248,6 +280,7 @@ async fn cluster_rest_kv_and_log_then_pg_selects() {
 
     create_kv_table(&connection).await;
     create_log_table(&connection).await;
+    create_kv_prefix_table(&connection).await;
 
     let (instance, gw_conn) = assemble_instance(&bootstrap).await;
 
@@ -303,6 +336,25 @@ async fn cluster_rest_kv_and_log_then_pg_selects() {
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["rows_written"], 3, "Log append acked 3 rows");
 
+    // (b3) Populate the composite-PK prefix table via REST: three rows share
+    // `c1 = 10` so a later `WHERE c1 = 10` prefix lookup returns exactly three.
+    let resp = tokio::time::timeout(
+        Duration::from_secs(30),
+        http.post(format!("{rest_base}/databases/{DATABASE}/tables/{KV_PREFIX_TABLE}/records"))
+            .header("Authorization", &auth)
+            .header("Content-Type", JSON)
+            .body(
+                r#"[{"c1":10,"c2":1,"name":"a"},{"c1":10,"c2":2,"name":"b"},{"c1":10,"c2":3,"name":"c"},{"c1":20,"c2":1,"name":"d"}]"#,
+            )
+            .send(),
+    )
+    .await
+    .expect("REST prefix-table upsert timed out before the gateway replied")
+    .unwrap();
+    assert_eq!(resp.status(), 200, "prefix-table upsert REST status");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["rows_written"], 4, "prefix-table upsert acked 4 rows");
+
     let (name1, name2) = kv_lookup_names(&gw_conn).await;
     assert_eq!(name1.as_deref(), Some("alice"), "client lookup id=1");
     assert_eq!(name2.as_deref(), Some("bob"), "client lookup id=2");
@@ -340,6 +392,51 @@ async fn cluster_rest_kv_and_log_then_pg_selects() {
     assert_eq!(kv_rows.len(), 1, "KV point lookup returns exactly one row");
     assert_eq!(kv_rows[0].get("id"), Some("2"));
     assert_eq!(kv_rows[0].get("name"), Some("bob"));
+
+    // (c2) KV bounded scan (datafusion-v0.2.4): `SELECT ... LIMIT n` on a KV table
+    // without a primary-key predicate now returns up to n rows (previously a clear
+    // "unsupported" error). gw_kv has 2 rows; LIMIT 1 must bound to exactly one.
+    let rows = tokio::time::timeout(
+        Duration::from_secs(30),
+        pg_client.simple_query(&format!(
+            "SELECT id, name FROM fluss.{DATABASE}.{KV_TABLE} LIMIT 1"
+        )),
+    )
+    .await
+    .expect("PG KV bounded scan timed out")
+    .expect("PG KV bounded scan");
+    let kv_scan_rows = rows
+        .iter()
+        .filter(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_)))
+        .count();
+    assert_eq!(kv_scan_rows, 1, "KV bounded scan respects LIMIT 1");
+
+    // (c3) KV prefix lookup (datafusion-v0.2.4): a `WHERE c1 = 10` predicate on the
+    // bucket-key prefix returns all matching rows (three share c1 = 10), not just one.
+    tokio::time::timeout(Duration::from_secs(30), wait_for_bucket0(&gw_conn, KV_PREFIX_TABLE))
+        .await
+        .expect("prefix table bucket never became readable");
+    let rows = tokio::time::timeout(
+        Duration::from_secs(30),
+        pg_client.simple_query(&format!(
+            "SELECT c1, c2, name FROM fluss.{DATABASE}.{KV_PREFIX_TABLE} WHERE c1 = 10"
+        )),
+    )
+    .await
+    .expect("PG KV prefix lookup timed out")
+    .expect("PG KV prefix lookup");
+    let prefix_rows: Vec<_> = rows
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(r) => Some(r),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(prefix_rows.len(), 3, "KV prefix lookup on c1=10 returns three rows");
+    assert!(
+        prefix_rows.iter().all(|r| r.get("c1") == Some("10")),
+        "every prefix-lookup row has c1 = 10"
+    );
 
     let rows = tokio::time::timeout(
         Duration::from_secs(30),
@@ -452,6 +549,7 @@ async fn cluster_rest_kv_and_log_then_pg_selects() {
     let admin = gw_conn.get_admin().unwrap();
     let _ = admin.drop_table(&TablePath::new(DATABASE, KV_TABLE), true).await;
     let _ = admin.drop_table(&TablePath::new(DATABASE, LOG_TABLE), true).await;
+    let _ = admin.drop_table(&TablePath::new(DATABASE, KV_PREFIX_TABLE), true).await;
     cluster.stop();
 }
 
