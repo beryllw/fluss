@@ -28,6 +28,12 @@ license = "Apache-2.0"
 description = "SQL/REST gateway for Apache Fluss (PostgreSQL read-only + REST direct write)"
 publish = false
 
+# Runnable server binary (see src/main.rs). The crate is also a library that the
+# integration tests build against.
+[[bin]]
+name = "fluss-gateway"
+path = "src/main.rs"
+
 [dependencies]
 # --- Core async runtime ---
 tokio = { version = "1.44.2", features = ["full"] }
@@ -61,6 +67,8 @@ serde_json = "1"
 thiserror = "2"
 bytes = "1"
 tracing = "0.1"
+# Server-binary logging (RUST_LOG filter). Also used by tests as a dev-dependency.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Unguessable per-connection PG cancel backend-key secret (§P4.6).
 rand = "0.8"
 
@@ -72,7 +80,6 @@ rand = "0.8"
 integration_tests = []
 
 [dev-dependencies]
-tracing-subscriber = "0.3"
 # Brings up a throwaway Fluss cluster in docker for the integration_tests path.
 # Same git rev as the `fluss` / `fluss-datafusion` deps so the client types unify.
 fluss-test-cluster = { git = "https://github.com/beryllw/fluss-rust.git", rev = "74754da3286fe96f18243a234fa828ebe2274934" }

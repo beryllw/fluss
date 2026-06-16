@@ -1,0 +1,119 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+services:
+  coordinator-server:
+    image: apache/fluss:0.9.1-incubating
+    command: coordinatorServer
+    depends_on:
+      - zookeeper
+    environment:
+      - |
+        FLUSS_PROPERTIES=
+        zookeeper.address: zookeeper:2181
+        bind.listeners: INTERNAL://coordinator-server:0, CLIENT://coordinator-server:9123
+        advertised.listeners: CLIENT://coordinator-server:9123
+        internal.listener.name: INTERNAL
+        remote.data.dir: /tmp/fluss/remote-data
+    ports:
+      - "9123:9123"
+
+  tablet-server:
+    image: apache/fluss:0.9.1-incubating
+    command: tabletServer
+    depends_on:
+      - coordinator-server
+    environment:
+      - |
+        FLUSS_PROPERTIES=
+        zookeeper.address: zookeeper:2181
+        bind.listeners: INTERNAL://tablet-server:0, CLIENT://tablet-server:9123
+        advertised.listeners: CLIENT://tablet-server:9123
+        internal.listener.name: INTERNAL
+        tablet-server.id: 0
+        kv.snapshot.interval: 0s
+        data.dir: /tmp/fluss/data
+        remote.data.dir: /tmp/fluss/remote-data
+    ports:
+      - "9124:9123"
+    volumes:
+      - shared-tmpfs:/tmp/fluss
+
+  gateway:
+    image: apache/fluss-gateway
+    depends_on:
+      - coordinator-server
+      - tablet-server
+    environment:
+      - FLUSS_BOOTSTRAP_SERVERS=coordinator-server:9123
+      - GATEWAY_PG_LISTEN=0.0.0.0:5432
+      - GATEWAY_REST_LISTEN=0.0.0.0:8080
+      - FLUSS_CLUSTER=default
+      - RUST_LOG=info
+    ports:
+      - "5432:5432"
+      - "8080:8080"
+
+  jobmanager:
+    image: apache/fluss-quickstart-flink:1.20-0.9.1-incubating-rc1
+    depends_on:
+      - coordinator-server
+    command: jobmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+    ports:
+      - "8083:8081"
+
+  taskmanager:
+    image: apache/fluss-quickstart-flink:1.20-0.9.1-incubating-rc1
+    depends_on:
+      - jobmanager
+    command: taskmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        taskmanager.memory.process.size: 1024m
+
+  sql-client:
+    image: apache/fluss-quickstart-flink:1.20-0.9.1-incubating-rc1
+    depends_on:
+      - jobmanager
+      - taskmanager
+    command: ["/opt/sql-client/sql-client"]
+    tty: true
+    stdin_open: true
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        rest.address: jobmanager
+
+  zookeeper:
+    restart: always
+    image: zookeeper:3.9.2
+
+volumes:
+  shared-tmpfs:
+    driver: local
+    driver_opts:
+      type: "tmpfs"
+      device: "tmpfs"
