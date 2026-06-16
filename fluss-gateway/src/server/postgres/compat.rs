@@ -64,6 +64,28 @@ static PG_CATALOG_TEXT_CAST: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)::\s*pg_catalog\.text\b").unwrap()
 });
 
+/// psql `\d`'s column query carries two correlated scalar subqueries that
+/// DataFusion's analyzer rejects ("Correlated scalar subquery must be aggregated
+/// to return at most one row"): the column default (from `pg_attrdef`) and the
+/// non-default collation (from `pg_collation`). Both are always empty for Fluss
+/// tables (no column defaults, no per-column collations), so we replace each with
+/// `NULL` — faithful for our tables and lets `\d` plan. Matched against the raw
+/// psql text (before function de-qualification), tolerant of whitespace/newlines.
+static PG_ATTRDEF_SUBQUERY: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?is)\(\s*SELECT\s+pg_catalog\.pg_get_expr\([^)]*\)\s+FROM\s+pg_catalog\.pg_attrdef\s+d\s+WHERE\s+.*?a\.atthasdef\s*\)",
+    )
+    .unwrap()
+});
+
+/// The non-default-collation correlated scalar subquery in psql `\d`.
+static PG_COLLATION_SUBQUERY: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?is)\(\s*SELECT\s+c\.collname\s+FROM\s+pg_catalog\.pg_collation\s+c,\s*pg_catalog\.pg_type\s+t\s+WHERE\s+.*?t\.typcollation\s*\)",
+    )
+    .unwrap()
+});
+
 /// Schema-qualified `pg_catalog.<fn>(` function calls. DataFusion registers the
 /// `datafusion-pg-catalog` UDFs under their bare name and cannot resolve a
 /// schema-qualified function name (e.g. `pg_catalog.pg_table_is_visible(...)`),
@@ -79,7 +101,11 @@ static PG_CATALOG_FN: LazyLock<Regex> = LazyLock::new(|| {
 /// no change are returned unchanged. The always-correct path for tools is direct
 /// `information_schema` / `pg_catalog` SQL — this only smooths psql `\d*` & friends.
 pub fn rewrite_introspection(sql: &str) -> String {
-    let s = PG_CATALOG_OPERATOR.replace_all(sql, "${1}");
+    // Drop the correlated scalar subqueries first, before function de-qualifying,
+    // so they match the raw `pg_catalog.*` text.
+    let s = PG_ATTRDEF_SUBQUERY.replace_all(sql, "NULL");
+    let s = PG_COLLATION_SUBQUERY.replace_all(&s, "NULL");
+    let s = PG_CATALOG_OPERATOR.replace_all(&s, "${1}");
     let s = REGTYPE_TO_TEXT_CAST.replace_all(&s, "::text");
     let s = PG_CATALOG_TEXT_CAST.replace_all(&s, "::text");
     let s = COLLATE_DEFAULT.replace_all(&s, "");
@@ -391,6 +417,24 @@ mod tests {
             rewrite_introspection("x::pg_catalog.text"),
             "x::text"
         );
+    }
+
+    #[test]
+    fn rewrite_drops_correlated_scalar_subqueries_in_d_column_query() {
+        // The exact column-query shape psql \d sends (whitespace-collapsed here).
+        let sql = "SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod), \
+            (SELECT pg_catalog.pg_get_expr(d.adbin, d.adrelid, true) \
+             FROM pg_catalog.pg_attrdef d \
+             WHERE d.adrelid = a.attrelid AND d.adnum = a.attnum AND a.atthasdef), \
+            a.attnotnull, \
+            (SELECT c.collname FROM pg_catalog.pg_collation c, pg_catalog.pg_type t \
+             WHERE c.oid = a.attcollation AND t.oid = a.atttypid AND a.attcollation <> t.typcollation) AS attcollation, \
+            a.attidentity FROM pg_catalog.pg_attribute a WHERE a.attrelid = '16386'";
+        let out = rewrite_introspection(sql);
+        assert!(!out.contains("pg_attrdef"), "default subquery must be dropped: {out}");
+        assert!(!out.contains("pg_collation"), "collation subquery must be dropped: {out}");
+        assert!(out.contains("a.attnotnull, NULL AS attcollation"), "collation -> NULL: {out}");
+        assert!(out.contains(", NULL,"), "default -> NULL: {out}");
     }
 
     #[test]
