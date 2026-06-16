@@ -51,6 +51,19 @@ static PG_CATALOG_OPERATOR: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)OPERATOR\s*\(\s*pg_catalog\.([^)\s]+)\s*\)").unwrap()
 });
 
+/// PostgreSQL-specific cast chains used by psql introspection queries. DataFusion
+/// does not support `regtype`, and schema-qualified cast targets like
+/// `::pg_catalog.text` also fail. For metadata display these expressions are only
+/// cosmetic (typed-table display), so we degrade them to a plain `::text` cast.
+static REGTYPE_TO_TEXT_CAST: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)::\s*(?:pg_catalog\.)?regtype\s*::\s*(?:pg_catalog\.)?text\b").unwrap()
+});
+
+/// Bare schema-qualified `::pg_catalog.text` cast target.
+static PG_CATALOG_TEXT_CAST: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)::\s*pg_catalog\.text\b").unwrap()
+});
+
 /// Schema-qualified `pg_catalog.<fn>(` function calls. DataFusion registers the
 /// `datafusion-pg-catalog` UDFs under their bare name and cannot resolve a
 /// schema-qualified function name (e.g. `pg_catalog.pg_table_is_visible(...)`),
@@ -67,6 +80,8 @@ static PG_CATALOG_FN: LazyLock<Regex> = LazyLock::new(|| {
 /// `information_schema` / `pg_catalog` SQL — this only smooths psql `\d*` & friends.
 pub fn rewrite_introspection(sql: &str) -> String {
     let s = PG_CATALOG_OPERATOR.replace_all(sql, "${1}");
+    let s = REGTYPE_TO_TEXT_CAST.replace_all(&s, "::text");
+    let s = PG_CATALOG_TEXT_CAST.replace_all(&s, "::text");
     let s = COLLATE_DEFAULT.replace_all(&s, "");
     let s = PG_CATALOG_FN.replace_all(&s, "${1}(");
     s.into_owned()
@@ -359,6 +374,22 @@ mod tests {
         assert_eq!(
             rewrite_introspection("n.nspname OPERATOR(pg_catalog.!~) '^pg_'"),
             "n.nspname !~ '^pg_'"
+        );
+    }
+
+    #[test]
+    fn rewrite_degrades_pg_specific_casts_for_introspection() {
+        assert_eq!(
+            rewrite_introspection("c.reloftype::pg_catalog.regtype::pg_catalog.text"),
+            "c.reloftype::text"
+        );
+        assert_eq!(
+            rewrite_introspection("c.reloftype::regtype::text"),
+            "c.reloftype::text"
+        );
+        assert_eq!(
+            rewrite_introspection("x::pg_catalog.text"),
+            "x::text"
         );
     }
 
