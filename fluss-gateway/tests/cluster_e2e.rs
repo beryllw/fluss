@@ -35,7 +35,10 @@
 //!    full-PK point lookup on the KV table and a `LIMIT` bounded scan on the Log
 //!    table — and assert the just-written rows come back through the gateway's
 //!    own SQL catalog path.
-//! 4. T4 semantics that need a cluster: at-least-once (REST 2xx == backend ack)
+//! 4. (d) REST METADATA: list databases, list the tables in the database, and
+//!    fetch each table's schema (getMetadata) straight from the live Fluss
+//!    catalog through the gateway's metadata surface.
+//! 5. T4 semantics that need a cluster: at-least-once (REST 2xx == backend ack)
 //!    and "direct path opens no session" are asserted here against the real
 //!    instance. The cluster-free T4 semantics (SessionContext dirty/rebuild,
 //!    cooperative cancel, operation state machine) are covered by the in-crate
@@ -362,6 +365,12 @@ async fn cluster_rest_kv_and_log_then_pg_selects() {
     names.sort();
     assert_eq!(names, vec!["x", "y", "z"], "Log rows read back via PG SELECT");
 
+    // (d) METADATA over REST against the live catalog: list databases, list the
+    // tables in our database, and fetch each table's schema (getMetadata). These
+    // read straight from the real Fluss catalog through the gateway's metadata
+    // surface, so they prove list/describe work end-to-end, not just write/query.
+
+    // list databases: the database we wrote to must be visible.
     let dbs = http
         .get(format!("{rest_base}/databases"))
         .header("Authorization", &auth)
@@ -379,6 +388,58 @@ async fn cluster_rest_kv_and_log_then_pg_selects() {
             .any(|d| d == DATABASE),
         "metadata lists the database we wrote to"
     );
+
+    // list tables: both the KV and Log tables we created must be listed.
+    let tables = http
+        .get(format!("{rest_base}/databases/{DATABASE}/tables"))
+        .header("Authorization", &auth)
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    let table_names: Vec<&str> = tables["tables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t.as_str())
+        .collect();
+    assert!(
+        table_names.contains(&KV_TABLE),
+        "metadata lists the KV table (got {table_names:?})"
+    );
+    assert!(
+        table_names.contains(&LOG_TABLE),
+        "metadata lists the Log table (got {table_names:?})"
+    );
+
+    // getMetadata: fetch each table's schema and assert the (id, name) columns
+    // come back from the real catalog.
+    for table in [KV_TABLE, LOG_TABLE] {
+        let info = http
+            .get(format!("{rest_base}/databases/{DATABASE}/tables/{table}"))
+            .header("Authorization", &auth)
+            .send()
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap();
+        assert_eq!(info["database"], DATABASE, "{table} metadata database");
+        assert_eq!(info["table"], table, "{table} metadata table name");
+        let columns: Vec<&str> = info["columns"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{table} metadata has no columns array"))
+            .iter()
+            .filter_map(|c| c["name"].as_str())
+            .collect();
+        assert_eq!(
+            columns,
+            vec!["id", "name"],
+            "{table} metadata reports the (id, name) schema"
+        );
+    }
 
     drop(pg_client);
     tokio::time::sleep(Duration::from_millis(300)).await;

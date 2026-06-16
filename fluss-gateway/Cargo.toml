@@ -11,7 +11,7 @@
 # upstream df52/arrow57 line. Dependency upgrades are a separate, later work item.
 #
 # Fluss access uses the upstream `fluss-datafusion` + `fluss-rs` crates as pinned
-# git dependencies pinned to rev 68eba7b (tag datafusion-v0.2.2 at
+# git dependencies pinned to rev 74754da (tag datafusion-v0.2.3 at
 # verification time). They share this exact
 # df52/arrow57/tokio-1.44 line, so cargo unifies cleanly. Gateway code still talks
 # to Fluss only through narrow gateway-defined contract traits (e.g.
@@ -48,9 +48,9 @@ pgwire = "0.38"
 arrow-pg = { version = "0.12.2", features = ["datafusion"] }
 datafusion-pg-catalog = "0.15.0"
 
-# --- Fluss access (git deps; datafusion-v0.2.2 line aligns df52/arrow57) ---
-fluss = { package = "fluss-rs", git = "https://github.com/beryllw/fluss-rust.git", rev = "68eba7b813aae79536a9a1b72f97b669dd670386", features = ["storage-all"] }
-fluss-datafusion = { git = "https://github.com/beryllw/fluss-rust.git", rev = "68eba7b813aae79536a9a1b72f97b669dd670386" }
+# --- Fluss access (git deps; datafusion-v0.2.3 line aligns df52/arrow57) ---
+fluss = { package = "fluss-rs", git = "https://github.com/beryllw/fluss-rust.git", rev = "74754da3286fe96f18243a234fa828ebe2274934", features = ["storage-all"] }
+fluss-datafusion = { git = "https://github.com/beryllw/fluss-rust.git", rev = "74754da3286fe96f18243a234fa828ebe2274934" }
 
 # --- HTTP (REST direct path) ---
 axum = "0.8"
@@ -75,7 +75,7 @@ integration_tests = []
 tracing-subscriber = "0.3"
 # Brings up a throwaway Fluss cluster in docker for the integration_tests path.
 # Same git rev as the `fluss` / `fluss-datafusion` deps so the client types unify.
-fluss-test-cluster = { git = "https://github.com/beryllw/fluss-rust.git", rev = "68eba7b813aae79536a9a1b72f97b669dd670386" }
+fluss-test-cluster = { git = "https://github.com/beryllw/fluss-rust.git", rev = "74754da3286fe96f18243a234fa828ebe2274934" }
 # Real PostgreSQL wire client for protocol integration tests (P4). Drives the
 # gateway over loopback TCP with no Fluss cluster, against a fake GatewayInstance.
 tokio-postgres = "0.7"
