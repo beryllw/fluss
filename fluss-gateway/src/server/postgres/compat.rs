@@ -28,6 +28,50 @@
 //! no-ops, a couple of scalar probes) are intercepted. Everything else is
 //! passthrough to `Instance.execute_sql`, and writes are rejected outright.
 
+use std::sync::LazyLock;
+
+use regex::Regex;
+
+// ---------------------------------------------------------------------------
+// PostgreSQL client introspection rewrite (psql \dt / \d / \l / \dn, BI tools)
+// ---------------------------------------------------------------------------
+
+/// `... COLLATE pg_catalog.default` / `... COLLATE "default"` — DataFusion's
+/// planner rejects the `Collate` AST node. The default collation is a no-op for
+/// our results, so we strip the whole `COLLATE <default>` span.
+static COLLATE_DEFAULT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)\s+COLLATE\s+(?:pg_catalog\.default|"default")"#).unwrap()
+});
+
+/// Explicit `OPERATOR(pg_catalog.<op>)` syntax (psql `\d` uses
+/// `OPERATOR(pg_catalog.~)` for the regex match). DataFusion rejects the custom
+/// operator node; it does accept the bare operator (`~`, `!~`, …), so we unwrap
+/// `OPERATOR(pg_catalog.<op>)` to `<op>`.
+static PG_CATALOG_OPERATOR: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)OPERATOR\s*\(\s*pg_catalog\.([^)\s]+)\s*\)").unwrap()
+});
+
+/// Schema-qualified `pg_catalog.<fn>(` function calls. DataFusion registers the
+/// `datafusion-pg-catalog` UDFs under their bare name and cannot resolve a
+/// schema-qualified function name (e.g. `pg_catalog.pg_table_is_visible(...)`),
+/// so we de-qualify function calls. Table references like `pg_catalog.pg_class`
+/// (no following `(`) are left intact — they resolve fine.
+static PG_CATALOG_FN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)\bpg_catalog\.([a-zA-Z_][a-zA-Z0-9_]*)\s*\("#).unwrap()
+});
+
+/// Rewrite PostgreSQL client introspection SQL (psql backslash commands, IDE/BI
+/// object browsers) into a form the DataFusion planner accepts, WITHOUT changing
+/// result semantics. Applied only on the passthrough path; statements that need
+/// no change are returned unchanged. The always-correct path for tools is direct
+/// `information_schema` / `pg_catalog` SQL — this only smooths psql `\d*` & friends.
+pub fn rewrite_introspection(sql: &str) -> String {
+    let s = PG_CATALOG_OPERATOR.replace_all(sql, "${1}");
+    let s = COLLATE_DEFAULT.replace_all(&s, "");
+    let s = PG_CATALOG_FN.replace_all(&s, "${1}(");
+    s.into_owned()
+}
+
 /// What kind of statement an incoming SQL string is, for routing purposes.
 ///
 /// Classification is purely lexical (leading keyword + cheap parsing); it does
@@ -269,5 +313,58 @@ mod tests {
         assert_eq!(unquote("'abc'"), "abc");
         assert_eq!(unquote("\"abc\""), "abc");
         assert_eq!(unquote("abc"), "abc");
+    }
+
+    #[test]
+    fn rewrite_dequalifies_pg_catalog_functions() {
+        // psql \dt calls pg_catalog.pg_table_is_visible(c.oid); DataFusion only
+        // resolves the bare UDF name.
+        assert_eq!(
+            rewrite_introspection("AND pg_catalog.pg_table_is_visible(c.oid)"),
+            "AND pg_table_is_visible(c.oid)"
+        );
+        // a space before the paren is tolerated and collapsed.
+        assert_eq!(
+            rewrite_introspection("pg_catalog.pg_get_userbyid (c.relowner)"),
+            "pg_get_userbyid(c.relowner)"
+        );
+    }
+
+    #[test]
+    fn rewrite_keeps_pg_catalog_table_refs() {
+        // A schema-qualified TABLE (no following paren) must stay qualified.
+        let sql = "SELECT * FROM pg_catalog.pg_class c";
+        assert_eq!(rewrite_introspection(sql), sql);
+    }
+
+    #[test]
+    fn rewrite_strips_collate_default() {
+        assert_eq!(
+            rewrite_introspection("WHERE x = 'a' COLLATE pg_catalog.default AND y = 1"),
+            "WHERE x = 'a' AND y = 1"
+        );
+        assert_eq!(
+            rewrite_introspection("ORDER BY x COLLATE \"default\""),
+            "ORDER BY x"
+        );
+    }
+
+    #[test]
+    fn rewrite_unwraps_pg_catalog_operator() {
+        // psql \d uses OPERATOR(pg_catalog.~) for regex match; unwrap to bare ~.
+        assert_eq!(
+            rewrite_introspection("WHERE c.relname OPERATOR(pg_catalog.~) '^(t)$'"),
+            "WHERE c.relname ~ '^(t)$'"
+        );
+        assert_eq!(
+            rewrite_introspection("n.nspname OPERATOR(pg_catalog.!~) '^pg_'"),
+            "n.nspname !~ '^pg_'"
+        );
+    }
+
+    #[test]
+    fn rewrite_is_noop_for_plain_sql() {
+        let sql = "SELECT id, name FROM fluss.fluss.kv WHERE id = 1";
+        assert_eq!(rewrite_introspection(sql), sql);
     }
 }

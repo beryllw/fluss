@@ -66,6 +66,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 bytes = "1"
+# PostgreSQL client introspection (psql \dt/\d) SQL rewrite, see server/postgres/compat.rs.
+regex = "1"
 tracing = "0.1"
 # Server-binary logging (RUST_LOG filter). Also used by tests as a dev-dependency.
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

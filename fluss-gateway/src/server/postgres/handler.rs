@@ -324,7 +324,7 @@ impl PgConnection {
                     .instance
                     .describe_sql(DescribeSqlRequest {
                         session_id,
-                        statement: sql.to_string(),
+                        statement: compat::rewrite_introspection(sql),
                     })
                     .await
                     .map_err(to_pg_err)?;
@@ -362,7 +362,7 @@ impl PgConnection {
             .instance
             .describe_sql(DescribeSqlRequest {
                 session_id,
-                statement: sql.to_string(),
+                statement: compat::rewrite_introspection(sql),
             })
             .await
             .map_err(to_pg_err)?;
@@ -423,7 +423,10 @@ impl PgConnection {
                 Ok(Response::Query(QueryResponse::new(fields, rows)))
             }
 
-            StatementClass::Passthrough => self.execute_select(sql, params, result_format).await,
+            StatementClass::Passthrough => {
+                let rewritten = compat::rewrite_introspection(sql);
+                self.execute_select(&rewritten, params, result_format).await
+            }
         }
     }
 

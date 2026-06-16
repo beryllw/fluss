@@ -33,6 +33,7 @@
 use std::sync::Arc;
 
 use datafusion::execution::context::SessionContext;
+use datafusion::prelude::SessionConfig;
 
 use crate::error::{GatewayError, GatewayResult};
 use crate::session::{GatewaySession, SessionContextBuilder};
@@ -75,7 +76,11 @@ impl SessionContextBuilder for EnvironmentContextBuilder {
     ) -> GatewayResult<Arc<SessionContext>> {
         let provider = self.registry.get(&self.sql_environment)?;
         // Step 1: clean SessionContext (datafusion defaults + gateway config).
-        let ctx = Arc::new(SessionContext::new());
+        // Enable DataFusion's `information_schema` so `information_schema.tables`
+        // / `columns` / `schemata` resolve and reflect the registered Fluss
+        // catalog (datafusion-pg-catalog provides pg_catalog, not information_schema).
+        let config = SessionConfig::new().with_information_schema(true);
+        let ctx = Arc::new(SessionContext::new_with_config(config));
         // Steps 2..5: the provider reads the session's authoritative SessionVars.
         provider
             .prepare_session_context(&self.session, &ctx)

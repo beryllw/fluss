@@ -20,6 +20,12 @@ gateway 只通过两个东西与该 crate 交互：**一个共享 `FlussDatafusi
 - Log bounded scan 下推：**LIMIT required**、offset ascending、默认 earliest（与 DESIGN.md 的 Log 语义一致）。
 - prefix scan：仅当底层 client 支持单列 string/binary 主键前缀。
 - 非下推 SQL 的保守处理：KV 无完整主键 / Log 无 LIMIT → **返回清晰错误**，不伪装成全表扫（gateway 据此把错误映射到协议层）。
+- **KV bounded scan（待上游实现的契约）**：为支持 `SELECT * FROM kv LIMIT n` 这类无完整主键的查询，`FlussKvTableProvider::scan` 在没有完整主键等值谓词时，应执行 **接受 DataFusion `limit` 参数的 bounded scan**（行为对标 `FlussLogScanExec`），而不是直接返回 `UnsupportedQueryPattern`。要求：
+  - **LIMIT required**：无 `limit` 时仍按现状返回清晰错误，不做无界全表扫。
+  - **limit 下推**：把 `limit` 下推进底层 KV/changelog 扫描，避免读全表再截断。
+  - **顺序语义**：返回顺序可不保证（按 bucket / 存储顺序即可），但需在契约中写明，gateway 不假设有序。
+  - **cancel 协作性**：与 Log scan 一致，stream 被 drop 或触发 cancel/timeout 时尽快协作退出并释放资源。
+  - gateway 侧无需改动即可消费：当前 gateway 把上游错误映射成清晰报错；该能力在上游 `fluss-datafusion` 落地后，KV 的 `SELECT * ... LIMIT n` 自动可用。Log scan 已满足该契约，作为参考实现形状。
 - **cancel 协作性（crate-facing 契约）**：下推的 KV lookup / Log scan 对应的 `ExecutionPlan` / stream 必须接受协作取消（`CancellationToken` 或在 `poll_next` 中响应取消信号），在执行过程中尽快协作退出并释放底层资源。gateway 的 tracked stream 停止 poll 或触发 cancel/timeout 时，依赖这点真正中止后端读取——否则 [`core-session.md`](core-session.md) 的 cooperative cancel / timeout 语义无法落地。
 
 ### 类型与错误边界（跨 crate 的对接面）

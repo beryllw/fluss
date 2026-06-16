@@ -74,6 +74,34 @@ PostgreSQL (read-only SQL):
 PGPASSWORD=ignored psql "host=127.0.0.1 port=5432 user=alice dbname=fluss sslmode=disable" -c "SELECT 1"
 ```
 
+Inspect metadata over PostgreSQL — `information_schema`, `pg_catalog`, and psql
+backslash commands all work:
+
+```bash
+PSQL='psql "host=127.0.0.1 port=5432 user=alice password=ignored dbname=fluss sslmode=disable"'
+
+# list tables (standard SQL)
+eval $PSQL -c "SELECT table_schema, table_name FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog','information_schema');"
+# list columns of a table
+eval $PSQL -c "SELECT column_name, data_type FROM information_schema.columns WHERE table_name='<table>';"
+# psql shortcuts
+eval $PSQL -c "\dt"
+eval $PSQL -c "\d <table>"
+```
+
+Read data (KV point lookup by full primary key; Log bounded scan with LIMIT):
+
+```bash
+# KV: full primary-key equality
+eval $PSQL -c "SELECT * FROM <kv_table> WHERE id = 1;"
+# Log: bounded scan
+eval $PSQL -c "SELECT * FROM <log_table> LIMIT 10;"
+```
+
+`SELECT * FROM <kv_table> LIMIT 10` (KV scan without a primary key) is not
+supported yet — it needs a bounded-scan capability in `fluss-datafusion`
+(tracked in `fluss-gateway/design/datafusion-contract.md`).
+
 REST (metadata + write):
 
 ```bash
