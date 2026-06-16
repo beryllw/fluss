@@ -39,6 +39,10 @@
 //! 4. (d) REST METADATA: list databases, list the tables in the database, and
 //!    fetch each table's schema (getMetadata) straight from the live Fluss
 //!    catalog through the gateway's metadata surface.
+//! 4b. (e) psql `\d` introspection: drive the exact SQL psql `\d <table>` emits
+//!    and assert it executes against the real catalog (pins the PG introspection
+//!    rewrite: OPERATOR/COLLATE/pg_table_is_visible + regtype cast + correlated
+//!    scalar subqueries).
 //! 5. T4 semantics that need a cluster: at-least-once (REST 2xx == backend ack)
 //!    and "direct path opens no session" are asserted here against the real
 //!    instance. The cluster-free T4 semantics (SessionContext dirty/rebuild,
@@ -537,6 +541,60 @@ async fn cluster_rest_kv_and_log_then_pg_selects() {
             "{table} metadata reports the (id, name) schema"
         );
     }
+
+    // (e) psql `\d` introspection over PG: `\d` is a psql client macro, but the SQL
+    // it emits flows through the gateway's introspection rewrite. Drive the exact
+    // queries psql sends and assert they execute against the real catalog — this
+    // pins the OPERATOR(pg_catalog.~) / COLLATE / pg_table_is_visible rewrite (step
+    // 1) and the regtype-cast + correlated-scalar-subquery rewrite (column query).
+    let rows = tokio::time::timeout(
+        Duration::from_secs(30),
+        pg_client.simple_query(&format!(
+            "SELECT c.oid, n.nspname, c.relname FROM pg_catalog.pg_class c \
+             LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.relname OPERATOR(pg_catalog.~) '^({KV_TABLE})$' COLLATE pg_catalog.default \
+             AND pg_catalog.pg_table_is_visible(c.oid) ORDER BY 2, 3"
+        )),
+    )
+    .await
+    .expect("psql \\d name query timed out")
+    .expect("psql \\d name query (OPERATOR/COLLATE/pg_table_is_visible rewrite)");
+    let oid_row = rows
+        .iter()
+        .find_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(r) if r.get("relname") == Some(KV_TABLE) => {
+                Some(r.get("oid").map(|s| s.to_string()))
+            }
+            _ => None,
+        })
+        .flatten()
+        .expect("psql \\d name query must resolve the KV table oid");
+
+    let rows = tokio::time::timeout(
+        Duration::from_secs(30),
+        pg_client.simple_query(&format!(
+            "SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod), \
+             (SELECT pg_catalog.pg_get_expr(d.adbin, d.adrelid, true) FROM pg_catalog.pg_attrdef d \
+              WHERE d.adrelid = a.attrelid AND d.adnum = a.attnum AND a.atthasdef), \
+             a.attnotnull, \
+             (SELECT c.collname FROM pg_catalog.pg_collation c, pg_catalog.pg_type t \
+              WHERE c.oid = a.attcollation AND t.oid = a.atttypid AND a.attcollation <> t.typcollation) AS attcollation, \
+             a.attidentity, a.attgenerated \
+             FROM pg_catalog.pg_attribute a \
+             WHERE a.attrelid = '{oid_row}' AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum"
+        )),
+    )
+    .await
+    .expect("psql \\d column query timed out")
+    .expect("psql \\d column query (regtype cast + correlated subquery rewrite)");
+    let d_cols: Vec<String> = rows
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(r) => r.get("attname").map(|s| s.to_string()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(d_cols, vec!["id", "name"], "psql \\d lists the KV table columns");
 
     drop(pg_client);
     tokio::time::sleep(Duration::from_millis(300)).await;
