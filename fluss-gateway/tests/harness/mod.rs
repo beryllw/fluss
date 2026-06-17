@@ -423,8 +423,18 @@ impl PgTestServer {
     /// Bind and spawn the PG frontend on `127.0.0.1:0`, returning the resolved
     /// port and the shared fake instance (so tests can assert on `cancelled`).
     pub async fn start() -> PgTestServer {
-        let instance = Arc::new(FakeInstance::new());
-        let server = PgServer::new(instance.clone(), Arc::new(TrustAuthenticator::new()));
+        Self::start_with_authenticator(
+            Arc::new(FakeInstance::new()),
+            Arc::new(TrustAuthenticator::new()),
+        )
+        .await
+    }
+
+    pub async fn start_with_authenticator(
+        instance: Arc<FakeInstance>,
+        authenticator: Arc<dyn fluss_gateway::auth::Authenticator>,
+    ) -> PgTestServer {
+        let server = PgServer::new(instance.clone(), authenticator);
         let (listener, addr) = PgServer::bind("127.0.0.1:0").await.unwrap();
         tokio::spawn(async move {
             let _ = server.serve(listener).await;
@@ -458,7 +468,14 @@ impl RestTestServer {
     }
 
     pub async fn start_with(instance: Arc<FakeInstance>) -> RestTestServer {
-        let server = RestServer::new(instance.clone(), Arc::new(TrustAuthenticator::new()));
+        Self::start_with_authenticator(instance, Arc::new(TrustAuthenticator::new())).await
+    }
+
+    pub async fn start_with_authenticator(
+        instance: Arc<FakeInstance>,
+        authenticator: Arc<dyn fluss_gateway::auth::Authenticator>,
+    ) -> RestTestServer {
+        let server = RestServer::new(instance.clone(), authenticator);
         let (listener, addr) = RestServer::bind("127.0.0.1:0").await.unwrap();
         tokio::spawn(async move {
             let _ = server.serve(listener).await;

@@ -66,8 +66,15 @@ axum = "0.8"
 # --- Serialization / error / misc ---
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Gateway config file (auth user table) is YAML.
+serde_yaml = "0.9"
 thiserror = "2"
 bytes = "1"
+# Auth: optional sha256:<hex> password hashing + constant-time comparison. All
+# already in the dependency tree transitively (zero extra build cost).
+sha2 = "0.10"
+hex = "0.4"
+subtle = "2"
 # PostgreSQL client introspection (psql \dt/\d) SQL rewrite, see server/postgres/compat.rs.
 regex = "1"
 tracing = "0.1"

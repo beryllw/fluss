@@ -61,10 +61,70 @@ docker run --rm \
 | `GATEWAY_PG_LISTEN`       | `0.0.0.0:5432`     | PostgreSQL bind address              |
 | `GATEWAY_REST_LISTEN`     | `0.0.0.0:8080`     | REST bind address                    |
 | `FLUSS_CLUSTER`           | `default`          | Logical cluster id                   |
+| `GATEWAY_CONFIG`          | unset              | YAML config file path                |
+| `GATEWAY_USERS`           | unset              | `user:secret,...` auth override      |
 | `RUST_LOG`                | `info`             | Tracing filter                       |
 
 The gateway retries the cluster connection a few times at startup, so it can be
 launched slightly before the cluster is ready.
+
+## Authentication
+
+When **no users are configured**, the gateway stays in Phase-1 trust mode for
+compatibility: the username is accepted as-is and the password is ignored.
+When users are configured, both PostgreSQL and REST require a matching
+username/password.
+
+### YAML config file
+
+Point `GATEWAY_CONFIG` at a YAML file:
+
+```yaml
+auth:
+  users:
+    - username: alice
+      password: secret123
+    - username: bob
+      password: "sha256:8ed3f6ad685b959ead7022518e1af76cd816f8e8ec7ccdda1ed4018e8f2223f8"
+```
+
+Supported password formats:
+
+- plaintext: `secret123`
+- `sha256:<hex>` — the client still sends the **plaintext** password; the gateway
+  hashes it and compares the digest in constant time
+
+### Env override
+
+`GATEWAY_USERS` is a fast override/append path for local runs and Compose:
+
+```bash
+export GATEWAY_USERS='alice:secret123,bob:sha256:8ed3f6ad685b959ead7022518e1af76cd816f8e8ec7ccdda1ed4018e8f2223f8'
+```
+
+The gateway loads users from the YAML file first, then overlays `GATEWAY_USERS`
+by username. Secrets may contain `:` (only the first `:` splits user/secret).
+
+### Example run
+
+```bash
+docker run --rm \
+  -e FLUSS_BOOTSTRAP_SERVERS=host.docker.internal:9123 \
+  -e GATEWAY_CONFIG=/etc/fluss/auth.yaml \
+  -v "$PWD/auth.yaml:/etc/fluss/auth.yaml:ro" \
+  -p 5432:5432 -p 8080:8080 \
+  apache/fluss-gateway
+```
+
+### Client examples
+
+```bash
+# PostgreSQL
+PGPASSWORD=secret123 psql "host=127.0.0.1 port=5432 user=alice dbname=fluss sslmode=disable" -c "SELECT 1"
+
+# REST
+curl -u alice:secret123 http://127.0.0.1:8080/v1/clusters/default/databases
+```
 
 ## Quick verification
 

@@ -27,17 +27,23 @@
 
 mod harness;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use fluss_gateway::auth::{ConfigUserStoreAuthenticator, StoredSecret};
 use harness::{FakeInstance, RestTestServer, WriteKind};
+use sha2::Digest;
 
 const JSON: &str = "application/json";
 const ARROW: &str = "application/vnd.apache.arrow.stream";
 
 /// Basic auth header for `user` with an ignored password (Phase 1 trust).
 fn basic(user: &str) -> String {
-    // base64("user:ignored")
-    let raw = format!("{user}:ignored");
+    basic_with_password(user, "ignored")
+}
+
+fn basic_with_password(user: &str, password: &str) -> String {
+    let raw = format!("{user}:{password}");
     encode_base64(raw.as_bytes())
 }
 
@@ -257,6 +263,50 @@ async fn missing_auth_maps_to_401() {
     assert_eq!(body["error"]["code"], "unauthenticated");
     // The write must never reach the instance when unauthenticated.
     assert!(server.instance.writes.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn password_authenticator_accepts_correct_password_and_rejects_others() {
+    let mut users = HashMap::new();
+    users.insert("alice".to_string(), StoredSecret::Plain("secret123".into()));
+    users.insert(
+        "bob".to_string(),
+        StoredSecret::Sha256(sha2::Sha256::digest(b"secret456").into()),
+    );
+    let auth = Arc::new(ConfigUserStoreAuthenticator::new(users));
+    let server = RestTestServer::start_with_authenticator(Arc::new(FakeInstance::new()), auth).await;
+    let client = reqwest::Client::new();
+
+    let ok = client
+        .get(format!("{}/databases", server.base_url()))
+        .header("Authorization", format!("Basic {}", basic_with_password("alice", "secret123")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 200, "correct plaintext password accepted");
+
+    let ok = client
+        .get(format!("{}/databases", server.base_url()))
+        .header("Authorization", format!("Basic {}", basic_with_password("bob", "secret456")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 200, "sha256-configured user sends cleartext password");
+
+    for authz in [
+        basic_with_password("alice", "wrong"),
+        basic_with_password("nobody", "secret123"),
+    ] {
+        let resp = client
+            .get(format!("{}/databases", server.base_url()))
+            .header("Authorization", format!("Basic {}", authz))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "unauthenticated");
+    }
 }
 
 #[tokio::test]

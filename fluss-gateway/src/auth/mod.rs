@@ -39,10 +39,14 @@ use std::collections::HashMap;
 use std::fmt;
 
 use async_trait::async_trait;
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 use crate::error::GatewayError;
 // Reuse the canonical Principal (types.rs §P1.2); do not redefine it here.
 pub use crate::types::Principal;
+
+pub mod config;
 
 /// A secret value (e.g. a cleartext password) carried inside a [`Credential`].
 ///
@@ -225,27 +229,89 @@ impl Authenticator for TrustAuthenticator {
 }
 
 // ---------------------------------------------------------------------------
-// ConfigUserStoreAuthenticator (shape reserved only) (§P7.3)
+// ConfigUserStoreAuthenticator (§P7.3)
 // ---------------------------------------------------------------------------
 
-/// Reserved shape for a config-backed credential store, kept to prove the
-/// [`Authenticator`] trait is replaceable without touching the protocol layers.
+/// A stored secret from config: either a plaintext password, or the hex form of
+/// `sha256(<cleartext>)` prefixed with `sha256:`.
+#[derive(Clone, PartialEq, Eq)]
+pub enum StoredSecret {
+    Plain(Secret),
+    Sha256([u8; 32]),
+}
+
+impl fmt::Debug for StoredSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StoredSecret::Plain(_) => f.write_str("StoredSecret::Plain(***)"),
+            StoredSecret::Sha256(_) => f.write_str("StoredSecret::Sha256(***)"),
+        }
+    }
+}
+
+/// Parse one stored secret from config.
 ///
-/// Phase 1 only fixes the *shape*: a `username -> secret` table loaded from
-/// config, with `authenticate` verifying a [`Credential::Password`]. The
-/// cleartext-comparison body below is a minimal happy-path skeleton, NOT a
-/// production credential store — hashing, timing-safe comparison, and a real
-/// config loader are deferred to the phase that actually enables it.
+/// - `sha256:<64 hex chars>` -> a sha256 digest of the user's cleartext password
+/// - anything else -> a plaintext password
+pub fn parse_stored_secret(raw: &str) -> Result<StoredSecret, AuthError> {
+    let Some((prefix, rest)) = raw.split_once(':') else {
+        return Ok(StoredSecret::Plain(Secret::new(raw)));
+    };
+    if !prefix.eq_ignore_ascii_case("sha256") {
+        return Ok(StoredSecret::Plain(Secret::new(raw)));
+    }
+    let bytes = hex::decode(rest.trim()).map_err(|e| {
+        AuthError::InvalidCredential(format!("invalid sha256 hex in configured user secret: {e}"))
+    })?;
+    if bytes.len() != 32 {
+        return Err(AuthError::InvalidCredential(format!(
+            "invalid sha256 hex in configured user secret: expected 32 bytes, got {}",
+            bytes.len()
+        )));
+    }
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(&bytes);
+    Ok(StoredSecret::Sha256(digest))
+}
+
+/// Config-backed credential store shared by PG + REST.
 #[derive(Debug, Default, Clone)]
 pub struct ConfigUserStoreAuthenticator {
-    users: HashMap<String, Secret>,
+    users: HashMap<String, StoredSecret>,
 }
 
 impl ConfigUserStoreAuthenticator {
-    /// Build from an in-memory `username -> secret` table. A real implementation
-    /// would load this from gateway config; that loader is out of Phase 1 scope.
-    pub fn new(users: HashMap<String, Secret>) -> Self {
+    pub fn new(users: HashMap<String, StoredSecret>) -> Self {
         Self { users }
+    }
+
+    pub fn user_count(&self) -> usize {
+        self.users.len()
+    }
+
+    /// Build from `username -> stored-secret-string` pairs loaded from config.
+    pub fn from_pairs(
+        pairs: impl IntoIterator<Item = (String, String)>,
+    ) -> Result<Self, AuthError> {
+        let mut users = HashMap::new();
+        for (username, raw_secret) in pairs {
+            users.insert(username, parse_stored_secret(&raw_secret)?);
+        }
+        Ok(Self { users })
+    }
+}
+
+fn verify(stored: &StoredSecret, candidate: &Secret) -> bool {
+    match stored {
+        StoredSecret::Plain(expected) => expected
+            .expose()
+            .as_bytes()
+            .ct_eq(candidate.expose().as_bytes())
+            .into(),
+        StoredSecret::Sha256(expected) => {
+            let actual = Sha256::digest(candidate.expose().as_bytes());
+            expected.ct_eq(actual.as_slice()).into()
+        }
     }
 }
 
@@ -254,16 +320,14 @@ impl Authenticator for ConfigUserStoreAuthenticator {
     async fn authenticate(&self, credential: Credential) -> Result<Principal, AuthError> {
         match credential {
             Credential::Password { username, secret } => match self.users.get(&username) {
-                Some(expected) if *expected == secret => Ok(Principal { name: username }),
-                Some(_) => Err(AuthError::InvalidCredential(format!(
-                    "bad password for user {username}"
-                ))),
-                None => Err(AuthError::InvalidCredential(format!(
-                    "unknown user {username}"
-                ))),
+                Some(expected) if verify(expected, &secret) => Ok(Principal { name: username }),
+                // Deliberately blur unknown-user vs bad-password to avoid user enumeration.
+                _ => Err(AuthError::InvalidCredential(
+                    "username or password is incorrect".to_string(),
+                )),
             },
-            // A store requires a secret to verify; a bare trust claim is not
-            // acceptable here.
+            // A verifying store requires a secret to check; a bare trust claim is
+            // not acceptable here.
             Credential::Trust { .. } => Err(AuthError::Unauthenticated(
                 "password credential required".to_string(),
             )),
@@ -366,13 +430,32 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn config_store_skeleton_happy_and_reject_paths() {
-        let mut users = HashMap::new();
-        users.insert("carol".to_string(), Secret::new("pw"));
-        let auth = ConfigUserStoreAuthenticator::new(users);
+    #[test]
+    fn parse_stored_secret_supports_plain_and_sha256_and_masks_debug() {
+        let plain = parse_stored_secret("pw").unwrap();
+        assert!(matches!(plain, StoredSecret::Plain(_)));
 
-        // happy path: matching password
+        let hash = hex::encode(Sha256::digest(b"secret456"));
+        let stored = parse_stored_secret(&format!("sha256:{hash}")).unwrap();
+        assert!(matches!(stored, StoredSecret::Sha256(_)));
+        assert!(!format!("{stored:?}").contains(&hash));
+
+        let err = parse_stored_secret("sha256:not-hex").unwrap_err();
+        assert!(matches!(err, AuthError::InvalidCredential(_)));
+    }
+
+    #[tokio::test]
+    async fn config_store_accepts_plaintext_and_sha256_and_rejects_bad_logins() {
+        let auth = ConfigUserStoreAuthenticator::from_pairs([
+            ("carol".to_string(), "pw".to_string()),
+            (
+                "bob".to_string(),
+                format!("sha256:{}", hex::encode(Sha256::digest(b"secret456"))),
+            ),
+        ])
+        .unwrap();
+
+        // happy path: matching plaintext password
         let p = auth
             .authenticate(Credential::Password {
                 username: "carol".into(),
@@ -382,7 +465,17 @@ mod tests {
             .unwrap();
         assert_eq!(p.name, "carol");
 
-        // wrong password
+        // happy path: configured sha256, client still sends cleartext
+        let p = auth
+            .authenticate(Credential::Password {
+                username: "bob".into(),
+                secret: Secret::new("secret456"),
+            })
+            .await
+            .unwrap();
+        assert_eq!(p.name, "bob");
+
+        // wrong password and unknown user are intentionally blurred.
         assert!(matches!(
             auth.authenticate(Credential::Password {
                 username: "carol".into(),
@@ -391,8 +484,6 @@ mod tests {
             .await,
             Err(AuthError::InvalidCredential(_))
         ));
-
-        // unknown user
         assert!(matches!(
             auth.authenticate(Credential::Password {
                 username: "dave".into(),
@@ -402,7 +493,7 @@ mod tests {
             Err(AuthError::InvalidCredential(_))
         ));
 
-        // a trust claim has no secret to verify -> rejected by a store
+        // A trust claim has no secret to verify -> rejected by a store.
         assert!(matches!(
             auth.authenticate(Credential::Trust {
                 username: "carol".into()

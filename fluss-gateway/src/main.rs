@@ -28,16 +28,22 @@
 //! - `GATEWAY_PG_LISTEN`       (default `0.0.0.0:5432`)   — PostgreSQL bind addr.
 //! - `GATEWAY_REST_LISTEN`     (default `0.0.0.0:8080`)   — REST bind addr.
 //! - `FLUSS_CLUSTER`           (default `default`)        — logical cluster id.
+//! - `GATEWAY_CONFIG`          (optional)                 — YAML config file.
+//! - `GATEWAY_USERS`           (optional)                 — `user:secret,...` auth override.
 //! - `RUST_LOG`                (default `info`)           — tracing filter.
 //!
-//! Phase note: authentication is `TrustAuthenticator` (the username is trusted,
-//! the password is not verified) and there is no config file yet — both are
-//! deferred. See `auth/mod.rs` for the verifying authenticator seam.
+//! Auth note: when users are configured (YAML file and/or env override), the
+//! gateway verifies username/password on both PG and REST. With no configured
+//! users, it falls back to Phase-1 trust mode (username becomes the principal,
+//! password ignored) and logs a warning.
 
+use std::collections::HashMap;
+use std::fs;
 use std::sync::Arc;
 use std::time::Duration;
 
-use fluss_gateway::auth::TrustAuthenticator;
+use fluss_gateway::auth::config::{parse_users_env, parse_yaml};
+use fluss_gateway::auth::{Authenticator, ConfigUserStoreAuthenticator, TrustAuthenticator};
 use fluss_gateway::backend::FlussBackendFacade;
 use fluss_gateway::cluster::{ClusterConfig, ClusterRegistry};
 use fluss_gateway::connection::{FlussConnectionProvider, SharedProxyConnectionProvider};
@@ -57,6 +63,8 @@ struct GatewayConfig {
     pg_listen: String,
     rest_listen: String,
     cluster: String,
+    config_path: Option<String>,
+    users_env: Option<String>,
 }
 
 impl GatewayConfig {
@@ -67,12 +75,44 @@ impl GatewayConfig {
                 .filter(|v| !v.trim().is_empty())
                 .unwrap_or_else(|| default.to_string())
         };
+        let env_opt = |key: &str| std::env::var(key).ok().filter(|v| !v.trim().is_empty());
         Self {
             bootstrap_servers: env_or("FLUSS_BOOTSTRAP_SERVERS", "127.0.0.1:9123"),
             pg_listen: env_or("GATEWAY_PG_LISTEN", "0.0.0.0:5432"),
             rest_listen: env_or("GATEWAY_REST_LISTEN", "0.0.0.0:8080"),
             cluster: env_or("FLUSS_CLUSTER", "default"),
+            config_path: env_opt("GATEWAY_CONFIG"),
+            users_env: env_opt("GATEWAY_USERS"),
         }
+    }
+}
+
+fn build_authenticator(
+    config: &GatewayConfig,
+) -> Result<Arc<dyn Authenticator>, Box<dyn std::error::Error>> {
+    let mut users = HashMap::<String, String>::new();
+
+    if let Some(path) = &config.config_path {
+        let text = fs::read_to_string(path)?;
+        for (username, secret) in parse_yaml(&text)? {
+            users.insert(username, secret);
+        }
+    }
+    if let Some(spec) = &config.users_env {
+        for (username, secret) in parse_users_env(spec) {
+            users.insert(username, secret);
+        }
+    }
+
+    if users.is_empty() {
+        tracing::warn!(
+            "no auth users configured; falling back to trust mode (username is trusted, password ignored)"
+        );
+        Ok(Arc::new(TrustAuthenticator::new()))
+    } else {
+        let auth = ConfigUserStoreAuthenticator::from_pairs(users)?;
+        tracing::info!(users = auth.user_count(), "configured password authenticator");
+        Ok(Arc::new(auth))
     }
 }
 
@@ -96,6 +136,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let instance = assemble_instance(&config).await?;
+    let authenticator = build_authenticator(&config)?;
 
     // Bind both frontends before serving so a bind failure (e.g. port in use)
     // surfaces immediately rather than after the cluster handshake.
@@ -105,11 +146,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let pg = PgServer::new(
         Arc::clone(&instance) as Arc<dyn GatewayInstance>,
-        Arc::new(TrustAuthenticator::new()),
+        Arc::clone(&authenticator),
     );
     let rest = RestServer::new(
         Arc::clone(&instance) as Arc<dyn GatewayInstance>,
-        Arc::new(TrustAuthenticator::new()),
+        Arc::clone(&authenticator),
     );
 
     let mut pg_task = tokio::spawn(async move { pg.serve(pg_listener).await });

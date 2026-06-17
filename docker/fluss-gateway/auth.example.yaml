@@ -1,0 +1,13 @@
+# Example fluss-gateway auth config.
+# Point GATEWAY_CONFIG at this file inside the container.
+
+auth:
+  users:
+    # Plaintext password
+    - username: alice
+      password: secret123
+
+    # sha256(<cleartext>) hex form. The client still sends the cleartext password.
+    # Example cleartext here is: secret456
+    - username: bob
+      password: "sha256:3c2122a1d02657a5a6f4d5b4994f6a2ff1589696ca0a9f973063200d7daefdf2"
