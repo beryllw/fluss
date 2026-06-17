@@ -98,12 +98,16 @@ eval $PSQL -c "SELECT * FROM <kv_table> WHERE id = 1;"
 eval $PSQL -c "SELECT * FROM <kv_table> WHERE c1 = 10;"
 # KV: bounded scan
 eval $PSQL -c "SELECT * FROM <kv_table> LIMIT 10;"
+# KV: full snapshot scan (no key predicate, no LIMIT)
+eval $PSQL -c "SELECT * FROM <kv_table>;"
 # Log: bounded scan / full snapshot
 eval $PSQL -c "SELECT * FROM <log_table> LIMIT 10;"
 ```
 
-A KV scan with neither a key predicate nor a `LIMIT` is rejected with a clear
-error rather than running an unbounded full scan.
+Point lookup, prefix lookup, bounded `LIMIT` scan, and full snapshot scan are all
+supported. Note: `count(*)` (and other empty-column-projection queries) currently
+error on the KV path ("Column indices cannot be empty") — select at least one
+column.
 
 REST (metadata + DDL + write):
 
