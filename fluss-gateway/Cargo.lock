@@ -2074,7 +2074,7 @@ dependencies = [
 [[package]]
 name = "fluss-datafusion"
 version = "0.2.0"
-source = "git+https://github.com/beryllw/fluss-rust.git?rev=f294b01272386659a4433a9e3bd1cc4706e20958#f294b01272386659a4433a9e3bd1cc4706e20958"
+source = "git+https://github.com/beryllw/fluss-rust.git?rev=cf93ace73b1ea25da5fed51a607ee0fc7d325199#cf93ace73b1ea25da5fed51a607ee0fc7d325199"
 dependencies = [
  "arrow",
  "async-trait",
@@ -2117,7 +2117,7 @@ dependencies = [
 [[package]]
 name = "fluss-rs"
 version = "0.2.0"
-source = "git+https://github.com/beryllw/fluss-rust.git?rev=f294b01272386659a4433a9e3bd1cc4706e20958#f294b01272386659a4433a9e3bd1cc4706e20958"
+source = "git+https://github.com/beryllw/fluss-rust.git?rev=cf93ace73b1ea25da5fed51a607ee0fc7d325199#cf93ace73b1ea25da5fed51a607ee0fc7d325199"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -2157,7 +2157,7 @@ dependencies = [
 [[package]]
 name = "fluss-test-cluster"
 version = "0.2.0"
-source = "git+https://github.com/beryllw/fluss-rust.git?rev=f294b01272386659a4433a9e3bd1cc4706e20958#f294b01272386659a4433a9e3bd1cc4706e20958"
+source = "git+https://github.com/beryllw/fluss-rust.git?rev=cf93ace73b1ea25da5fed51a607ee0fc7d325199#cf93ace73b1ea25da5fed51a607ee0fc7d325199"
 dependencies = [
  "clap",
  "fluss-rs",
