@@ -869,6 +869,62 @@ async fn cluster_rest_kv_and_log_then_pg_selects() {
     .count();
     assert_eq!(wide_cols, 16, "psql \\d lists all 16 columns of the wide-type table");
 
+    // REST write covering EVERY writable column type (integers, floats, boolean,
+    // string, decimal, date/time/timestamp as JSON strings, and binary as a hex
+    // string — arrow-json's binary encoding), then read the row back via PG to
+    // prove the full Arrow -> Fluss `GenericRow` conversion round-trips.
+    let wide_row = r#"[{"id":1,"c_bool":true,"c_tinyint":7,"c_smallint":300,
+        "c_bigint":9000000000,"c_float":1.5,"c_double":2.25,"c_decimal":3.14,
+        "c_char":"abcd","c_string":"hello",
+        "c_binary":"000102030405060708090a0b0c0d0e0f","c_bytes":"aabbcc",
+        "c_date":"2024-03-15","c_time":"12:34:56","c_timestamp":"2024-03-15T12:34:56.789",
+        "c_notnull":42}]"#;
+    let resp = http
+        .post(format!("{rest_base}/databases/{DATABASE}/tables/{wide}/records"))
+        .header("Authorization", &auth)
+        .header("Content-Type", JSON)
+        .body(wide_row)
+        .send()
+        .await
+        .unwrap();
+    // The write returning rows_written:1 proves the full Arrow -> Fluss row
+    // conversion succeeded for EVERY column (incl. the hex-decoded binary columns;
+    // see the row_convert unit tests). The PG read-back below covers the
+    // numeric/temporal/decimal scalars; binary columns are excluded from the
+    // projection because reading them back is a separate read-path concern.
+    assert_eq!(resp.status(), 200, "write of an all-types row succeeds");
+    assert_eq!(resp.json::<serde_json::Value>().await.unwrap()["rows_written"], 1);
+
+    let rows = tokio::time::timeout(
+        Duration::from_secs(30),
+        pg_client.simple_query(&format!(
+            "SELECT id, c_tinyint, c_smallint, c_bigint, c_bool, c_string, c_decimal, \
+             c_date, c_time, c_timestamp, c_notnull \
+             FROM fluss.{DATABASE}.{wide} WHERE id = 1"
+        )),
+    )
+    .await
+    .expect("PG read of all-types row timed out")
+    .expect("PG read of all-types row");
+    let row = rows
+        .iter()
+        .find_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(r) if r.get("id") == Some("1") => Some(r),
+            _ => None,
+        })
+        .expect("the all-types row reads back via PG");
+    let g = |c: &str| row.get(c).unwrap_or("").to_string();
+    assert_eq!(g("c_tinyint"), "7", "TINYINT round-trips");
+    assert_eq!(g("c_smallint"), "300", "SMALLINT round-trips");
+    assert_eq!(g("c_bigint"), "9000000000", "BIGINT round-trips");
+    assert_eq!(g("c_bool"), "t", "BOOLEAN round-trips");
+    assert_eq!(g("c_string"), "hello", "STRING round-trips");
+    assert_eq!(g("c_decimal"), "3.14", "DECIMAL round-trips");
+    assert_eq!(g("c_date"), "2024-03-15", "DATE round-trips");
+    assert!(g("c_time").starts_with("12:34:56"), "TIME round-trips: {}", g("c_time"));
+    assert!(g("c_timestamp").starts_with("2024-03-15 12:34:56.789"), "TIMESTAMP round-trips: {}", g("c_timestamp"));
+    assert_eq!(g("c_notnull"), "42", "explicit NOT NULL column round-trips");
+
     http.delete(format!("{rest_base}/databases/{DATABASE}/tables/{wide}"))
         .header("Authorization", &auth)
         .send()

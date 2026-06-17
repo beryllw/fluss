@@ -138,6 +138,26 @@ Create returns `201` (or `200` with `"validate_only": true` to dry-run), `409`
 if the table already exists. See `fluss-gateway/design/direct-path.md` for the
 full request schema (column types, `configs`, `validate_only`).
 
+### JSON write value encodings
+
+All Fluss column types are writable over the JSON record body. Most map to the
+obvious JSON value; the non-numeric types use a string encoding:
+
+| Column type            | JSON value                                            |
+|------------------------|-------------------------------------------------------|
+| `BOOLEAN`              | `true` / `false`                                      |
+| `TINYINT`…`BIGINT`     | number (`7`)                                          |
+| `FLOAT` / `DOUBLE`     | number (`1.5`)                                        |
+| `DECIMAL(p,s)`         | number or string (`3.14`)                             |
+| `CHAR(n)` / `STRING`   | string (`"hello"`)                                    |
+| `DATE`                 | string `"YYYY-MM-DD"` (`"2024-03-15"`)                |
+| `TIME(p)`              | string `"HH:MM:SS"` (`"12:34:56"`)                    |
+| `TIMESTAMP(p)`         | string `"YYYY-MM-DDTHH:MM:SS.fff"`                    |
+| `BINARY(n)` / `BYTES`  | **hex** string (`"00ff10"`) — not base64             |
+
+Use the Arrow IPC stream body (`Content-Type: application/vnd.apache.arrow.stream`)
+to write pre-typed columns directly without the JSON string encodings.
+
 ## Local test stack
 
 A local test stack can be launched with:
