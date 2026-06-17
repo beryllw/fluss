@@ -204,7 +204,60 @@ pub fn encode_batch(
     fields: Arc<Vec<FieldInfo>>,
     batch: RecordBatch,
 ) -> Vec<Result<DataRow, PgWireError>> {
-    arrow_pg::datatypes::encode_recordbatch(fields, batch).collect()
+    arrow_pg::datatypes::encode_recordbatch(fields, normalize_for_pg(batch)).collect()
+}
+
+/// Normalize a result batch so arrow-pg's value encoder can handle every column.
+///
+/// arrow-pg maps `FixedSizeBinary(n)` (Fluss `BINARY(n)`) to the `bytea` OID in
+/// the `RowDescription`, but its `encode_value` has no `FixedSizeBinary` arm and
+/// falls through to an unsupported-type path that `format!`s the array and grows
+/// an unbounded string (hangs / OOMs the connection). Variable-length `Binary`
+/// IS handled, and the field is already advertised as `bytea`, so we convert any
+/// `FixedSizeBinary` column to `Binary` here — same bytes, same wire type.
+fn normalize_for_pg(batch: RecordBatch) -> RecordBatch {
+    use arrow::array::{Array, BinaryBuilder, FixedSizeBinaryArray};
+    use arrow::datatypes::{Field, Schema};
+
+    let schema = batch.schema();
+    if !schema
+        .fields()
+        .iter()
+        .any(|f| matches!(f.data_type(), DataType::FixedSizeBinary(_)))
+    {
+        return batch;
+    }
+
+    let mut fields = Vec::with_capacity(schema.fields().len());
+    let mut columns = Vec::with_capacity(batch.num_columns());
+    for (field, column) in schema.fields().iter().zip(batch.columns()) {
+        if matches!(field.data_type(), DataType::FixedSizeBinary(_)) {
+            // Downcast is infallible: we just matched the column's declared type.
+            let fsb = column
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .expect("FixedSizeBinary column");
+            let mut builder = BinaryBuilder::with_capacity(fsb.len(), fsb.len() * fsb.value_length() as usize);
+            for i in 0..fsb.len() {
+                if fsb.is_null(i) {
+                    builder.append_null();
+                } else {
+                    builder.append_value(fsb.value(i));
+                }
+            }
+            fields.push(Arc::new(Field::new(
+                field.name(),
+                DataType::Binary,
+                field.is_nullable(),
+            )));
+            columns.push(Arc::new(builder.finish()) as _);
+        } else {
+            fields.push(field.clone());
+            columns.push(column.clone());
+        }
+    }
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        .expect("rebuilt batch has matching schema/columns")
 }
 
 /// Build a single-column, single-row text result (used for `SHOW <var>`).
@@ -494,6 +547,46 @@ mod tests {
         let (fields, row) = single_text_row("search_path", "public");
         assert_eq!(fields.len(), 1);
         assert!(row.is_ok());
+    }
+
+    #[test]
+    fn fixed_size_binary_is_normalized_to_binary_for_pg() {
+        use arrow::array::{Array, BinaryArray, FixedSizeBinaryArray};
+        use arrow::datatypes::{Field, Schema};
+
+        let fsb = FixedSizeBinaryArray::try_from_iter(vec![vec![1u8, 2, 3, 4]].into_iter()).unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("b", DataType::FixedSizeBinary(4), false)])),
+            vec![Arc::new(fsb)],
+        )
+        .unwrap();
+
+        let out = normalize_for_pg(batch);
+        assert_eq!(out.schema().field(0).data_type(), &DataType::Binary, "fsb -> binary");
+        let col = out.column(0).as_any().downcast_ref::<BinaryArray>().unwrap();
+        assert_eq!(col.value(0), &[1u8, 2, 3, 4], "bytes preserved");
+
+        // And the full encode path must produce a row instead of hanging on the
+        // unsupported-type fallback.
+        let fields = Arc::new(row_description(&out.schema(), FieldFormat::Text).unwrap());
+        let rows = encode_batch(fields, out);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].is_ok());
+    }
+
+    #[test]
+    fn normalize_is_a_noop_without_fixed_size_binary() {
+        use arrow::array::Int32Array;
+        use arrow::datatypes::{Field, Schema};
+
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)])),
+            vec![Arc::new(Int32Array::from(vec![1, 2]))],
+        )
+        .unwrap();
+        let out = normalize_for_pg(batch);
+        assert_eq!(out.schema().field(0).data_type(), &DataType::Int32);
+        assert_eq!(out.num_rows(), 2);
     }
 
     #[test]

@@ -888,20 +888,16 @@ async fn cluster_rest_kv_and_log_then_pg_selects() {
         .await
         .unwrap();
     // The write returning rows_written:1 proves the full Arrow -> Fluss row
-    // conversion succeeded for EVERY column (incl. the hex-decoded binary columns;
-    // see the row_convert unit tests). The PG read-back below covers the
-    // numeric/temporal/decimal scalars; binary columns are excluded from the
-    // projection because reading them back is a separate read-path concern.
+    // conversion succeeded for every column. The `SELECT *` read-back then proves
+    // each type round-trips over PG — including the binary columns: `BYTES`
+    // (variable `Binary`) and `BINARY(16)` (`FixedSizeBinary`, which arrow-pg
+    // can't encode directly and which the adapter normalizes to `Binary`/bytea).
     assert_eq!(resp.status(), 200, "write of an all-types row succeeds");
     assert_eq!(resp.json::<serde_json::Value>().await.unwrap()["rows_written"], 1);
 
     let rows = tokio::time::timeout(
         Duration::from_secs(30),
-        pg_client.simple_query(&format!(
-            "SELECT id, c_tinyint, c_smallint, c_bigint, c_bool, c_string, c_decimal, \
-             c_date, c_time, c_timestamp, c_notnull \
-             FROM fluss.{DATABASE}.{wide} WHERE id = 1"
-        )),
+        pg_client.simple_query(&format!("SELECT * FROM fluss.{DATABASE}.{wide} WHERE id = 1")),
     )
     .await
     .expect("PG read of all-types row timed out")
@@ -923,6 +919,11 @@ async fn cluster_rest_kv_and_log_then_pg_selects() {
     assert_eq!(g("c_date"), "2024-03-15", "DATE round-trips");
     assert!(g("c_time").starts_with("12:34:56"), "TIME round-trips: {}", g("c_time"));
     assert!(g("c_timestamp").starts_with("2024-03-15 12:34:56.789"), "TIMESTAMP round-trips: {}", g("c_timestamp"));
+    assert_eq!(g("c_bytes"), "\\xaabbcc", "BYTES round-trips as bytea");
+    assert_eq!(
+        g("c_binary"), "\\x000102030405060708090a0b0c0d0e0f",
+        "BINARY(16)/FixedSizeBinary round-trips as bytea (adapter normalization)"
+    );
     assert_eq!(g("c_notnull"), "42", "explicit NOT NULL column round-trips");
 
     http.delete(format!("{rest_base}/databases/{DATABASE}/tables/{wide}"))
