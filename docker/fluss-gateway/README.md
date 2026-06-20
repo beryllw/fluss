@@ -68,6 +68,16 @@ docker run --rm \
 The gateway retries the cluster connection a few times at startup, so it can be
 launched slightly before the cluster is ready.
 
+## Connection recovery
+
+If the shared Fluss connection dies at runtime (its RPC I/O task stops), the
+gateway detects it on the next query and automatically rebuilds + hot-swaps a
+fresh connection — no restart needed. Rebuilds are **bounded** (at most a few
+attempts with exponential backoff), so a persistently unreachable cluster fails
+fast with a clear error instead of looping forever. Read/metadata queries retry
+once after a successful rebuild; writes are not auto-retried (at-least-once), so
+the client should resubmit.
+
 ## Authentication
 
 When **no users are configured**, the gateway stays in Phase-1 trust mode for
@@ -168,6 +178,12 @@ Point lookup, prefix lookup, bounded `LIMIT` scan, and full snapshot scan are al
 supported. Note: `count(*)` (and other empty-column-projection queries) currently
 error on the KV path ("Column indices cannot be empty") — select at least one
 column.
+
+Troubleshooting note: if multiple PostgreSQL clients appear to "hang" while
+running KV point/prefix lookups, the likely cause is lookup-path serialization,
+not TCP accept or auth. All sessions share one `FlussConnection`, and its KV
+lookup client batches/queues concurrent lookups behind a background sender, so
+fresh concurrent clients can show staircase latency on the first KV queries.
 
 REST (metadata + DDL + write):
 
