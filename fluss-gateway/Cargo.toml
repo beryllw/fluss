@@ -1,26 +1,24 @@
-# Fluss Gateway — Phase 1 dependency version matrix (P0, see DESIGN.md §3).
+# Fluss Gateway — dependency version matrix (see DESIGN.md §3).
 #
-# This crate must align with the upstream `fluss-rust-community` workspace line:
-#   datafusion = 52.0.0, arrow = 57.0.0, tokio = 1.44.2
+# Aligned to the upstream `fluss-rust` datafusion-v0.3.1 line:
+#   datafusion = 53.0.0, arrow = 58.0.0, tokio = 1.44.2
 # The PostgreSQL compatibility stack is pinned around that line:
-#   pgwire 0.38.x         -> matches arrow-pg 0.12.2 (pgwire ^0.38)
-#   arrow-pg 0.12.2       -> targets arrow ^57 / datafusion ^52 (feature "datafusion")
-#   datafusion-pg-catalog 0.15.0 -> targets datafusion ^52
-# The newer datafusion-postgres family (df53/arrow58/pgwire0.40) is intentionally
-# NOT used: it would pull arrow 58 / datafusion 53 and break alignment with the
-# upstream df52/arrow57 line. Dependency upgrades are a separate, later work item.
+#   pgwire 0.40.x         -> matches arrow-pg 0.14 (pgwire ^0.40)
+#   arrow-pg 0.14         -> targets arrow ^58 / datafusion ^53 (feature "datafusion")
+#   datafusion-pg-catalog 0.17 -> targets datafusion ^53
 #
 # Fluss access uses the upstream `fluss-datafusion` + `fluss-rs` crates as pinned
-# git dependencies pinned to rev cf93ace (tag datafusion-v0.2.6 at
-# verification time; covers all column types through the SQL read paths — incl.
-# binary/decimal/temporal point lookups — on top of the KV prefix lookup, KV
-# bounded `LIMIT` scan, and Log full-snapshot scan). They share this exact
-# df52/arrow57/tokio-1.44 line, so cargo unifies cleanly. Gateway code still talks
-# to Fluss only through narrow gateway-defined contract traits (e.g.
-# `FlussCatalogInstaller`, `FlussConnectionProvider`, `BackendFacade`): the real
-# crates back those traits in production while fakes back them in tests, so the
-# gateway never absorbs catalog/execution/type logic. `datafusion` + `arrow` are
-# also direct public deps because the SQL path needs SessionContext / RecordBatch.
+# git dependencies at rev aa19a58 (tag datafusion-v0.3.1). This line provides
+# `FlussDatafusion::swap_connection` (runtime connection hot-swap) and a
+# self-healing RPC layer (a stopped connection is reconnected; scanner metadata
+# retries are bounded), which the gateway's connection-recovery manager builds on.
+# fluss-datafusion's `lake` feature (Paimon) is left OFF, so the git dependency is
+# self-contained. Gateway code talks to Fluss only through narrow gateway-defined
+# contract traits (e.g. `FlussCatalogInstaller`, `FlussConnectionProvider`,
+# `BackendFacade`): the real crates back those traits in production while fakes back
+# them in tests, so the gateway never absorbs catalog/execution/type logic.
+# `datafusion` + `arrow` are also direct public deps because the SQL path needs
+# SessionContext / RecordBatch.
 
 [package]
 name = "fluss-gateway"
@@ -43,22 +41,26 @@ tokio-util = { version = "0.7", features = ["rt"] }
 async-trait = "0.1"
 futures = "0.3"
 
-# --- SQL engine (public crates; df52/arrow57 line) ---
-datafusion = "52.0.0"
-arrow = { version = "57.0.0", features = ["ipc_compression", "ffi", "json"] }
-arrow-schema = "57.0.0"
+# --- SQL engine (public crates; df53/arrow58 line) ---
+datafusion = "53.0.0"
+arrow = { version = "58.0.0", features = ["ipc_compression", "ffi", "json"] }
+arrow-schema = "58.0.0"
 
 # --- PostgreSQL wire / compatibility stack ---
 # NOTE: pgwire must stay semver-compatible with the pgwire arrow-pg pulls in, so
 # cargo unifies both to ONE pgwire instance — otherwise arrow-pg's encoded row
 # types cannot be fed into our pgwire server handlers. Do not bump pgwire alone.
-pgwire = "0.38"
-arrow-pg = { version = "0.12.2", features = ["datafusion"] }
-datafusion-pg-catalog = "0.15.0"
+pgwire = "0.40"
+arrow-pg = { version = "0.14", features = ["datafusion"] }
+datafusion-pg-catalog = "0.17"
 
-# --- Fluss access (git deps; datafusion-v0.2.6 line aligns df52/arrow57) ---
-fluss = { package = "fluss-rs", git = "https://github.com/beryllw/fluss-rust.git", rev = "cf93ace73b1ea25da5fed51a607ee0fc7d325199", features = ["storage-all"] }
-fluss-datafusion = { git = "https://github.com/beryllw/fluss-rust.git", rev = "cf93ace73b1ea25da5fed51a607ee0fc7d325199" }
+# --- Connection hot-swap (recovery manager) ---
+arc-swap = "1"
+
+# --- Fluss access (git deps; datafusion-v0.3.1 line aligns df53/arrow58) ---
+# `lake` (Paimon) left off -> self-contained git dependency.
+fluss = { package = "fluss-rs", git = "https://github.com/beryllw/fluss-rust.git", rev = "aa19a58f8a3d88b1e3b2447b6d41b6c28d9dd520", features = ["storage-all"] }
+fluss-datafusion = { git = "https://github.com/beryllw/fluss-rust.git", rev = "aa19a58f8a3d88b1e3b2447b6d41b6c28d9dd520" }
 
 # --- HTTP (REST direct path) ---
 axum = "0.8"
@@ -80,20 +82,20 @@ regex = "1"
 tracing = "0.1"
 # Server-binary logging (RUST_LOG filter). Also used by tests as a dev-dependency.
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-# Unguessable per-connection PG cancel backend-key secret (§P4.6).
+# Unguessable per-connection PG cancel backend-key secret.
 rand = "0.8"
 
 [features]
 # Real-cluster end-to-end tests (tests/cluster_e2e.rs). Off by default so plain
 # `cargo test` stays cluster-free; enable with `--features integration_tests`,
 # which needs a container runtime (docker) and the apache/fluss image. Verifies
-# TASKS §4 T1-T4 against a live cluster (REST write -> readback, PG SELECT).
+# the live cluster path (REST write -> readback, PG SELECT, recovery).
 integration_tests = []
 
 [dev-dependencies]
 # Brings up a throwaway Fluss cluster in docker for the integration_tests path.
 # Same git rev as the `fluss` / `fluss-datafusion` deps so the client types unify.
-fluss-test-cluster = { git = "https://github.com/beryllw/fluss-rust.git", rev = "cf93ace73b1ea25da5fed51a607ee0fc7d325199" }
+fluss-test-cluster = { git = "https://github.com/beryllw/fluss-rust.git", rev = "aa19a58f8a3d88b1e3b2447b6d41b6c28d9dd520" }
 # Real PostgreSQL wire client for protocol integration tests (P4). Drives the
 # gateway over loopback TCP with no Fluss cluster, against a fake GatewayInstance.
 tokio-postgres = "0.7"
