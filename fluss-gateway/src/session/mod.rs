@@ -15,13 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! P2 — GatewaySession / SessionVars / SessionManager + Operation /
+//! GatewaySession / SessionVars / SessionManager + Operation /
 //! OperationManager.
 //!
 //! Session is connection-scoped state; Operation is query-scoped state. Only the
 //! SQL path exposes user-visible Operations. `SessionVars` is the single source
 //! of truth for mutable session state; live mutation must be idempotent.
-//! Design: `design/core-session.md` P2 and `DESIGN.md` §2.
+//! Design: `design/core-session.md` and `DESIGN.md`.
 
 pub mod manager;
 pub mod operation;

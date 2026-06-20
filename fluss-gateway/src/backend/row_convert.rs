@@ -17,7 +17,7 @@
 
 //! Arrow `RecordBatch` -> Fluss `GenericRow` conversion for KV writes
 //! (`KvUpsert` / `KvDelete`). Backs the real [`FlussBackendFacade`]; see
-//! `design/direct-path.md` §P5 / `design/infra.md` §P6.2.
+//! `design/direct-path.md` / `design/infra.md`.
 //!
 //! Log appends do NOT go through this module — the Fluss `AppendWriter` takes a
 //! `RecordBatch` directly (`append_arrow_batch`), so there is no row-by-row
@@ -56,7 +56,7 @@ use crate::error::{GatewayError, GatewayResult};
 ///
 /// Returns `InvalidArgument` if any column has an unsupported Arrow type; the
 /// error names the offending column and type so the caller gets actionable 400
-/// feedback (direct-path.md §3/§6).
+/// feedback (direct-path.md).
 pub fn batch_to_generic_rows(batch: &RecordBatch) -> GatewayResult<Vec<GenericRow<'static>>> {
     let num_cols = batch.num_columns();
     let num_rows = batch.num_rows();

@@ -15,23 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! P3 — SQL environment assembly layer.
+//! SQL environment assembly layer.
 //!
 //! SQL environment differences (catalog wiring, pg_catalog base + overlay,
 //! initial session vars) are installed through a [`SqlEnvironmentProvider`],
 //! never hardcoded into `Instance`. A [`SqlEnvironmentRegistry`] selects the
 //! provider per SQL frontend (PostgreSQL today). `PgSqlEnvironmentProvider`
 //! implements the fixed 5-step assembly order. The provider owns only
-//! *SessionContext content*; the wire belongs to the PG adapter (P4).
-//! Design: `design/sql-path.md` §P3.1-§P3.4 and `design/datafusion-contract.md` D1.
+//! *SessionContext content*; the wire belongs to the PG adapter.
+//! Design: `design/sql-path.md` and `design/datafusion-contract.md` D1.
 //!
 //! Submodules:
-//! - `provider`      — the [`SqlEnvironmentProvider`] trait (§P3.1).
-//! - `registry`      — [`SqlEnvironmentRegistry`] (§P3.2).
-//! - `collaborators` — stub seams for the not-yet-ready external steps (2 & 4).
+//! - `provider`      — the [`SqlEnvironmentProvider`] trait.
+//! - `registry`      — [`SqlEnvironmentRegistry`].
+//! - `collaborators` — the catalog/overlay assembly seams (steps 2 & 4): the real
+//!   Fluss catalog installer and the pg_catalog overlay (still a stub).
 //! - `apply`         — step-5 session-vars snapshot applier (gateway-owned).
-//! - `pg`            — [`PgSqlEnvironmentProvider`] + the 5-step order (§P3.3).
-//! - `bridge`        — adapts registry+provider onto the P2 builder seam (§P3.4).
+//! - `pg`            — [`PgSqlEnvironmentProvider`] + the 5-step order.
+//! - `bridge`        — adapts registry+provider onto the session builder seam.
 
 pub mod apply;
 pub mod bridge;

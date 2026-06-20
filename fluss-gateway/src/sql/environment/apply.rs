@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! P3.3 step 5 — apply a [`SessionVars`] snapshot onto a live `SessionContext`.
+//! Assembly step 5 — apply a [`SessionVars`] snapshot onto a live `SessionContext`.
 //!
 //! Gateway-owned (not an external seam): this is the one place where session
 //! vars become live context state, shared by `prepare_session_context` step 5
@@ -24,12 +24,11 @@
 //! applying the same vars twice leaves the context in the same state, and a
 //! rebuild restores state from the snapshot without replaying past mutations.
 //!
-//! Phase 1 applies the context-affecting vars that DataFusion's
-//! `SessionContext` can carry today: timezone (execution time zone) and the
-//! current catalog / schema (default name resolution). search_path /
-//! application_name beyond that are tracked in vars and surfaced by the PG
-//! adapter (P4); they are not DataFusion config knobs, so there is nothing to
-//! install into the context here.
+//! It applies the context-affecting vars that DataFusion's `SessionContext` can
+//! carry: timezone (execution time zone) and the current catalog / schema
+//! (default name resolution). search_path / application_name beyond that are
+//! tracked in vars and surfaced by the PG adapter; they are not DataFusion config
+//! knobs, so there is nothing to install into the context here.
 
 use datafusion::execution::context::SessionContext;
 

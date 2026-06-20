@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! P4 — `PgProtocolAdapter`: the wire <-> gateway boundary.
+//! `PgProtocolAdapter`: the wire <-> gateway boundary.
 //!
-//! Owns everything the design assigns to "线上长什么样" (`design/sql-path.md`
-//! §P4.1/§P4.4): building [`OpenSessionRequest`] from startup parameters,
+//! Owns everything the design assigns to "线上长什么样" (`design/sql-path.md`):
+//! building [`OpenSessionRequest`] from startup parameters,
 //! mapping startup vars into initial [`SessionVars`], encoding Arrow result
 //! batches into PG `RowDescription` + `DataRow`, mapping a domain
 //! [`GatewayError`] into a PG `ErrorInfo`, and the out-of-band cancel-key
@@ -47,26 +47,26 @@ use crate::types::{
 /// The fixed SQL environment id the PostgreSQL frontend opens sessions with.
 pub const PG_SQL_ENVIRONMENT: &str = "postgres";
 
-/// Phase 1 PG path is single-cluster.
+/// The PG path is single-cluster.
 pub const DEFAULT_CLUSTER: &str = "default";
 
-/// Catalog the `database` startup parameter is interpreted against (§P4.2).
+/// Catalog the `database` startup parameter is interpreted against.
 pub const FLUSS_CATALOG: &str = "fluss";
 
 // ---------------------------------------------------------------------------
-// startup parameters -> OpenSessionRequest (§P4.2)
+// startup parameters -> OpenSessionRequest
 // ---------------------------------------------------------------------------
 
 /// Build an [`OpenSessionRequest`] from PG startup parameters and the
 /// authenticated principal.
 ///
-/// Mapping (`design/sql-path.md` §P4.2):
+/// Mapping (`design/sql-path.md`):
 /// - `sql_environment` is fixed to `"postgres"`, `cluster` is always `default`;
 /// - `database` -> initial current catalog `fluss` + that name as schema;
 /// - `application_name` / `TimeZone` / `search_path` -> initial [`SessionVars`];
 /// - `client_encoding` must be UTF-8 (case/spelling-insensitive) or this errors.
 ///
-/// `principal` is produced by the auth layer (cleartext-then-trust, P7) and is
+/// `principal` is produced by the auth layer (cleartext-then-trust) and is
 /// preserved verbatim onto the request.
 pub fn open_session_request_from_startup(
     principal: Principal,
@@ -76,12 +76,12 @@ pub fn open_session_request_from_startup(
     if let Some(enc) = params.get("client_encoding") {
         if !is_utf8_encoding(enc) {
             return Err(GatewayError::Unsupported(format!(
-                "client_encoding {enc:?} is not supported; Phase 1 PostgreSQL only supports UTF-8"
+                "client_encoding {enc:?} is not supported; PostgreSQL access requires UTF-8"
             )));
         }
     }
 
-    // Phase 1: the PG `database` becomes the initial current schema under the
+    // The PG `database` becomes the initial current schema under the
     // single `fluss` catalog.
     let current_schema = params
         .get("database")
@@ -121,7 +121,7 @@ pub fn open_session_request_from_startup(
 
 /// Map a cleartext-password handshake result into a neutral [`Credential`] and
 /// keep the auth layer free of pgwire types. The trust authenticator ignores
-/// the password; we still forward it so a future password store can verify it.
+/// the password; we still forward it so a verifying password store can check it.
 ///
 /// [`Credential`]: crate::auth::Credential
 pub fn credential_from_pg_login(
@@ -141,13 +141,13 @@ fn is_utf8_encoding(enc: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// SET / SHOW semantics on SessionVars (§P4.3, the "落点" half lives in Instance;
+// SET / SHOW semantics on SessionVars (the "落点" half lives in Instance;
 // this is the var <-> string translation the adapter owns)
 // ---------------------------------------------------------------------------
 
 /// Read a session variable's current string value for a `SHOW <name>` reply.
 ///
-/// Phase 1 answers the small set of vars the PG path tracks in [`SessionVars`];
+/// Answers the small set of vars the PG path tracks in [`SessionVars`];
 /// unknown vars resolve to an empty string (matching PG's lenient behavior for
 /// custom GUCs) rather than an error, so BI probes do not break.
 pub fn show_var(vars: &SessionVars, name: &str) -> String {
@@ -171,7 +171,7 @@ fn env_string(vars: &SessionVars, key: &str) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Arrow -> PG encoding (§P4.4)
+// Arrow -> PG encoding
 // ---------------------------------------------------------------------------
 
 /// Derive PG `FieldInfo`s (the `RowDescription`) from an Arrow schema, honoring
@@ -278,7 +278,7 @@ pub fn single_text_row(
 }
 
 // ---------------------------------------------------------------------------
-// PG -> Arrow/DataFusion: bind parameter decoding (§P4.4)
+// PG -> Arrow/DataFusion: bind parameter decoding
 // ---------------------------------------------------------------------------
 
 /// Decode a bound portal's positional parameters (PG wire text/binary bytes) into
@@ -317,7 +317,7 @@ pub fn param_types_to_pg(types: &[DataType]) -> Result<Vec<Type>, PgWireError> {
 }
 
 // ---------------------------------------------------------------------------
-// domain error -> PG error (§P4 boundary mapping)
+// domain error -> PG error
 // ---------------------------------------------------------------------------
 
 /// Map a gateway domain [`GatewayError`] into a PG `ErrorInfo`, choosing the
@@ -351,15 +351,15 @@ pub fn error_to_pg(err: &GatewayError) -> ErrorInfo {
 }
 
 /// The standard error returned when a write/DDL statement reaches the read-only
-/// PG path (§P4.7). Centralized so the message is identical everywhere.
+/// PG path. Centralized so the message is identical everywhere.
 pub fn write_rejected_error() -> GatewayError {
     GatewayError::Unsupported(
-        "Phase 1 PostgreSQL is read-only; use the REST API to write".to_string(),
+        "PostgreSQL access is read-only; use the REST API to write".to_string(),
     )
 }
 
 // ---------------------------------------------------------------------------
-// out-of-band cancel-key registry (§P4.6)
+// out-of-band cancel-key registry
 // ---------------------------------------------------------------------------
 
 /// An entry in the cancel registry: which session a backend key belongs to and,
@@ -424,7 +424,7 @@ impl CancelRegistry {
         self.inner.lock().unwrap().remove(&pid);
     }
 
-    /// Resolve a `CancelRequest` against the registry (§P4.6).
+    /// Resolve a `CancelRequest` against the registry.
     pub fn resolve_cancel(&self, pid: i32, secret: i32) -> CancelResolution {
         match self.inner.lock().unwrap().get(&pid) {
             Some(e) if e.secret == secret => match &e.running_operation {

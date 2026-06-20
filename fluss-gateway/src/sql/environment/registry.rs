@@ -15,15 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! P3.2 — [`SqlEnvironmentRegistry`]: select a provider per SQL frontend.
+//! [`SqlEnvironmentRegistry`]: select a provider per SQL frontend.
 //!
 //! `Instance` holds one shared, read-only registry and looks up a provider by
 //! [`SqlEnvironmentId`] (e.g. `"postgres"`). Providers are stored as
 //! `Arc<dyn SqlEnvironmentProvider>` so a single provider — and the heavy shared
 //! objects it owns (shared `FlussDatafusion`, pg_catalog templates) — is reused
-//! across sessions. The registry exists so future Flight SQL / MySQL frontends
-//! register a new provider WITHOUT changing `Instance`; Phase 1 registers only
-//! `PgSqlEnvironmentProvider`. Design: `design/sql-path.md` §P3.2.
+//! across sessions. The registry exists so additional Flight SQL / MySQL
+//! frontends register a new provider WITHOUT changing `Instance`.
+//! Design: `design/sql-path.md`.
 
 use std::collections::HashMap;
 use std::sync::Arc;

@@ -34,7 +34,7 @@
 //!
 //! Auth note: when users are configured (YAML file and/or env override), the
 //! gateway verifies username/password on both PG and REST. With no configured
-//! users, it falls back to Phase-1 trust mode (username becomes the principal,
+//! users, it falls back to trust mode (username becomes the principal,
 //! password ignored) and logs a warning.
 
 use std::collections::HashMap;
@@ -46,7 +46,10 @@ use fluss_gateway::auth::config::{parse_users_env, parse_yaml};
 use fluss_gateway::auth::{Authenticator, ConfigUserStoreAuthenticator, TrustAuthenticator};
 use fluss_gateway::backend::FlussBackendFacade;
 use fluss_gateway::cluster::{ClusterConfig, ClusterRegistry};
-use fluss_gateway::connection::{FlussConnectionProvider, SharedProxyConnectionProvider};
+use fluss_gateway::connection::{
+    build_fluss_config, ConnectionManager, FlussConnectionProvider, SharedProxyConnectionProvider,
+};
+use fluss_gateway::error::GatewayError;
 use fluss_gateway::instance::{GatewayInstance, GatewayInstanceImpl};
 use fluss_gateway::server::postgres::PgServer;
 use fluss_gateway::server::rest::RestServer;
@@ -181,7 +184,7 @@ async fn assemble_instance(
     config: &GatewayConfig,
 ) -> Result<Arc<GatewayInstanceImpl>, Box<dyn std::error::Error>> {
     let cluster = ClusterId(config.cluster.clone());
-    // Phase 1 uses a shared proxy account; the principal is carried through the
+    // Uses a shared proxy account; the principal is carried through the
     // chain but not consumed (no doAs).
     let principal = Principal {
         name: "gateway".to_string(),
@@ -204,6 +207,23 @@ async fn assemble_instance(
         )
         .await?,
     );
+
+    // Connection recovery: a manager owns the shared connection and, on death,
+    // rebuilds it (bounded) and hot-swaps it into FlussDatafusion (SQL path) while
+    // the backend reads the live connection from the manager (direct path).
+    let fluss_df_for_swap = Arc::clone(&fluss_df);
+    let conn_manager = Arc::new(ConnectionManager::new(
+        Arc::clone(&connection),
+        build_fluss_config(&ClusterConfig {
+            bootstrap_servers: config.bootstrap_servers.clone(),
+        }),
+        Box::new(move |new| {
+            fluss_df_for_swap
+                .swap_connection(Arc::clone(new))
+                .map_err(|e| GatewayError::Backend(format!("swap_connection: {e}")))
+        }),
+    ));
+
     let pg_provider = PgSqlEnvironmentProvider::new(
         Arc::new(FlussDatafusionCatalogInstaller::new(fluss_df)),
         Arc::new(StubPgCatalogOverlayInstaller),
@@ -211,15 +231,14 @@ async fn assemble_instance(
     let mut sql_environments = SqlEnvironmentRegistry::new();
     sql_environments.register(SqlEnvironmentId("postgres".into()), Arc::new(pg_provider));
 
-    // Direct path: a backend over the SAME shared connection.
-    let backend = Arc::new(FlussBackendFacade::new(Arc::clone(&connection)));
+    // Direct path: a backend that reads the live connection from the manager.
+    let backend = Arc::new(FlussBackendFacade::new(Arc::clone(&conn_manager)));
     let sessions = Arc::new(SessionManager::new(SessionManagerConfig::default()));
 
-    Ok(Arc::new(GatewayInstanceImpl::new(
-        sessions,
-        backend,
-        Arc::new(sql_environments),
-    )))
+    Ok(Arc::new(
+        GatewayInstanceImpl::new(sessions, backend, Arc::new(sql_environments))
+            .with_recovery(conn_manager),
+    ))
 }
 
 /// Resolve the shared connection, retrying a bounded number of times so a

@@ -15,14 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! P1 — gateway domain error classification.
+//! Gateway domain error classification.
 //!
 //! Single internal error taxonomy that backend / fluss-datafusion / auth /
 //! validation errors map INTO, and that protocol boundaries map OUT of. The
 //! domain error carries ONLY business semantics: it never contains a PG error
 //! code, an HTTP status, or a gRPC status — those are the responsibility of the
 //! protocol adapter at the boundary layer.
-//! Design: `design/core-session.md` §P1.7 and `DESIGN.md` §2.
+//! Design: `design/core-session.md` and `DESIGN.md` §2.
 
 use thiserror::Error;
 
@@ -30,7 +30,7 @@ use thiserror::Error;
 ///
 /// Variants express domain semantics only; the protocol layer is responsible
 /// for mapping these into protocol-specific error formats (e.g. PG error code,
-/// HTTP status). See `design/direct-path.md` §6 for the REST mapping table.
+/// HTTP status). See `design/direct-path.md` for the REST mapping table.
 #[derive(Debug, Error)]
 pub enum GatewayError {
     /// Caller-supplied input was malformed or semantically invalid.
@@ -65,7 +65,7 @@ pub enum GatewayError {
     #[error("table already exists: {database}.{table}")]
     TableAlreadyExists { database: String, table: String },
 
-    /// The requested capability is not supported in this phase / build.
+    /// The requested capability is not supported by this build.
     #[error("unsupported: {0}")]
     Unsupported(String),
 

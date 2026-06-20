@@ -15,12 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! P4/P5 — protocol frontends.
+//! Protocol frontends.
 //!
-//! Transport + adaptation only; all execution goes through `Instance`. Phase 1
-//! ships `postgres` (read-only SQL) and `rest` (direct write). Future protocols
-//! (mysql / flightsql / grpc) are NOT created until their phase.
-//! Design: `design/sql-path.md` P4, `design/direct-path.md` P5, infra §P8.2.
+//! Transport + adaptation only; all execution goes through `Instance`. Ships
+//! `postgres` (read-only SQL) and `rest` (direct write).
+//! Design: `design/sql-path.md`, `design/direct-path.md`, infra.
 
 pub mod postgres;
 pub mod rest;

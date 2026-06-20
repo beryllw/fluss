@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! P4 — PostgreSQL wire frontend (transport / handler / adapter / compat).
+//! PostgreSQL wire frontend (transport / handler / adapter / compat).
 //!
-//! Read-only SQL in Phase 1. The four submodules follow the design's layering
-//! (`design/sql-path.md` §P4.1):
+//! Read-only SQL. The four submodules follow the design's layering
+//! (`design/sql-path.md`):
 //! - [`transport`]: TCP listener / accept / per-connection task (cleartext only);
 //! - [`handler`]: the pgwire protocol state machine, bridging to `Instance`;
 //! - [`adapter`]: the wire <-> gateway boundary (startup mapping, Arrow->PG

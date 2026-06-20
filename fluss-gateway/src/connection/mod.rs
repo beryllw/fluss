@@ -15,15 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! P6 — FlussConnectionProvider.
+//! FlussConnectionProvider.
 //!
-//! `resolve(cluster, principal) -> shared FlussConnection`. Phase 1 returns a
-//! shared proxy-account connection for all principals (no doAs), but keeps the
-//! `principal` argument so the call site does not change when per-user creds
-//! land later, and so `principal` is forced to flow all the way down to
-//! connection resolution. The same cluster's connection is reused across
-//! sessions and requests (lazily constructed once, then cached) — never one per
-//! session/request. Design: `design/infra.md` §P6.5.
+//! `resolve(cluster, principal) -> shared FlussConnection`. Returns a shared
+//! proxy-account connection for all principals (no doAs), but keeps the
+//! `principal` argument so it is forced to flow all the way down to connection
+//! resolution. The same cluster's connection is reused across sessions and
+//! requests (lazily constructed once, then cached) — never one per
+//! session/request. Design: `design/infra.md`.
 //!
 //! Testability note: the trait is generic over the connection handle type
 //! (`Conn`). The production shared-proxy provider sets `Conn =
@@ -33,16 +32,148 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 
 use crate::cluster::{ClusterRegistry, ClusterConfig};
 use crate::error::{GatewayError, GatewayResult};
 use crate::types::{ClusterId, Principal};
 
+/// Build a fluss-rs `Config` from gateway cluster config. Wires only bootstrap
+/// servers; SASL / per-user credentials are out of scope. Shared by the
+/// connection provider and the recovery [`ConnectionManager`] so a rebuilt
+/// connection uses the exact same config as the original.
+pub fn build_fluss_config(cfg: &ClusterConfig) -> fluss::config::Config {
+    fluss::config::Config {
+        bootstrap_servers: cfg.bootstrap_servers.clone(),
+        ..fluss::config::Config::default()
+    }
+}
+
+/// True if a backend error string indicates the shared Fluss connection is dead
+/// (its RPC I/O task stopped / the connection is poisoned) — the signal to evict
+/// and rebuild it. These markers originate in the fluss-rs RPC layer; the typed
+/// error is already stringified by the time it reaches the gateway boundary
+/// (SQL path buries it in a DataFusion error), so a substring match is the only
+/// signal available on both paths.
+pub fn is_connection_dead(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("connection i/o task has stopped")
+        || e.contains("connection closed before response")
+        || e.contains("poisoned")
+        || e.contains("is poisoned")
+}
+
+/// Hook invoked after a successful rebuild with the new connection, so consumers
+/// that captured the connection by value (e.g. `FlussDatafusion`) can swap it in.
+type SwapHook =
+    Box<dyn Fn(&Arc<fluss::client::FlussConnection>) -> GatewayResult<()> + Send + Sync>;
+
+/// Owns the process-wide shared `FlussConnection` and rebuilds it when it dies.
+///
+/// `current()` always returns the live connection; callers must fetch it per
+/// operation (never cache it) so a swap is observed. `recover()` is **bounded**
+/// and **single-flight**: at most [`Self::MAX_ATTEMPTS`] rebuilds with exponential
+/// backoff, and within [`Self::COOLDOWN`] of a successful rebuild it is a no-op —
+/// so a burst of failed queries triggers exactly one rebuild, never an infinite
+/// loop. On success it swaps the new connection into every consumer (via the
+/// `on_swap` hook + the `ArcSwap` the backend reads) and closes the old one.
+pub struct ConnectionManager {
+    config: fluss::config::Config,
+    current: ArcSwap<fluss::client::FlussConnection>,
+    on_swap: SwapHook,
+    rebuild_lock: tokio::sync::Mutex<()>,
+    last_rebuilt: Mutex<Option<Instant>>,
+}
+
+impl ConnectionManager {
+    const MAX_ATTEMPTS: u32 = 3;
+    const BASE_BACKOFF: Duration = Duration::from_secs(1);
+    // Short window whose only job is to coalesce a thundering herd of queries that
+    // all observe the SAME dead connection within a few ms (one rebuild serves
+    // them all). Kept small so a genuinely new death seconds later can still
+    // rebuild — important because some upstream paths (e.g. dropped full scans)
+    // can re-kill the connection.
+    const COOLDOWN: Duration = Duration::from_secs(2);
+
+    pub fn new(
+        initial: Arc<fluss::client::FlussConnection>,
+        config: fluss::config::Config,
+        on_swap: SwapHook,
+    ) -> Self {
+        Self {
+            config,
+            current: ArcSwap::from(initial),
+            on_swap,
+            rebuild_lock: tokio::sync::Mutex::new(()),
+            last_rebuilt: Mutex::new(None),
+        }
+    }
+
+    /// The live shared connection. Fetch per operation; do not cache.
+    pub fn current(&self) -> Arc<fluss::client::FlussConnection> {
+        self.current.load_full()
+    }
+
+    /// Bounded, single-flight rebuild of a dead connection. Returns `Ok` once a
+    /// healthy connection is in place (rebuilt now, or rebuilt moments ago by a
+    /// racing caller); `Err` if all bounded attempts failed.
+    pub async fn recover(&self) -> GatewayResult<()> {
+        // Single-flight: only one rebuild runs at a time.
+        let _guard = self.rebuild_lock.lock().await;
+
+        // Coalesce a burst of failures: if we just rebuilt, the current connection
+        // is already fresh — do not thrash.
+        if let Some(t) = *self.last_rebuilt.lock().unwrap() {
+            if t.elapsed() < Self::COOLDOWN {
+                return Ok(());
+            }
+        }
+
+        let mut backoff = Self::BASE_BACKOFF;
+        let mut last_err: Option<String> = None;
+        for attempt in 1..=Self::MAX_ATTEMPTS {
+            tracing::warn!(
+                attempt,
+                max = Self::MAX_ATTEMPTS,
+                "rebuilding dead Fluss connection"
+            );
+            match fluss::client::FlussConnection::new(self.config.clone()).await {
+                Ok(conn) => {
+                    let new = Arc::new(conn);
+                    // Point byvalue consumers (FlussDatafusion) at the new connection.
+                    (self.on_swap)(&new)?;
+                    let old = self.current.swap(new);
+                    *self.last_rebuilt.lock().unwrap() = Some(Instant::now());
+                    tracing::info!("Fluss connection rebuilt and swapped in");
+                    // Close the dead connection in the background (best effort).
+                    tokio::spawn(async move {
+                        let _ = old.close(Duration::from_secs(5)).await;
+                    });
+                    return Ok(());
+                }
+                Err(e) => {
+                    last_err = Some(e.to_string());
+                    if attempt < Self::MAX_ATTEMPTS {
+                        tokio::time::sleep(backoff).await;
+                        backoff *= 2;
+                    }
+                }
+            }
+        }
+        Err(GatewayError::Backend(format!(
+            "Fluss connection rebuild failed after {} attempts: {}",
+            Self::MAX_ATTEMPTS,
+            last_err.unwrap_or_default()
+        )))
+    }
+}
+
 /// Resolves a (cluster, principal) pair to a shared Fluss connection handle.
 ///
-/// Phase 1 contract:
+/// Contract:
 /// - the returned handle is shared/reused per cluster across all callers;
 /// - `principal` is preserved but not consumed (shared proxy account, no doAs);
 /// - any backend/credential failure is mapped to a [`GatewayError`] here, at the
@@ -60,10 +191,10 @@ pub trait FlussConnectionProvider: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
-// Shared-proxy production provider (skeleton — real cluster access)
+// Shared-proxy production provider (real cluster access)
 // ---------------------------------------------------------------------------
 
-/// Phase 1 production provider: one shared proxy-account `FlussConnection` per
+/// Production provider: one shared proxy-account `FlussConnection` per
 /// cluster, lazily constructed from [`ClusterRegistry`] config and cached for
 /// reuse. `principal` is accepted and ignored (shared proxy account).
 ///
@@ -85,13 +216,10 @@ impl SharedProxyConnectionProvider {
         }
     }
 
-    /// Build a fluss-rs `Config` from gateway cluster config. Phase 1 only wires
-    /// bootstrap servers; SASL / per-user credentials are out of scope.
+    /// Build a fluss-rs `Config` from gateway cluster config (see
+    /// [`build_fluss_config`]).
     fn build_config(cfg: &ClusterConfig) -> fluss::config::Config {
-        fluss::config::Config {
-            bootstrap_servers: cfg.bootstrap_servers.clone(),
-            ..fluss::config::Config::default()
-        }
+        build_fluss_config(cfg)
     }
 }
 
@@ -238,5 +366,26 @@ mod tests {
         let res = p.resolve(&ClusterId("default".into()), &principal()).await;
         // Raw backend failure mapped to domain Backend, no leak of fluss-rs type.
         assert!(matches!(res, Err(GatewayError::Backend(_))));
+    }
+
+    #[test]
+    fn detects_dead_connection_markers() {
+        // The exact strings the fluss-rs RPC layer surfaces when a connection dies.
+        for s in [
+            "Fluss hitting unexpected rpc error connection error: ConnectionError(\"connection I/O task has stopped\")",
+            "connection closed before response",
+            "Connection is poisoned: ...",
+            "planning failed: External error: ... connection I/O task has stopped",
+        ] {
+            assert!(is_connection_dead(s), "should detect: {s}");
+        }
+        // Ordinary errors must NOT trigger a rebuild.
+        for s in [
+            "table not found: fluss.db.t",
+            "invalid argument: bad column type",
+            "Column indices cannot be empty",
+        ] {
+            assert!(!is_connection_dead(s), "should NOT detect: {s}");
+        }
     }
 }

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! P4 — pgwire protocol state machine (`handler`).
+//! pgwire protocol state machine (`handler`).
 //!
 //! Implements the three pgwire handler traits (`StartupHandler`,
 //! `SimpleQueryHandler`, `ExtendedQueryHandler`) plus `CancelHandler`, bridging
@@ -24,7 +24,7 @@
 //! delegated to `adapter`; statement routing is delegated to `compat`. The
 //! handler holds the per-connection session/operation state and the
 //! prepared-statement wire lifecycle — none of which leaks into `Instance`'s
-//! Operation model. Design: `design/sql-path.md` §P4.1/§P4.4/§P4.5/§P4.6.
+//! Operation model. Design: `design/sql-path.md`.
 
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -65,7 +65,7 @@ use super::compat::{self, StatementClass};
 ///
 /// One [`PgConnection`] exists per TCP connection (per session). It owns the
 /// session id assigned at startup and the backend `pid` used for out-of-band
-/// cancel. The prepared-statement / portal wire lifecycle (§P4.5) is NOT
+/// cancel. The prepared-statement / portal wire lifecycle is NOT
 /// duplicated here: pgwire's per-connection `MemPortalStore` (on the client's
 /// `DefaultClient`) owns named/anonymous statements and portals, removes them on
 /// `Close`, and is dropped when the connection ends. None of that leaks into
@@ -108,7 +108,7 @@ impl PgConnection {
 // server parameters
 // ---------------------------------------------------------------------------
 
-/// Minimal server-parameter set advertised at startup. UTF-8 only (§P4.2).
+/// Minimal server-parameter set advertised at startup. UTF-8 only.
 #[derive(Debug, Clone, Default)]
 pub struct PgServerParameters;
 
@@ -128,7 +128,7 @@ impl ServerParameterProvider for PgServerParameters {
 }
 
 // ---------------------------------------------------------------------------
-// startup / auth (cleartext-then-trust) (§P4.2)
+// startup / auth (cleartext-then-trust)
 // ---------------------------------------------------------------------------
 
 #[async_trait]
@@ -166,10 +166,10 @@ impl StartupHandler for PgConnection {
                     .cloned()
                     .unwrap_or_default();
                 let cred = adapter::credential_from_pg_login(&username, Some(pwd.password));
-                // cleartext-then-trust: the configured authenticator decides
-                // (Phase 1 = TrustAuthenticator). The protocol layer never owns
-                // the auth policy; it only adapts the wire handshake to a
-                // neutral Credential and maps any AuthError to a domain error.
+                // cleartext-then-trust: the configured authenticator decides.
+                // The protocol layer never owns the auth policy; it only adapts
+                // the wire handshake to a neutral Credential and maps any
+                // AuthError to a domain error.
                 let principal = self
                     .authenticator
                     .authenticate(cred)
@@ -201,7 +201,7 @@ impl StartupHandler for PgConnection {
 
 
 // ---------------------------------------------------------------------------
-// simple query (§P4.3 routing)
+// simple query
 // ---------------------------------------------------------------------------
 
 #[async_trait]
@@ -219,7 +219,7 @@ impl SimpleQueryHandler for PgConnection {
 }
 
 // ---------------------------------------------------------------------------
-// extended query (§P4.4/§P4.5)
+// extended query
 // ---------------------------------------------------------------------------
 
 #[async_trait]
@@ -231,7 +231,7 @@ impl ExtendedQueryHandler for PgConnection {
         // The statement is kept as the raw SQL string (NoopQueryParser); the PG
         // `ParameterDescription` / `RowDescription` are produced lazily by
         // `do_describe_statement` / `do_describe_portal` via `Instance.describe_sql`,
-        // not by parsing here (§P4.4).
+        // not by parsing here.
         Arc::new(NoopQueryParser)
     }
 
@@ -248,11 +248,11 @@ impl ExtendedQueryHandler for PgConnection {
     {
         // Statement carries the raw SQL (NoopQueryParser keeps it as a String).
         // The portal/statement themselves live in pgwire's MemPortalStore; each
-        // Execute maps to exactly one execute_sql (§P4.5).
+        // Execute maps to exactly one execute_sql.
         let sql = portal.statement.statement.clone();
         let format = result_format(portal);
-        // Decode the bound `$1..$N` parameters (PG wire text/binary -> ParamValues,
-        // §P4.4) so a parameterized statement executes with its actual values.
+        // Decode the bound `$1..$N` parameters (PG wire text/binary -> ParamValues)
+        // so a parameterized statement executes with its actual values.
         // Resolve the expected parameter types first so a client that left the
         // Parse OIDs blank (tokio-postgres / JDBC default) still decodes binary
         // values correctly against the gateway's inferred types.
@@ -310,7 +310,7 @@ impl PgConnection {
 
     /// Describe a statement's result columns and parameter types, mapping both to
     /// PG wire form: the `RowDescription` fields and the `ParameterDescription`
-    /// type OIDs (§P4.4). SET/SHOW/transaction-control statements have no result
+    /// type OIDs. SET/SHOW/transaction-control statements have no result
     /// columns and no parameters.
     async fn describe_fields(
         &self,
@@ -347,7 +347,7 @@ impl PgConnection {
     }
 
     /// Resolve the Arrow types of a statement's `$1..$N` placeholders via
-    /// `Instance.describe_sql` (§P4.4). Used to drive bind-parameter decoding when
+    /// `Instance.describe_sql`. Used to drive bind-parameter decoding when
     /// the client did not declare parameter OIDs in `Parse`. Non-passthrough
     /// statements (SET/SHOW/transaction control) have no parameters.
     async fn infer_param_types(
@@ -389,7 +389,7 @@ impl PgConnection {
                 if matches!(class, StatementClass::Discard) {
                     // DISCARD ALL resets ALL session vars to the connection's
                     // initial values and forces a rebuild before the next query
-                    // (§P4.3), not just search_path.
+                    //, not just search_path.
                     let session_id = self.require_session().map_err(to_pg_err)?;
                     self.instance
                         .alter_session(session_id, SessionMutation::ResetAll)
@@ -468,9 +468,9 @@ impl PgConnection {
                     adapter::row_description(schema.as_ref(), result_format)?,
                 );
 
-                // Drain the Arrow stream into PG DataRows. Phase 1 materializes
-                // here; cooperative cancel still applies because cancel acts on
-                // the operation/backend stream (P2), and a cancelled stream
+                // Drain the Arrow stream into PG DataRows, materializing here;
+                // cooperative cancel still applies because cancel acts on
+                // the operation/backend stream, and a cancelled stream
                 // surfaces an error we map below.
                 let mut rows: Vec<Result<_, PgWireError>> = Vec::new();
                 while let Some(batch) = stream.next().await {
@@ -514,7 +514,7 @@ fn set_to_mutation(name: &str, value: &str) -> SessionMutation {
 }
 
 /// Result column format requested by a portal (text unless the client asked for
-/// binary on every column). Phase 1 treats the format uniformly across columns.
+/// binary on every column). The format is treated uniformly across columns.
 fn result_format(portal: &Portal<String>) -> FieldFormat {
     if portal.result_column_format.format_for(0) == FieldFormat::Binary {
         FieldFormat::Binary
@@ -529,7 +529,7 @@ fn to_pg_err(err: GatewayError) -> PgWireError {
     PgWireError::UserError(Box::new(adapter::error_to_pg(&err)))
 }
 
-/// An unguessable-per-connection secret for the PG backend key (§P4.6). The
+/// An unguessable-per-connection secret for the PG backend key. The
 /// cancel registry rejects mismatches, so this only needs to be hard to guess
 /// across connections; `rand`'s thread RNG provides that without hand-rolling an
 /// entropy source.

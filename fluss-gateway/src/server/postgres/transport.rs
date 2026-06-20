@@ -15,12 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! P4 — PostgreSQL TCP transport (`transport`).
+//! PostgreSQL TCP transport (`transport`).
 //!
 //! Owns the listener / accept loop / per-connection task and nothing about SQL
-//! (§P4.1). Phase 1 is cleartext only; TLS is delegated to a fronting proxy, so
-//! `process_socket` is always called with `None` for the TLS acceptor — the
-//! seam is left open for a later in-process TLS option. Each accepted socket
+//!. Cleartext only; TLS is delegated to a fronting proxy, so
+//! `process_socket` is always called with `None` for the TLS acceptor. Each accepted socket
 //! gets its own [`PgConnection`] (no global shared session) plus a connection
 //! id used as the backend PID for the out-of-band cancel handshake.
 
@@ -101,12 +100,12 @@ impl PgServer {
             }),
         };
 
-        // Phase 1: cleartext only (no TLS acceptor). Errors are per-connection
+        // Cleartext only (no TLS acceptor). Errors are per-connection
         // and non-fatal to the server.
         let _ = pgwire::tokio::process_socket(socket, None, handlers).await;
 
         // Connection done: drop its cancel-key entry and close its session so a
-        // long-lived session does not leak when the client disconnects (§P2 close
+        // long-lived session does not leak when the client disconnects (close
         // semantics; a running operation is decoupled and not force-aborted here).
         self.cancels.remove(pid);
         if let Some(session_id) = connection.session_id() {
@@ -151,7 +150,7 @@ impl PgWireServerHandlers for PgHandlers {
 }
 
 /// Maps a PG `CancelRequest` (PID + secret) to `Instance.cancel_operation`
-/// (§P4.6). Verifies the secret via the shared registry; ignores cancels with
+///. Verifies the secret via the shared registry; ignores cancels with
 /// no running operation; rejects (silently, per the PG cancel protocol which has
 /// no reply) unknown pids / bad secrets.
 struct PgCancelHandler {

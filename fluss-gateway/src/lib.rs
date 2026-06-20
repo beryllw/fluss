@@ -17,10 +17,10 @@
 
 //! fluss-gateway — assembly entry point.
 //!
-//! Phase 1 scope: PostgreSQL read-only SQL + REST direct write + read-only
+//! Provides PostgreSQL read-only SQL + REST direct write + read-only
 //! metadata. The gateway core is protocol-agnostic; `Instance` is the unified
 //! facade and protocol modules only handle transport / adaptation. See
-//! `DESIGN.md` and `design/infra.md` §P8 for the module skeleton rationale.
+//! `DESIGN.md` and `design/infra.md` for the module structure rationale.
 
 pub mod error;
 pub mod types;

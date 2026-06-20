@@ -15,26 +15,26 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! P6 — BackendFacade + metadata read API.
+//! BackendFacade + metadata read API.
 //!
 //! The direct-path backend: orchestrates direct read/write intents onto Fluss
 //! and exposes read-only metadata (list_databases / list_tables / get_table_info
 //! with a TTL cache). The SQL path does NOT go through here — it goes through
 //! fluss-datafusion; the two paths only converge at the connection layer, never
-//! at the backend layer. Design: `design/infra.md` §P6.2–P6.4, §P6.7.
+//! at the backend layer. Design: `design/infra.md`.
 //!
-//! ## Two metadata caches (known drift; design/infra.md §P6.4)
+//! ## Two metadata caches (known drift; design/infra.md)
 //! This facade owns a metadata cache that serves the REST metadata endpoints and
 //! the PG `pg_catalog` overlay. fluss-datafusion owns a *separate* internal
 //! metadata cache that serves SQL planning; the gateway cannot and should not
 //! reach into it (parallel-development contract). Both ultimately derive from the
-//! same Fluss cluster, so they can briefly disagree. Phase 1 stance: do not share
+//! same Fluss cluster, so they can briefly disagree. The stance here: do not share
 //! one cache across the crate boundary, align TTLs on both sides, and treat
 //! "SQL view vs REST view may momentarily drift" as a *known, accepted* risk —
 //! no cross-cache invalidation broadcast. The cache TTL here is the gateway-side
 //! knob that should be configured to match fluss-datafusion's.
 //!
-//! ## Error boundary (design/infra.md §P6.7)
+//! ## Error boundary (design/infra.md)
 //! This is the backend→domain mapping boundary: raw fluss-rs / fluss-datafusion
 //! errors are mapped to [`GatewayError`] *at the entry of every method here*. No
 //! raw backend error type escapes upward; the protocol layer later maps
@@ -55,35 +55,35 @@ mod row_convert;
 pub use row_convert::batch_to_generic_rows;
 
 /// Default metadata cache TTL. Should be aligned with fluss-datafusion's own
-/// metadata cache TTL (design/infra.md §P6.4) to bound SQL/REST view drift.
+/// metadata cache TTL (design/infra.md) to bound SQL/REST view drift.
 pub const DEFAULT_METADATA_CACHE_TTL: Duration = Duration::from_secs(30);
 
 /// The direct-path backend and the gateway's single internal metadata source.
 ///
-/// Responsibilities (design/infra.md §P6.2–P6.3):
+/// Responsibilities (design/infra.md):
 /// - orchestrate direct *writes* (`KvUpsert` / `KvDelete` / `LogAppend`) onto the
 ///   Fluss client, returning a domain [`DirectWriteResult`];
 /// - expose read-only metadata (`list_databases` / `list_tables` /
 ///   `get_table_info`), produced Arrow-/domain-native and TTL-cached;
-/// - `read` (lookup/scan) is deferred this phase (see [`BackendFacade::read`]).
+/// - `read` (lookup/scan) is not supported (see [`BackendFacade::read`]).
 ///
 /// Not its job: SQL planning/pushdown (fluss-datafusion), protocol encoding,
 /// session/operation lifecycle.
 ///
-/// `MetadataService` is intentionally *not* a separate type in MVP, but the three
+/// `MetadataService` is intentionally *not* a separate type, but the three
 /// metadata methods form a self-contained logical surface so it can be split out
-/// later without changing callers (design/infra.md §P6.3).
+/// later without changing callers (design/infra.md).
 #[async_trait]
 pub trait BackendFacade: Send + Sync {
-    // --- direct write orchestration (design/infra.md §P6.2) ---
+    // --- direct write orchestration (design/infra.md) ---
 
     /// Orchestrate a direct write onto the backend. At-least-once semantics: a
     /// success means the backend acked; a mid-flight failure may have partially
-    /// written and is not rolled back (direct-path.md §6). The request body is
+    /// written and is not rolled back (direct-path.md). The request body is
     /// already decoded to Arrow-native at the REST boundary.
     async fn write(&self, request: DirectWriteRequest) -> GatewayResult<DirectWriteResult>;
 
-    // --- metadata read surface (design/infra.md §P6.3) ---
+    // --- metadata read surface (design/infra.md) ---
 
     /// List database names visible in the cluster.
     async fn list_databases(&self, scope: &MetadataScope) -> GatewayResult<Vec<String>>;
@@ -125,26 +125,25 @@ pub trait BackendFacade: Send + Sync {
         Err(GatewayError::Unsupported("drop_table not supported".into()))
     }
 
-    // --- direct read (DEFERRED this phase) ---
+    // --- direct read (not supported) ---
 
-    /// Direct read (lookup / scan) is deferred in Phase 1 (TASKS §7 Backlog): the
-    /// REST read endpoints are placeholders. The method stays on the trait so the
-    /// shape is frozen and P5 can wire it without changing the trait; the default
-    /// impl rejects it as `Unsupported`. Implementations must NOT implement it
-    /// this phase.
+    /// Direct read (lookup / scan) is not supported: reads go through the
+    /// PostgreSQL SQL path, and the REST read endpoints are placeholders. The
+    /// method stays on the trait so the shape is frozen; the default impl rejects
+    /// it as `Unsupported`. Implementations do not implement it.
     async fn read(&self, _request: DirectReadRequest) -> GatewayResult<DirectReadResult> {
         Err(GatewayError::Unsupported(
-            "direct read is deferred in Phase 1".to_string(),
+            "direct read is not supported".to_string(),
         ))
     }
 }
 
 // ---------------------------------------------------------------------------
-// Real Fluss-backed facade (skeleton)
+// Real Fluss-backed facade
 // ---------------------------------------------------------------------------
 
-/// Phase 1 production facade backed by a real shared `FlussConnection`
-/// (design/infra.md §P6.2/§P6.5, direct-path.md §P5).
+/// Production facade backed by a shared `FlussConnection`
+/// (design/infra.md, direct-path.md).
 ///
 /// Direct writes are orchestrated onto the Fluss client:
 /// - `KvUpsert` / `KvDelete`: per-row `RecordBatch -> GenericRow` conversion
@@ -152,29 +151,28 @@ pub trait BackendFacade: Send + Sync {
 /// - `LogAppend`: the `RecordBatch` is handed straight to an `AppendWriter` via
 ///   `append_arrow_batch`, then `flush()`.
 ///
-/// at-least-once (direct-path.md §6): a returned `Ok` means `flush()` acked. A
+/// at-least-once (direct-path.md): a returned `Ok` means `flush()` acked. A
 /// mid-flight failure may have partially written and is NOT rolled back. The
-/// writer is created per request (Phase 1 ingest volumes are modest); a pooled /
-/// long-lived writer is a later refinement.
+/// writer is created per request; a pooled / long-lived writer is a later
+/// refinement.
 ///
 /// Metadata reads go through `connection.get_admin()`. Every raw fluss-rs error
 /// is mapped to a [`GatewayError`] right here — this is the backend→domain
 /// boundary; no fluss-rs error type escapes upward.
 ///
-/// Not unit-tested (no live cluster in CI): the live path is compile-checked
-/// here and is left for the final end-to-end task (write -> readback against a
-/// real Fluss cluster). Trait *behavior* (caching, error mapping) is covered by
+/// Live behavior (write -> readback against a real Fluss cluster) is covered by
+/// the cluster e2e tests. Trait *behavior* (caching, error mapping) is covered by
 /// [`tests`]'s in-memory fake.
 pub struct FlussBackendFacade {
-    connection: Arc<fluss::client::FlussConnection>,
+    conn: Arc<crate::connection::ConnectionManager>,
     #[allow(dead_code)]
     metadata_cache_ttl: Duration,
 }
 
 impl FlussBackendFacade {
-    pub fn new(connection: Arc<fluss::client::FlussConnection>) -> Self {
+    pub fn new(conn: Arc<crate::connection::ConnectionManager>) -> Self {
         Self {
-            connection,
+            conn,
             metadata_cache_ttl: DEFAULT_METADATA_CACHE_TTL,
         }
     }
@@ -184,8 +182,13 @@ impl FlussBackendFacade {
         self
     }
 
+    /// The cached admin handle on the live connection. `get_admin` returns an
+    /// owned `Arc<FlussAdmin>` that keeps the RPC machinery alive on its own, so
+    /// the transient connection handle from `current()` does not need to outlive
+    /// this call.
     fn admin(&self) -> GatewayResult<Arc<fluss::client::FlussAdmin>> {
-        self.connection
+        self.conn
+            .current()
             .get_admin()
             .map_err(|e| GatewayError::Backend(format!("get_admin: {e}")))
     }
@@ -244,11 +247,16 @@ impl FlussBackendFacade {
         Ok(n)
     }
 
-    /// Resolve the table handle once, mapping a missing table to `TableNotFound`.
-    async fn table_handle(&self, table: &TableRef) -> GatewayResult<fluss::client::FlussTable<'_>> {
+    /// Resolve the table handle, mapping a missing table to `TableNotFound`. The
+    /// returned `FlussTable` borrows `conn`, so the caller must hold the connection
+    /// handle (from `self.conn.current()`) for the duration of the operation.
+    async fn table_handle<'a>(
+        &self,
+        conn: &'a fluss::client::FlussConnection,
+        table: &TableRef,
+    ) -> GatewayResult<fluss::client::FlussTable<'a>> {
         let path = fluss::metadata::TablePath::new(table.database.clone(), table.table.clone());
-        self.connection
-            .get_table(&path)
+        conn.get_table(&path)
             .await
             .map_err(|e| map_table_err(table, e))
     }
@@ -274,14 +282,18 @@ fn map_table_err(table: &TableRef, e: fluss::error::Error) -> GatewayError {
 #[async_trait]
 impl BackendFacade for FlussBackendFacade {
     async fn write(&self, request: DirectWriteRequest) -> GatewayResult<DirectWriteResult> {
+        // Hold the live connection for the whole op so the borrowed `FlussTable`
+        // handles stay valid even if a concurrent recovery swaps the manager's
+        // connection.
+        let conn = self.conn.current();
         let rows_written = match request {
             // REST `records` always arrives as KvUpsert (the transport does not
             // know the table kind). The backend reinterprets it against the
             // resolved table: a PK table upserts, a PK-less (Log) table appends.
             // This is the "backend reinterprets KvUpsert as LogAppend for a Log
-            // table" contract documented on the REST handler (server/rest §3).
+            // table" contract documented on the REST handler (server/rest).
             DirectWriteRequest::KvUpsert { table, rows, .. } => {
-                let handle = self.table_handle(&table).await?;
+                let handle = self.table_handle(&conn, &table).await?;
                 if handle.get_table_info().has_primary_key() {
                     self.kv_write(&handle, &rows, false).await?
                 } else {
@@ -289,11 +301,11 @@ impl BackendFacade for FlussBackendFacade {
                 }
             }
             DirectWriteRequest::KvDelete { table, keys, .. } => {
-                let handle = self.table_handle(&table).await?;
+                let handle = self.table_handle(&conn, &table).await?;
                 self.kv_write(&handle, &keys, true).await?
             }
             DirectWriteRequest::LogAppend { table, rows, .. } => {
-                let handle = self.table_handle(&table).await?;
+                let handle = self.table_handle(&conn, &table).await?;
                 self.log_append(&handle, rows).await?
             }
         };

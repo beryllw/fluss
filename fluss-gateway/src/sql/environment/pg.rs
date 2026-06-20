@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! P3.3 — [`PgSqlEnvironmentProvider`]: the PostgreSQL SQL environment.
+//! [`PgSqlEnvironmentProvider`]: the PostgreSQL SQL environment.
 //!
-//! Implements the fixed 5-step assembly order (design §P3.3). The order is a
+//! Implements the fixed 5-step assembly order. The order is a
 //! contract and is pinned by the tests in this module:
 //!
 //! ```text
@@ -28,10 +28,12 @@
 //! 5. apply the initial SessionVars snapshot (timezone / search_path / schema / app)
 //! ```
 //!
-//! Steps 2 and 4 reach capabilities not built in Phase 1 (`fluss-datafusion`,
-//! P6 metadata) and are injected as seams (see [`collaborators`]). Step 3 uses
-//! the real `datafusion-pg-catalog` crate. The provider holds no per-session
-//! state; [`SessionVars`] is the single source of truth.
+//! Steps 2 and 4 are injected as seams (see [`collaborators`]) so the assembly
+//! order stays observable and unit-testable. Step 2 is backed by the real
+//! `fluss-datafusion` catalog installer; step 4 (the Fluss-specific pg_catalog
+//! overlay) is still a stub. Step 3 uses the real `datafusion-pg-catalog` crate.
+//! The provider holds no per-session state; [`SessionVars`] is the single source
+//! of truth.
 
 use std::sync::Arc;
 
@@ -48,11 +50,11 @@ use crate::sql::environment::collaborators::{
 use crate::sql::environment::provider::SqlEnvironmentProvider;
 use crate::types::{SessionMutation, SessionMutationEffect};
 
-/// The catalog name the Fluss catalog is registered under (design §P3.3 step 2;
+/// The catalog name the Fluss catalog is registered under (design step 2;
 /// contract D1 `register_catalog(&ctx, "fluss", ...)`).
 pub const FLUSS_CATALOG: &str = "fluss";
 
-/// PostgreSQL SQL environment provider (design §P3.3).
+/// PostgreSQL SQL environment provider.
 ///
 /// Holds the shared, cross-session collaborators (heavy objects live behind the
 /// seams, not per session). No per-session state lives here.
@@ -62,8 +64,8 @@ pub struct PgSqlEnvironmentProvider {
 }
 
 impl PgSqlEnvironmentProvider {
-    /// Construct with explicit collaborators (used by tests and, later, by real
-    /// wiring that injects the `fluss-datafusion` installer and P6 overlay).
+    /// Construct with explicit collaborators (used by tests and by production
+    /// wiring that injects the `fluss-datafusion` installer and pg_catalog overlay).
     pub fn new(
         fluss_catalog: Arc<dyn FlussCatalogInstaller>,
         overlay: Arc<dyn PgCatalogOverlayInstaller>,
@@ -74,8 +76,10 @@ impl PgSqlEnvironmentProvider {
         }
     }
 
-    /// Phase 1 default: stub Fluss catalog + no-op overlay (real capabilities not
-    /// landed). Step 3 still uses the real `datafusion-pg-catalog`.
+    /// Test default: stub Fluss catalog + no-op overlay, for exercising the
+    /// assembly order without a live cluster. Step 3 still uses the real
+    /// `datafusion-pg-catalog`. Production wires the real `fluss-datafusion`
+    /// catalog installer via [`PgSqlEnvironmentProvider::new`].
     pub fn with_stubs() -> Self {
         Self::new(
             Arc::new(StubFlussCatalogInstaller),
@@ -132,7 +136,8 @@ impl SqlEnvironmentProvider for PgSqlEnvironmentProvider {
         // Only ApplyToExistingContext mutations are acted on here; the rest are a
         // no-op (SessionOnly never reaches a provider; RebuildContextBeforeNextQuery
         // is handled by dirty + the next prepare_session_context). We re-classify
-        // (without mutating vars — that already happened in P2) to filter.
+        // (without mutating vars — that already happened in the session layer) to
+        // filter.
         if classify_effect(mutation) != SessionMutationEffect::ApplyToExistingContext {
             return Ok(());
         }
@@ -142,10 +147,10 @@ impl SqlEnvironmentProvider for PgSqlEnvironmentProvider {
     }
 }
 
-/// Classify a mutation's effect WITHOUT mutating vars. Mirrors the P2 vars
-/// classification (`session::vars`); used only to filter which mutations the
-/// provider acts on. P3 does not re-implement the classification table — it
-/// applies the same rules read-only here.
+/// Classify a mutation's effect WITHOUT mutating vars. Mirrors the
+/// classification in `session::vars`; used only to filter which mutations the
+/// provider acts on. This module does not re-implement the classification table —
+/// it applies the same rules read-only here.
 fn classify_effect(mutation: &SessionMutation) -> SessionMutationEffect {
     let mut vars = crate::types::SessionVars::default();
     apply_vars_mutation(&mut vars, mutation)
@@ -235,7 +240,7 @@ mod tests {
         )
     }
 
-    /// Test 1 (§P3.3, the most important): the 5 steps run in the contract order.
+    /// Test 1: the 5 steps run in the contract order.
     /// fluss catalog (step 2) BEFORE pg_catalog base (step 3) BEFORE overlay
     /// (step 4); vars (step 5) last. The recorder pins 2 -> 4; base (3) is proven
     /// to be between them because it requires the fluss catalog to exist (it would
@@ -329,7 +334,7 @@ mod tests {
         let ctx = SessionContext::new();
         provider.prepare_session_context(&s, &ctx).await.unwrap();
 
-        // P2 already updated vars; emulate that, then call the provider.
+        // The session layer already updated vars; emulate that, then call the provider.
         s.vars().write().unwrap().timezone = Some("Asia/Shanghai".into());
         provider
             .apply_session_mutation(&s, &ctx, &SessionMutation::SetTimezone(Some("Asia/Shanghai".into())))

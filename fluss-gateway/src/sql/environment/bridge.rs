@@ -15,16 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! P3.4 — bridge the [`SqlEnvironmentRegistry`] + provider onto the P2
+//! Bridge the [`SqlEnvironmentRegistry`] + provider onto the
 //! [`SessionContextBuilder`] rebuild seam.
 //!
-//! P2's `GatewaySession::context_for_query` builds/rebuilds through an injected
+//! `GatewaySession::context_for_query` builds/rebuilds through an injected
 //! [`SessionContextBuilder`]. This bridge implements that seam by: ① picking the
 //! provider for the session's `sql_environment` from the registry, ② creating a
 //! clean `SessionContext` (assembly step 1), ③ running the provider's full
 //! `prepare_session_context` (steps 2..5). Because step 5 re-applies the latest
 //! `SessionVars` snapshot, dirty -> rebuild naturally restores state with no
-//! mutation replay (design §P3.3 step 5).
+//! mutation replay (design step 5).
 //!
 //! The bridge is constructed per session (it captures the session's
 //! `sql_environment`) but holds no mutable per-session state; the registry and
@@ -40,7 +40,7 @@ use crate::session::{GatewaySession, SessionContextBuilder};
 use crate::sql::environment::registry::SqlEnvironmentRegistry;
 use crate::types::{SessionVars, SqlEnvironmentId};
 
-/// Adapts a shared registry + a session's environment id into a P2 builder.
+/// Adapts a shared registry + a session's environment id into a context builder.
 pub struct EnvironmentContextBuilder {
     registry: Arc<SqlEnvironmentRegistry>,
     sql_environment: SqlEnvironmentId,
@@ -153,11 +153,11 @@ mod tests {
         let s = session(Some(SqlEnvironmentId("postgres".into())));
         let bridge = EnvironmentContextBuilder::new(Arc::clone(&reg), Arc::clone(&s)).unwrap();
 
-        // Drive the P2 seam directly.
+        // Drive the builder seam directly.
         let _ctx = bridge.build(&SessionVars::default(), None).await.unwrap();
         assert_eq!(provider.prepared.load(Ordering::Acquire), 1);
 
-        // And via the real P2 rebuild path: first query builds once.
+        // And via the real session rebuild path: first query builds once.
         let _c = s.context_for_query(&bridge).await.unwrap();
         assert_eq!(provider.prepared.load(Ordering::Acquire), 2);
         assert_eq!(s.generation(), 1);

@@ -15,15 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! P2.1 / P2.5 / P2.6 / P2.9 — connection-scoped [`GatewaySession`].
+//! Connection-scoped [`GatewaySession`].
 //!
 //! Holds the read-only connection identity, the mutable [`SessionVars`] (single
 //! source of truth), the per-session [`OperationManager`], and the lazy /
-//! dirty-rebuild `SessionContext` state machine. The *actual* construction of a
-//! `SessionContext` (installing fluss-datafusion + the SQL environment) is P3;
-//! P2 only models the lazy/dirty/generation lifecycle and the pointer-swap
-//! semantics, behind an injected [`SessionContextBuilder`] seam so it is testable
-//! without building a real context.
+//! dirty-rebuild `SessionContext` state machine. The actual construction of a
+//! `SessionContext` (installing fluss-datafusion + the SQL environment) is
+//! performed by the SQL environment provider behind an injected
+//! [`SessionContextBuilder`] seam; this module models the lazy/dirty/generation
+//! lifecycle and the pointer-swap semantics independently of that builder.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock as SyncRwLock};
@@ -40,20 +40,19 @@ use crate::types::{
     SessionSnapshot, SessionVars, SqlEnvironmentId,
 };
 
-/// P2/P3 seam: builds a `SessionContext` from the current [`SessionVars`].
+/// Seam: builds a `SessionContext` from the current [`SessionVars`].
 ///
-/// In P2 the gateway does not assemble a real context (no catalog / SQL
-/// environment). This trait is the injection point the P3 environment provider
-/// implements; P2 tests supply a fake builder to exercise the dirty -> rebuild ->
-/// generation lifecycle without touching DataFusion catalog wiring.
+/// This trait is the injection point the SQL environment provider implements;
+/// tests supply a fake builder to exercise the dirty -> rebuild -> generation
+/// lifecycle without touching DataFusion catalog wiring.
 ///
-/// `build` is async because the real P3 assembly (`prepare_session_context`,
-/// design §P3.1) installs catalogs / pg_catalog asynchronously; the rebuild path
+/// `build` is async because the real assembly (`prepare_session_context`)
+/// installs catalogs / pg_catalog asynchronously; the rebuild path
 /// (`context_for_query`) is already async, so the seam stays async end-to-end.
 #[async_trait::async_trait]
 pub trait SessionContextBuilder: Send + Sync {
     /// Build a fresh context for `vars`. The previous context (if any) is passed
-    /// so an implementation may reuse shared heavy objects; P2 ignores it.
+    /// so an implementation may reuse shared heavy objects.
     async fn build(
         &self,
         vars: &SessionVars,
@@ -68,8 +67,8 @@ fn epoch_millis(t: SystemTime) -> u64 {
         .as_millis() as u64
 }
 
-/// Connection-scoped session object (design §P2.1). Created per PostgreSQL
-/// connection; the direct path never constructs one.
+/// Connection-scoped session object (design `core-session.md`). Created per
+/// PostgreSQL connection; the direct path never constructs one.
 pub struct GatewaySession {
     pub id: SessionId,
     pub principal: Principal,
@@ -87,7 +86,7 @@ pub struct GatewaySession {
     sql_context_generation: AtomicU64,
     /// Set when a mutation requires a rebuild before the next query.
     sql_context_dirty: AtomicBool,
-    /// Set on close; blocks new describe/execute/alter (design §P2.6).
+    /// Set on close; blocks new describe/execute/alter.
     closed: AtomicBool,
     pub created_at: SystemTime,
     /// Epoch-millis of last access; updated by the manager on session ops.
@@ -96,7 +95,7 @@ pub struct GatewaySession {
 
 impl GatewaySession {
     /// Construct a session in the lazy state: `sql_context = None`, generation 0,
-    /// not dirty (design §P2.5).
+    /// not dirty.
     pub fn new(
         id: SessionId,
         principal: Principal,
@@ -148,8 +147,7 @@ impl GatewaySession {
         self.last_access_at.load(Ordering::Acquire)
     }
 
-    /// Refresh `last_access_at` to now (design §P2.11: open/get/alter/describe/
-    /// execute).
+    /// Refresh `last_access_at` to now (open/get/alter/describe/execute).
     pub fn touch(&self) {
         self.last_access_at
             .store(epoch_millis(SystemTime::now()), Ordering::Release);
@@ -167,7 +165,7 @@ impl GatewaySession {
         }
     }
 
-    /// §P2.3 / §P2.4 — apply a mutation: ① update vars, ② classify effect,
+    /// Apply a mutation: ① update vars, ② classify effect,
     /// ③ let the caller decide whether to live-apply or lazily rebuild. Only
     /// `RebuildContextBeforeNextQuery` sets the dirty flag here. Idempotent.
     pub fn apply_mutation(&self, mutation: &SessionMutation) -> SessionMutationEffect {
@@ -207,7 +205,7 @@ impl GatewaySession {
         self.sql_context_dirty.store(false, Ordering::Release);
     }
 
-    /// §P2.5 — obtain the context for the next query, building or rebuilding as
+    /// Obtain the context for the next query, building or rebuilding as
     /// needed:
     ///
     /// - `None` (lazy, first use) -> build, generation += 1.
@@ -234,7 +232,7 @@ impl GatewaySession {
         }
     }
 
-    /// §P2.6 — close the session: mark closed (rejecting new describe/execute/
+    /// Close the session: mark closed (rejecting new describe/execute/
     /// alter) and request cancel on all active operations. Does not wait for
     /// operations to drain; the manager removes the session from its registry.
     pub fn close(&self) {
@@ -243,7 +241,7 @@ impl GatewaySession {
     }
 }
 
-/// §P2.9 — effective gateway deadline duration:
+/// Effective gateway deadline duration:
 /// `min(statement_timeout, request_timeout_override)`. `None` for both means no
 /// extra gateway deadline; one present means that value; both present means the
 /// smaller.
@@ -284,8 +282,8 @@ mod tests {
     }
 
     /// Fake builder: counts builds and produces a fresh empty `SessionContext`.
-    /// P2 does NOT assemble a real catalog/environment; this stands in for the P3
-    /// provider so the dirty/rebuild lifecycle is testable.
+    /// It stands in for the SQL environment provider so the dirty/rebuild
+    /// lifecycle is testable without assembling a real catalog/environment.
     struct CountingBuilder {
         builds: AtomicUsize,
     }
@@ -311,7 +309,7 @@ mod tests {
         }
     }
 
-    // §P2.5 — lazy init: no context until first query, then generation 1.
+    // Lazy init: no context until first query, then generation 1.
     #[tokio::test]
     async fn lazy_build_on_first_query() {
         let s = session(SessionVars::default());
@@ -326,7 +324,7 @@ mod tests {
         assert_eq!(s.generation(), 1);
     }
 
-    // §P2.4 / §P2.5 — RebuildContextBeforeNextQuery sets dirty; next query
+    // RebuildContextBeforeNextQuery sets dirty; next query
     // rebuilds (generation++), dirty resets, old Arc stays alive.
     #[tokio::test]
     async fn rebuild_mutation_sets_dirty_and_rebuilds() {
@@ -348,7 +346,7 @@ mod tests {
         assert!(Arc::strong_count(&first) >= 1);
     }
 
-    // §P2.4 — SessionOnly mutation does NOT set dirty.
+    // SessionOnly mutation does NOT set dirty.
     #[tokio::test]
     async fn session_only_mutation_does_not_set_dirty() {
         let s = session(SessionVars::default());
@@ -389,7 +387,7 @@ mod tests {
         assert_eq!(snap1, snap2);
     }
 
-    // §P4.3 — ResetAll (DISCARD ALL) restores the connection's initial vars and
+    // ResetAll (DISCARD ALL) restores the connection's initial vars and
     // forces a rebuild before the next query.
     #[tokio::test]
     async fn reset_all_restores_initial_vars_and_rebuilds() {
@@ -426,7 +424,7 @@ mod tests {
         assert!(!s.is_dirty());
     }
 
-    // §P2.6 — close marks closed and cancels active ops.
+    // close marks closed and cancels active ops.
     #[test]
     fn close_marks_closed() {
         let s = session(SessionVars::default());
@@ -435,7 +433,7 @@ mod tests {
         assert!(s.is_closed());
     }
 
-    // §P2.9 — effective_timeout min logic, all branches.
+    // effective_timeout min logic, all branches.
     #[test]
     fn effective_timeout_branches() {
         assert_eq!(effective_timeout(None, None), None);

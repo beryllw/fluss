@@ -15,13 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! T2/T4 — REST direct-path integration tests (P5).
+//! REST direct-path integration tests.
 //!
 //! Drives the spawned REST frontend with a real HTTP client (`reqwest`) over
 //! loopback TCP, against the `FakeInstance` in `harness`. Covers the P5
 //! completion criteria: direct write (KvUpsert / KvDelete / LogAppend) over both
 //! body encodings (JSON rows + Arrow IPC stream), the three read-only metadata
-//! endpoints, the domain→HTTP error map (404 / 501 / 401), the deferred read
+//! endpoints, the domain→HTTP error map (404 / 501 / 401), the unsupported read
 //! endpoints returning 501, and the semantic guarantee that a direct request
 //! creates no session. No Fluss cluster is required.
 
@@ -37,7 +37,7 @@ use sha2::Digest;
 const JSON: &str = "application/json";
 const ARROW: &str = "application/vnd.apache.arrow.stream";
 
-/// Basic auth header for `user` with an ignored password (Phase 1 trust).
+/// Basic auth header for `user` with an ignored password (trust mode).
 fn basic(user: &str) -> String {
     basic_with_password(user, "ignored")
 }

@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! P2.3 / P2.4 — apply a [`SessionMutation`] to [`SessionVars`] and classify its
+//! Apply a [`SessionMutation`] to [`SessionVars`] and classify its
 //! runtime effect.
 //!
-//! Processing order is fixed (design §P2.4): ① update `SessionVars` first, then
+//! Processing order is fixed: ① update `SessionVars` first, then
 //! ② compute the [`SessionMutationEffect`]. `SessionVars` is the single source of
 //! truth; this function never mutates runtime context, only the vars. Applying
 //! the same mutation twice is idempotent: the resulting vars and effect are
@@ -31,7 +31,7 @@ use crate::types::{SessionMutation, SessionMutationEffect, SessionVars};
 ///
 /// Idempotent: applying the same mutation again yields the same `vars` state and
 /// the same [`SessionMutationEffect`]. Only `SessionVars` is touched here; the
-/// caller is responsible for acting on the returned effect (design §P2.4).
+/// caller is responsible for acting on the returned effect.
 pub fn apply_session_mutation(
     vars: &mut SessionVars,
     mutation: &SessionMutation,
@@ -76,9 +76,9 @@ pub fn apply_session_mutation(
     }
 }
 
-/// Classify the runtime effect of a namespaced environment variable (design
-/// §P2.4). Only resolution-affecting keys force a rebuild; display-oriented keys
-/// stay session-local.
+/// Classify the runtime effect of a namespaced environment variable. Only
+/// resolution-affecting keys force a rebuild; display-oriented keys stay
+/// session-local.
 fn classify_environment_key(key: &str) -> SessionMutationEffect {
     match key {
         // search_path affects unqualified name resolution -> rebuild.
@@ -100,7 +100,7 @@ mod tests {
     use crate::types::SessionVarValue;
     use std::time::Duration;
 
-    // §P2.4 — SessionOnly: statement_timeout.
+    // SessionOnly: statement_timeout.
     #[test]
     fn statement_timeout_is_session_only() {
         let mut vars = SessionVars::default();
@@ -112,7 +112,7 @@ mod tests {
         assert_eq!(vars.statement_timeout, Some(Duration::from_secs(5)));
     }
 
-    // §P2.4 — ApplyToExistingContext: timezone.
+    // ApplyToExistingContext: timezone.
     #[test]
     fn timezone_applies_to_existing_context() {
         let mut vars = SessionVars::default();
@@ -124,7 +124,7 @@ mod tests {
         assert_eq!(vars.timezone.as_deref(), Some("UTC"));
     }
 
-    // §P2.4 — RebuildContextBeforeNextQuery: current_catalog / current_schema.
+    // RebuildContextBeforeNextQuery: current_catalog / current_schema.
     #[test]
     fn catalog_and_schema_force_rebuild() {
         let mut vars = SessionVars::default();
@@ -147,7 +147,7 @@ mod tests {
         assert_eq!(vars.current_schema.as_deref(), Some("public"));
     }
 
-    // §P2.4 — pg.search_path forces rebuild; display GUCs do not.
+    // pg.search_path forces rebuild; display GUCs do not.
     #[test]
     fn environment_var_classification() {
         let mut vars = SessionVars::default();
@@ -195,7 +195,7 @@ mod tests {
         assert!(!vars.environment.contains_key("pg.search_path"));
     }
 
-    // §P2.4 — apply_session_mutation must be idempotent.
+    // apply_session_mutation must be idempotent.
     #[test]
     fn applying_same_mutation_twice_is_idempotent() {
         let mut vars_a = SessionVars::default();

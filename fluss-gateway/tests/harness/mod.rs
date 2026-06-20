@@ -15,14 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! T1-T4 — shared integration test harness.
+//! Shared integration test harness.
 //!
 //! Provides a `FakeInstance` ([`GatewayInstance`]) and a spawned PostgreSQL
 //! frontend so protocol behavior can be driven by a real wire client
-//! (`tokio-postgres`) over loopback TCP with no Fluss cluster (P4 test
-//! strategy). `FakeInstance` returns deterministic Arrow results for fixed
+//! (`tokio-postgres`) over loopback TCP with no Fluss cluster. The test
+//! strategy: `FakeInstance` returns deterministic Arrow results for fixed
 //! SELECTs, treats SET/SHOW/BEGIN as `Command`, and records cancel calls. The
-//! REST frontend (P5) reuses the same `FakeInstance`, which additionally records
+//! REST frontend reuses the same `FakeInstance`, which additionally records
 //! direct writes and opened-session counts.
 //!
 //! Each integration test binary includes this module, so items used by only one

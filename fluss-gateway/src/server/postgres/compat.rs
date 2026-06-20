@@ -15,13 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! P4 — PostgreSQL BI/IDE compatibility classification (`compat`).
+//! PostgreSQL BI/IDE compatibility classification (`compat`).
 //!
 //! Pure, side-effect-free classification of an incoming SQL string into a
 //! [`StatementClass`]. The wire/encoding work lives in `adapter`; this module
 //! only decides *what* the statement is so the handler can route it.
 //!
-//! Design principle (`design/sql-path.md` §P4.3): **prefer answering from the
+//! Design principle (`design/sql-path.md`): **prefer answering from the
 //! real `pg_catalog` over rewriting**. The interception list here is therefore
 //! deliberately small and explicit — only statements that DataFusion / the real
 //! catalog cannot answer (session-local `SET`/`SHOW`, autocommit transaction
@@ -220,15 +220,15 @@ pub enum StatementClass {
     Set { name: String, value: String },
     /// `SHOW <var>` — read from `SessionVars`, reply with a single-row result.
     Show { name: String },
-    /// `BEGIN` / `START TRANSACTION` — Phase 1 autocommit no-op.
+    /// `BEGIN` / `START TRANSACTION` — autocommit no-op.
     Begin,
-    /// `COMMIT` / `END` — Phase 1 autocommit no-op.
+    /// `COMMIT` / `END` — autocommit no-op.
     Commit,
-    /// `ROLLBACK` / `ABORT` — Phase 1 autocommit no-op.
+    /// `ROLLBACK` / `ABORT` — autocommit no-op.
     Rollback,
     /// `DISCARD ALL` / `DISCARD ...` — session reset (vars + rebuild).
     Discard,
-    /// A write / DDL statement — rejected with `Unsupported` (read-only phase).
+    /// A write / DDL statement — rejected with `Unsupported` (read-only path).
     Write,
     /// Any other statement (normal `SELECT`, catalog probe) — passthrough to
     /// `Instance.execute_sql`.
@@ -270,7 +270,7 @@ pub fn classify(sql: &str) -> StatementClass {
         "COMMIT" | "END" => StatementClass::Commit,
         "ROLLBACK" | "ABORT" => StatementClass::Rollback,
         "DISCARD" => StatementClass::Discard,
-        // Writes & DDL are rejected up front (Phase 1 read-only, §P4.7).
+        // Writes & DDL are rejected up front (read-only path).
         "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "TRUNCATE" | "COPY" | "CREATE" | "ALTER"
         | "DROP" | "GRANT" | "REVOKE" | "REINDEX" | "VACUUM" | "CALL" => StatementClass::Write,
         _ => StatementClass::Passthrough,

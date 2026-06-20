@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! T2 — PostgreSQL protocol integration tests (P4).
+//! PostgreSQL protocol integration tests.
 //!
 //! Drives the spawned PG frontend with the real `tokio-postgres` wire client
 //! over loopback TCP, against the `FakeInstance` in `harness`. Covers the P4
@@ -77,7 +77,7 @@ async fn extended_select_decodes_typed_rows() {
 
 /// Extended-protocol parameterized SELECT: the client sends bound `$1`/`$2`
 /// values, which must be decoded from the PG wire (text/binary) into
-/// `ScalarValue`/`ParamValues` and reach `Instance.execute_sql` (§P4.4). The
+/// `ScalarValue`/`ParamValues` and reach `Instance.execute_sql`. The
 /// `FakeInstance` echoes the decoded params back as the result row, so a wrong /
 /// dropped parameter would surface as a wrong value here.
 #[tokio::test]
@@ -168,7 +168,7 @@ async fn transaction_control_is_noop() {
 }
 
 /// A write statement is rejected with a feature-not-supported error whose
-/// message points at the REST write path (Phase 1 read-only).
+/// message points at the REST write path (read-only).
 #[tokio::test]
 async fn write_is_rejected_as_unsupported() {
     let server = PgTestServer::start().await;
@@ -189,7 +189,7 @@ async fn write_is_rejected_as_unsupported() {
     assert!(db_err.message().contains("REST"), "msg: {}", db_err.message());
 }
 
-/// Out-of-band CancelRequest handling (§P4.6) at the real wire level:
+/// Out-of-band CancelRequest handling at the real wire level:
 /// - a forged CancelRequest with an unknown pid / wrong secret is rejected and
 ///   never reaches `Instance.cancel_operation`;
 /// - the client's own (correct-key) cancel token with no query running is a

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! P7 — Auth: Authenticator / Credential / Principal.
+//! Auth: Authenticator / Credential / Principal.
 //!
 //! Protocol-agnostic authentication. Protocol layers run their own wire
 //! handshake, translate the result into a neutral [`Credential`], then call
@@ -23,17 +23,17 @@
 //! The gateway configures exactly one global `Authenticator`, shared by both the
 //! PostgreSQL and REST frontends.
 //!
-//! Phase 1 contracts encoded here:
+//! Contracts encoded here:
 //! - **principal == username, 1:1**: a [`Principal`] is exactly the claimed
 //!   username — no aliases, groups, roles, or mapping table.
 //! - **authentication only, no authorization**: a successful `authenticate`
-//!   grants access; there is no permission model in this phase.
+//!   grants access; there is no permission model.
 //! - the resulting `Principal` flows downstream unchanged (PG → session, REST →
 //!   request context) and is preserved all the way to
-//!   `FlussConnectionProvider::resolve(cluster, principal)`, where Phase 1 keeps
+//!   `FlussConnectionProvider::resolve(cluster, principal)`, which keeps
 //!   but does not consume it (shared proxy account, no doAs).
 //!
-//! Design: `design/infra.md` §P7.
+//! Design: `design/infra.md`.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -43,7 +43,7 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use crate::error::GatewayError;
-// Reuse the canonical Principal (types.rs §P1.2); do not redefine it here.
+// Reuse the canonical Principal; do not redefine it here.
 pub use crate::types::Principal;
 
 pub mod config;
@@ -53,7 +53,7 @@ pub mod config;
 /// Wraps a `String` with a hand-written `Debug` that never prints the contents,
 /// so a secret cannot leak through `{:?}` logging of a `Credential`. Intentionally
 /// minimal: no new dependency, no `Display`, no `Clone`-friendly accessors beyond
-/// what the (future) password store needs.
+/// what the password store needs.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Secret(String);
 
@@ -93,7 +93,7 @@ impl From<&str> for Secret {
 /// variants; the auth layer never inspects wire formats.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Credential {
-    /// A trusted identity claim with no secret to verify. Used by the Phase 1
+    /// A trusted identity claim with no secret to verify. Used by the
     /// trust path where the username is taken at face value.
     Trust { username: String },
     /// A username + secret to be verified by a credential store.
@@ -127,7 +127,7 @@ pub enum AuthError {
     Unauthenticated(String),
     /// The presented credential was rejected (bad password / unknown user).
     InvalidCredential(String),
-    /// The caller is known but not permitted. Not produced in Phase 1 (no
+    /// The caller is known but not permitted. Not produced today (no
     /// authorization), but kept so the trait surface is stable when a permission
     /// model lands later.
     Unauthorized(String),
@@ -171,7 +171,7 @@ pub trait Authenticator: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
-// neutral wire-to-credential helper (§P7.1)
+// neutral wire-to-credential helper
 // ---------------------------------------------------------------------------
 
 /// Build a neutral [`Credential`] from a username and an optional password,
@@ -181,7 +181,7 @@ pub trait Authenticator: Send + Sync {
 /// - `None` → [`Credential::Trust`] (no secret to verify).
 ///
 /// Actual extraction of `(username, password)` from PG cleartext exchange or an
-/// HTTP `Authorization: Basic` header lives in the P4 / P5 protocol layers, NOT
+/// HTTP `Authorization: Basic` header lives in the protocol layers, NOT
 /// here — `auth/` must not depend on pgwire / HTTP types.
 pub fn credential_from_userpass(
     username: impl Into<String>,
@@ -198,13 +198,13 @@ pub fn credential_from_userpass(
 }
 
 // ---------------------------------------------------------------------------
-// TrustAuthenticator (Phase 1 default) (§P7.2)
+// TrustAuthenticator (default when no users are configured)
 // ---------------------------------------------------------------------------
 
-/// Phase 1 default authenticator: accepts any credential and trusts the claimed
-/// username, without verifying any secret. An empty / missing username is
+/// Default authenticator when no users are configured: accepts any credential and
+/// trusts the claimed username, without verifying any secret. An empty / missing username is
 /// rejected with [`AuthError::Unauthenticated`] so every connection / request
-/// carries a non-empty identity (keeping the principal chain non-empty per §P7.2).
+/// carries a non-empty identity.
 #[derive(Debug, Default, Clone)]
 pub struct TrustAuthenticator;
 
@@ -229,7 +229,7 @@ impl Authenticator for TrustAuthenticator {
 }
 
 // ---------------------------------------------------------------------------
-// ConfigUserStoreAuthenticator (§P7.3)
+// ConfigUserStoreAuthenticator
 // ---------------------------------------------------------------------------
 
 /// A stored secret from config: either a plaintext password, or the hex form of
@@ -504,10 +504,10 @@ mod tests {
     }
 
     /// Type-level proof that a `Principal` produced by auth flows unchanged into
-    /// the connection-resolution signature `resolve(cluster, &Principal)` (P6 §5),
+    /// the connection-resolution signature `resolve(cluster, &Principal)`,
     /// i.e. the principal is not lost between authentication and connection
     /// resolution. We don't need a live provider — just that the principal binds
-    /// to that parameter position. (Phase 1 keeps but does not consume it.)
+    /// to that parameter position. (Kept but not consumed.)
     #[tokio::test]
     async fn principal_threads_to_connection_resolution_signature() {
         async fn resolve_like(_cluster: &crate::types::ClusterId, _principal: &Principal) {}

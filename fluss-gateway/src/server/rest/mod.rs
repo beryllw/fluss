@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! P5 — REST frontend (axum routes / handlers).
+//! REST frontend (axum routes / handlers).
 //!
-//! The only write path in Phase 1, with at-least-once semantics; also serves
+//! The write path, with at-least-once semantics; also serves
 //! read-only metadata endpoints. The transport here is intentionally thin: it
 //! parses `Authorization: Basic` into a neutral [`Principal`], builds a
 //! request-scoped [`RequestExecutionContext`], decodes the write body via
@@ -26,16 +26,16 @@
 //! and `(principal, cluster)` is re-derived from every request.
 //!
 //! Multi-cluster evolution uses path prefixes (`/v1/clusters/{cluster}/...`),
-//! not headers. Phase 1 only routes `cluster == "default"`; other clusters are
-//! still parsed and threaded so the path shape is frozen from day one.
+//! not headers. Only `cluster == "default"` is routed; other clusters are
+//! still parsed and threaded so the path shape is stable.
 //!
-//! at-least-once (direct-path.md §6): a 2xx means the backend acked. A timeout /
+//! at-least-once (direct-path.md): a 2xx means the backend acked. A timeout /
 //! disconnect is NOT a cancel and NOT a rollback — the result is *unknown* and
 //! the client must treat the write as "possibly applied". There is no
 //! user-level cancel endpoint, by design.
 //!
-//! Design: `design/direct-path.md` §4 (path table), §6 (error map), §7 (no
-//! session); auth seam in `design/infra.md` §P7.
+//! Design: `design/direct-path.md` (path table, error map, no
+//! session); auth seam in `design/infra.md`.
 
 use std::sync::Arc;
 
@@ -87,7 +87,7 @@ impl RestServer {
         }
     }
 
-    /// Build the axum [`Router`] with the frozen Phase 1 resource path table.
+    /// Build the axum [`Router`] with the resource path table.
     /// Exposed (not just `serve`) so tests can mount it onto a `oneshot` tower
     /// service as well as a real loopback listener.
     pub fn router(&self) -> Router {
@@ -116,7 +116,7 @@ impl RestServer {
                 "/v1/clusters/{cluster}/databases/{db}/tables/{table}",
                 get(handle_get_table).delete(handle_drop_table),
             )
-            // --- direct read (path frozen, NOT implemented this phase) ---
+            // --- direct read (path frozen, not implemented) ---
             .route(
                 "/v1/clusters/{cluster}/databases/{db}/tables/{table}/lookup",
                 post(handle_read_not_implemented),
@@ -147,12 +147,12 @@ impl RestServer {
 }
 
 // ---------------------------------------------------------------------------
-// auth: Authorization: Basic -> Principal (§P7, direct-path.md §1)
+// auth: Authorization: Basic -> Principal (direct-path.md)
 // ---------------------------------------------------------------------------
 
 /// Parse a username out of an `Authorization: Basic <base64(user:pass)>` header.
-/// The password is intentionally discarded (Phase 1 trust); the [`Authenticator`]
-/// turns the username into a [`Principal`]. Extraction lives in the REST layer,
+/// The password is forwarded to the [`Authenticator`], which turns the
+/// credential into a [`Principal`]. Extraction lives in the REST layer,
 /// not in `auth/`, which must stay free of HTTP types. Returns the raw
 /// `(username, password)` so the caller picks the credential variant.
 fn parse_basic_auth(headers: &HeaderMap) -> Result<(String, Option<String>), GatewayError> {
@@ -186,7 +186,7 @@ fn parse_basic_auth(headers: &HeaderMap) -> Result<(String, Option<String>), Gat
 
 /// Authenticate the request and build the request-scoped context. The principal
 /// comes from auth; the cluster from the path; both are re-derived per request
-/// and never inherited from a session (§7).
+/// and never inherited from a session.
 async fn make_context(
     state: &RestState,
     headers: &HeaderMap,
@@ -203,16 +203,16 @@ async fn make_context(
         principal,
         cluster: ClusterId(cluster.to_string()),
         request_id: RequestId(new_request_id()),
-        // Phase 1: deadline is left to a fronting timeout; the cancel token fires
+        // The deadline is left to a fronting timeout; the cancel token fires
         // on client disconnect via the runtime. A server-side request deadline is
-        // a later refinement (direct-path.md §1).
+        // a later refinement (direct-path.md).
         deadline: None,
         cancel: CancellationToken::new(),
     })
 }
 
 // ---------------------------------------------------------------------------
-// handlers: write (§3, §4)
+// handlers: write
 // ---------------------------------------------------------------------------
 
 async fn handle_records(
@@ -235,7 +235,7 @@ async fn handle_records_delete(
 
 /// Whether the route is the upsert/append endpoint or the delete endpoint. The
 /// concrete `DirectWriteRequest` variant (KvUpsert vs LogAppend) is resolved
-/// against the table's kind by the backend in P6; here we only know "records"
+/// against the table's kind by the backend; here we only know "records"
 /// vs "records:delete".
 enum WriteIntent {
     Records,
@@ -280,9 +280,9 @@ async fn write_records(
                 table: table_ref,
                 keys: batch,
             },
-            // `records` is upsert-or-append. Phase 1 maps it to KvUpsert; the
-            // backend reinterprets it as LogAppend when the target is a Log table
-            // (P6). The request shape covers all three; this transport does not
+            // `records` is upsert-or-append. The transport maps it to KvUpsert;
+            // the backend reinterprets it as LogAppend when the target is a Log
+            // table. The request shape covers all three; this transport does not
             // re-fetch the table kind just to pick the enum arm.
             WriteIntent::Records => DirectWriteRequest::KvUpsert {
                 context,
@@ -307,7 +307,7 @@ async fn write_records(
 }
 
 // ---------------------------------------------------------------------------
-// handlers: metadata (§4)
+// handlers: metadata
 // ---------------------------------------------------------------------------
 
 async fn handle_list_databases(
@@ -628,19 +628,21 @@ async fn handle_drop_table(
 }
 
 // ---------------------------------------------------------------------------
-// handlers: deferred direct read (path frozen, §4 / Backlog §7)
+// handlers: direct read (not supported)
 // ---------------------------------------------------------------------------
 
-/// Placeholder for the deferred direct-read endpoints: the route exists so the
-/// path table is frozen, but Phase 1 returns 501 with a stable message.
+/// Placeholder for the direct-read endpoints: the route exists so the
+/// path table is frozen, but it returns 501 with a stable message. Direct
+/// reads (lookup / scan) are not supported over REST — reads go through the
+/// PostgreSQL SQL path.
 async fn handle_read_not_implemented() -> Response {
     error_response(GatewayError::Unsupported(
-        "direct read (lookup / prefix-scan / log-scan) is deferred past Phase 1".into(),
+        "direct read (lookup / prefix-scan / log-scan) is not supported; query via the PostgreSQL SQL path".into(),
     ))
 }
 
 // ---------------------------------------------------------------------------
-// error mapping: domain error -> HTTP status (direct-path.md §6)
+// error mapping: domain error -> HTTP status (direct-path.md)
 // ---------------------------------------------------------------------------
 
 /// The frozen domain→HTTP status map. Pure so it can be unit-tested without a

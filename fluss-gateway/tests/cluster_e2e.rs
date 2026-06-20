@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! T1-T4 — real-cluster end-to-end verification (DESIGN.md §3.3 integration
-//! model; sql-path.md §P3.3 assembly order; direct-path.md §P5 at-least-once).
+//! Real-cluster end-to-end verification (DESIGN.md §3.3 integration
+//! model; sql-path.md assembly order; direct-path.md at-least-once).
 //!
 //! This is the final executable evidence that "data is really written, and SQL
 //! really reads it back" against a live Apache Fluss cluster. The whole flow
@@ -242,7 +242,7 @@ async fn assemble_instance(bootstrap: &str) -> (Arc<GatewayInstanceImpl>, Arc<Fl
     let connection = conn_provider.resolve(&cluster, &principal).await.unwrap();
 
     // SQL path: real Fluss catalog installer behind PgSqlEnvironmentProvider.
-    // The overlay stays a stub (P6.4 deferred); it does not affect SELECT from
+    // The pg_catalog overlay stays a stub; it does not affect SELECT from
     // the real Fluss catalog.
     let fluss_df = Arc::new(
         fluss_datafusion::FlussDatafusion::new(
@@ -252,6 +252,21 @@ async fn assemble_instance(bootstrap: &str) -> (Arc<GatewayInstanceImpl>, Arc<Fl
         .await
         .expect("FlussDatafusion::new over the live connection"),
     );
+    // Connection-recovery manager: owns the shared connection, hot-swaps it into
+    // FlussDatafusion on rebuild; the backend reads the live connection from it.
+    let fluss_df_for_swap = Arc::clone(&fluss_df);
+    let conn_manager = Arc::new(fluss_gateway::connection::ConnectionManager::new(
+        Arc::clone(&connection),
+        fluss_gateway::connection::build_fluss_config(&ClusterConfig {
+            bootstrap_servers: bootstrap.to_string(),
+        }),
+        Box::new(move |new| {
+            fluss_df_for_swap
+                .swap_connection(Arc::clone(new))
+                .map_err(|e| fluss_gateway::error::GatewayError::Backend(format!("swap: {e}")))
+        }),
+    ));
+
     let pg_provider = PgSqlEnvironmentProvider::new(
         Arc::new(FlussDatafusionCatalogInstaller::new(fluss_df)),
         Arc::new(StubPgCatalogOverlayInstaller),
@@ -259,15 +274,14 @@ async fn assemble_instance(bootstrap: &str) -> (Arc<GatewayInstanceImpl>, Arc<Fl
     let mut sql_environments = SqlEnvironmentRegistry::new();
     sql_environments.register(SqlEnvironmentId("postgres".into()), Arc::new(pg_provider));
 
-    // Direct path: a backend over the SAME shared connection.
-    let backend = Arc::new(FlussBackendFacade::new(Arc::clone(&connection)));
+    // Direct path: a backend that reads the live connection from the manager.
+    let backend = Arc::new(FlussBackendFacade::new(Arc::clone(&conn_manager)));
     let sessions = Arc::new(SessionManager::new(SessionManagerConfig::default()));
 
-    let instance = Arc::new(GatewayInstanceImpl::new(
-        sessions,
-        backend,
-        Arc::new(sql_environments),
-    ));
+    let instance = Arc::new(
+        GatewayInstanceImpl::new(sessions, backend, Arc::new(sql_environments))
+            .with_recovery(conn_manager),
+    );
     (instance, connection)
 }
 
@@ -1000,7 +1014,7 @@ async fn kv_lookup_names(conn: &FlussConnection) -> (Option<String>, Option<Stri
     (r1, r2)
 }
 
-/// `base64("user:ignored")` for the REST Basic-auth header (Phase 1 trust).
+/// `base64("user:ignored")` for the REST Basic-auth header (trust mode).
 fn basic_auth(user: &str) -> String {
     const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let raw = format!("{user}:ignored");

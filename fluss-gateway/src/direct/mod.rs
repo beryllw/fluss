@@ -15,19 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! P5 — Direct path request models + body decoding.
+//! Direct path request models + body decoding.
 //!
 //! Direct write intents (`KvUpsert` / `KvDelete` / `LogAppend`) executed via the
-//! [`GatewayInstance`](crate::instance::GatewayInstance) facade. Phase 1 writes
-//! are at-least-once with only request-scoped timeout/cancel — no user-visible
+//! [`GatewayInstance`](crate::instance::GatewayInstance) facade. Writes are
+//! at-least-once with only request-scoped timeout/cancel — no user-visible
 //! Operation, never through the SQL execution chain, never via the
-//! SessionManager. Direct reads (lookup/scan) are deferred past Phase 1.
+//! SessionManager. Direct reads (lookup/scan) over the direct path are not
+//! supported (reads go via the PostgreSQL SQL path).
 //!
 //! This module owns the *protocol-neutral* boundary logic for direct writes:
 //! Content-Type negotiation and decoding a write body (JSON rows or Arrow IPC
 //! stream) into one Arrow-native `RecordBatch`, plus the canonical kind/path
 //! semantics. The HTTP transport (`server/rest`) layers axum on top of this.
-//! Design: `design/direct-path.md` §1, §3, §6.
+//! Design: `design/direct-path.md`.
 
 use arrow::datatypes::SchemaRef;
 use arrow::ipc::reader::StreamReader;
@@ -56,7 +57,7 @@ impl WriteEncoding {
     /// Negotiate the encoding from a raw `Content-Type` header value. Only the
     /// media type is considered; parameters (e.g. `; charset=utf-8`) are ignored.
     /// An absent or unrecognized type is an `InvalidArgument` so the boundary can
-    /// answer 400 rather than guess (direct-path.md §3).
+    /// answer 400 rather than guess (direct-path.md).
     pub fn negotiate(content_type: Option<&str>) -> GatewayResult<WriteEncoding> {
         let raw = content_type.ok_or_else(|| {
             GatewayError::InvalidArgument("missing Content-Type for write body".into())
@@ -76,7 +77,7 @@ impl WriteEncoding {
 /// carrying the decoded batch, so the transport can classify a route before it
 /// has a schema/body. KV vs Log selection is the caller's responsibility (the
 /// route path picks `records` vs `records:delete`; KV-vs-Log is resolved against
-/// the table by the backend in P6).
+/// the table by the backend).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DirectWriteKind {
     /// Upsert rows into a KV table (`POST .../records` on a KV table).
@@ -90,10 +91,10 @@ pub enum DirectWriteKind {
 /// Decode a write body into a single Arrow-native `RecordBatch`.
 ///
 /// - [`WriteEncoding::Json`] decodes against `schema` (taken from the target
-///   table; Phase 1 does no schema-on-write).
+///   table; no schema-on-write).
 /// - [`WriteEncoding::ArrowStream`] is self-describing; its embedded schema is
 ///   returned as-is and the caller is responsible for any schema reconciliation
-///   against the target table at the backend (P6).
+///   against the target table at the backend.
 ///
 /// All decode failures map to `InvalidArgument` (a malformed body is the
 /// caller's fault), which the REST boundary answers as 400.
@@ -165,8 +166,8 @@ fn decode_arrow_stream(body: &[u8]) -> GatewayResult<RecordBatch> {
     if batches.is_empty() {
         return Err(bad("empty Arrow stream produced no batches".into()));
     }
-    // Concatenate so the direct path always sees a single batch (Phase 1 ingest
-    // volumes are modest; a streaming write seam is deferred).
+    // Concatenate so the direct path always sees a single batch (ingest
+    // volumes are modest; there is no streaming write seam).
     arrow::compute::concat_batches(&schema, &batches).map_err(|e| bad(e.to_string()))
 }
 

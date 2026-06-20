@@ -15,15 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! P2.7 / P2.8 / P2.10 — query-scoped [`Operation`] state machine and the
-//! per-session [`OperationManager`].
+//! Query-scoped [`Operation`] state machine and the per-session
+//! [`OperationManager`].
 //!
-//! `OperationState` (P1 `types.rs`) is the authoritative state enum. This module
-//! adds the *transition rules*: only the edges enumerated in design §P2.7 are
-//! legal, terminal states never regress, and `CancelRequested` is transitional.
-//! The §P2.8 tracked-stream lifecycle points (first poll, EOF, deadline, cancel,
-//! exec error) are expressed as named transition methods so the semantics are
-//! testable now; the real stream wrapper lands in P4.
+//! `OperationState` (`types.rs`) is the authoritative state enum. This module
+//! adds the transition rules: only the enumerated edges are legal, terminal
+//! states never regress, and `CancelRequested` is transitional. The
+//! tracked-stream lifecycle points (first poll, EOF, deadline, cancel, exec
+//! error) are expressed as named transition methods that the SQL service's
+//! tracked stream drives.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -33,7 +33,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::types::{CancelResult, OperationId, OperationState, OperationStatusSnapshot};
 
-/// Whether a state is terminal (no outgoing transitions; design §P2.7).
+/// Whether a state is terminal.
 fn is_terminal(state: OperationState) -> bool {
     matches!(
         state,
@@ -44,7 +44,7 @@ fn is_terminal(state: OperationState) -> bool {
     )
 }
 
-/// The legal transition edges from §P2.7:
+/// The legal transition edges:
 ///
 /// ```text
 /// Pending -> Running, CancelRequested
@@ -70,7 +70,7 @@ fn transition_allowed(from: OperationState, to: OperationState) -> bool {
 }
 
 /// A single query-scoped operation. Only the SQL path creates these; the direct
-/// path never does (design §P2.1).
+/// path never does.
 #[derive(Debug)]
 pub struct Operation {
     pub id: OperationId,
@@ -117,7 +117,7 @@ impl Operation {
         true
     }
 
-    /// §P2.8 first poll: `Pending -> Running`.
+    /// First poll: `Pending -> Running`.
     pub fn mark_running(&mut self) -> bool {
         if self.try_transition(OperationState::Running) {
             self.started_at.get_or_insert_with(SystemTime::now);
@@ -127,7 +127,7 @@ impl Operation {
         }
     }
 
-    /// §P2.8 normal EOF: `Running -> Finished`.
+    /// Normal EOF: `Running -> Finished`.
     pub fn mark_finished(&mut self) -> bool {
         if self.try_transition(OperationState::Finished) {
             self.finished_at.get_or_insert_with(SystemTime::now);
@@ -137,7 +137,7 @@ impl Operation {
         }
     }
 
-    /// §P2.8 non-cancel execution error: `Running -> Failed`. `Failed` is never
+    /// Non-cancel execution error: `Running -> Failed`. `Failed` is never
     /// used for cancel/timeout outcomes.
     pub fn mark_failed(&mut self, error: impl Into<String>) -> bool {
         if self.try_transition(OperationState::Failed) {
@@ -149,7 +149,7 @@ impl Operation {
         }
     }
 
-    /// §P2.10 cancel request: `Pending/Running -> CancelRequested`. Fires the
+    /// Cancel request: `Pending/Running -> CancelRequested`. Fires the
     /// cancel token regardless so cooperative consumers observe it. If already in
     /// a terminal state, no transition occurs.
     pub fn request_cancel(&mut self) -> bool {
@@ -160,7 +160,7 @@ impl Operation {
         moved
     }
 
-    /// §P2.8 cancel path exit: `CancelRequested -> Cancelled`.
+    /// Cancel path exit: `CancelRequested -> Cancelled`.
     pub fn mark_cancelled(&mut self) -> bool {
         if self.try_transition(OperationState::Cancelled) {
             self.finished_at.get_or_insert_with(SystemTime::now);
@@ -170,7 +170,7 @@ impl Operation {
         }
     }
 
-    /// §P2.8 deadline hit: `Running/CancelRequested -> TimedOut`.
+    /// Deadline hit: `Running/CancelRequested -> TimedOut`.
     pub fn mark_timed_out(&mut self) -> bool {
         if self.try_transition(OperationState::TimedOut) {
             self.finished_at.get_or_insert_with(SystemTime::now);
@@ -190,7 +190,7 @@ impl Operation {
     }
 }
 
-/// Per-session registry of operations (design §P2.10 / §P2.11). Tracks live and
+/// Per-session registry of operations. Tracks live and
 /// terminal operations, answers status queries, and routes cancel requests.
 #[derive(Debug, Default)]
 pub struct OperationManager {
@@ -218,7 +218,7 @@ impl OperationManager {
             .map(Operation::status_snapshot)
     }
 
-    /// §P2.10 cancel semantics: distinguish not-found / already-terminal /
+    /// Cancel semantics: distinguish not-found / already-terminal /
     /// accepted. A `running` (or `pending`) operation moves to `CancelRequested`
     /// and its token fires; cancel is cooperative / best-effort.
     pub fn cancel(&self, id: &OperationId) -> CancelResult {
@@ -234,7 +234,7 @@ impl OperationManager {
         }
     }
 
-    /// §P2.6 — request cancel on every non-terminal operation (used by session
+    /// Request cancel on every non-terminal operation (used by session
     /// close). Does not wait for them to exit.
     pub fn cancel_all_active(&self) {
         let mut ops = self.operations.lock().unwrap();
@@ -246,7 +246,7 @@ impl OperationManager {
     }
 
     /// True if any registered operation is still non-terminal (used by the idle
-    /// reaper, §P2.11).
+    /// reaper).
     pub fn has_active(&self) -> bool {
         self.operations
             .lock()
@@ -284,7 +284,7 @@ mod tests {
         Operation::new(OperationId("op-1".into()), "SELECT 1")
     }
 
-    // §P2.7 — legal happy-path transitions.
+    // Legal happy-path transitions.
     #[test]
     fn legal_running_then_finished() {
         let mut o = op();
@@ -345,7 +345,7 @@ mod tests {
         assert_eq!(o.state(), OperationState::TimedOut);
     }
 
-    // §P2.7 — illegal transitions are rejected; terminal states never regress.
+    // Illegal transitions are rejected; terminal states never regress.
     #[test]
     fn finished_cannot_go_back_to_running() {
         let mut o = op();
@@ -379,7 +379,7 @@ mod tests {
         assert_eq!(o.state(), OperationState::TimedOut);
     }
 
-    // §P2.10 — CancelResult: NotFound / AlreadyTerminal / Accepted.
+    // CancelResult: NotFound / AlreadyTerminal / Accepted.
     #[test]
     fn cancel_unknown_is_not_found() {
         let mgr = OperationManager::new();

@@ -15,22 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! P3 — SQL execution orchestration.
+//! SQL execution orchestration.
 //!
 //! Drives, for a `(session, statement)` pair: per-session `SessionContext`
-//! build/rebuild through the P2 seam (`GatewaySession::context_for_query`) wired
-//! to the P3 [`EnvironmentContextBuilder`] (registry + `PgSqlEnvironmentProvider`),
+//! build/rebuild through the session seam (`GatewaySession::context_for_query`)
+//! wired to the [`EnvironmentContextBuilder`] (registry + `PgSqlEnvironmentProvider`),
 //! then DataFusion planning/execution on that context, then mapping the result to
-//! a P1 [`SqlExecution`]:
+//! a [`SqlExecution`]:
 //!
 //! - a result-bearing plan (`SELECT`, `VALUES`, …) → [`SqlExecution::Query`]: a
 //!   query-scoped [`Operation`] is registered on the session's `OperationManager`
 //!   and the Arrow-native stream is wrapped so that draining it drives the
 //!   operation state (`Running` → `Finished` / `Failed`) and observes cooperative
-//!   cancel through the operation's [`CancellationToken`] (P2.8 / P2.10);
+//!   cancel through the operation's [`CancellationToken`];
 //! - a side-effecting / no-result plan (`SET`, `BEGIN`, DML/DDL) →
-//!   [`SqlExecution::Command`] (P1 shape preserved even though Phase 1 PG SQL is
-//!   read-only).
+//!   [`SqlExecution::Command`] (the PG SQL path is read-only).
 //!
 //! `describe_sql` plans the statement WITHOUT executing it and returns the result
 //! schema plus inferred positional parameter types.
@@ -39,9 +38,8 @@
 //! [`SqlEnvironmentRegistry`] and reads the authoritative session state through
 //! the `SessionManager`. Fluss is reached only through the environment provider's
 //! catalog seam — there is no direct fluss-datafusion dependency in this module.
-//! Design: `design/sql-path.md` §P3.3 (fixed assembly order) and `DESIGN.md` §3.3
-//! (integration model); operation/stream/cancel semantics: `design/core-session.md`
-//! §P2.7-§P2.10.
+//! Design: `design/sql-path.md` (fixed assembly order) and `DESIGN.md`
+//! (integration model); operation/stream/cancel semantics: `design/core-session.md`.
 
 use std::sync::Arc;
 
@@ -72,7 +70,7 @@ struct RegisteredOp {
     cancel: CancellationToken,
 }
 
-/// SQL execution orchestrator (design §P3.3). Holds only shared, read-only
+/// SQL execution orchestrator. Holds only shared, read-only
 /// collaborators; per-session state lives in [`GatewaySession`].
 pub struct SqlGatewayService {
     sessions: Arc<SessionManager>,
@@ -110,10 +108,10 @@ impl SqlGatewayService {
         Ok(effect)
     }
 
-    /// Build (or rebuild, if dirty) the session's `SessionContext` through the P2
-    /// seam wired to the P3 environment provider. The returned `Arc` is the
+    /// Build (or rebuild, if dirty) the session's `SessionContext` through the
+    /// session seam wired to the environment provider. The returned `Arc` is the
     /// session's current context; an in-flight rebuild leaves any older context
-    /// alive for operations still holding it (P2.5).
+    /// alive for operations still holding it.
     async fn context_for(
         &self,
         session: &Arc<GatewaySession>,
@@ -158,12 +156,12 @@ impl SqlGatewayService {
         let is_command = is_command_plan(&plan);
 
         // Register the operation BEFORE the first poll so an out-of-band cancel
-        // arriving between registration and stream start is observed (P2.10).
+        // arriving between registration and stream start is observed.
         let op = register_operation(session.operation_manager(), &req.statement);
 
         if is_command {
             // No result set: execute for side effects, then close the operation.
-            // (Phase 1 PG is read-only at the adapter; this is the neutral shape.)
+            // (PG is read-only at the adapter; this is the neutral shape.)
             let mgr = session.operation_manager();
             mgr.with_operation(&op.id, |o| o.mark_running());
             match df.collect().await {
@@ -220,7 +218,7 @@ fn register_operation(mgr: &OperationManager, statement: &str) -> RegisteredOp {
 
 /// A small, dependency-free unique-ish token for operation ids. Operation ids are
 /// internal routing keys (not protocol-visible), so a monotonic-plus-time token is
-/// sufficient and avoids pulling a uuid dependency for Phase 1.
+/// sufficient and avoids pulling in a uuid dependency.
 fn uuid_like() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -301,7 +299,7 @@ fn ordered_param_types(plan: &LogicalPlan) -> GatewayResult<Vec<DataType>> {
 }
 
 /// Wrap an Arrow-native result stream so draining it drives the owning operation's
-/// state (P2.8) and observes cooperative cancel (P2.10):
+/// state and observes cooperative cancel:
 ///
 /// - first batch polled → `Running`;
 /// - normal EOF → `Finished`;
@@ -689,7 +687,7 @@ mod tests {
     }
 
     // Cooperative cancel: a cancel request fired before draining stops the stream
-    // and the operation reaches Cancelled (best-effort, P2.10).
+    // and the operation reaches Cancelled (best-effort).
     #[tokio::test]
     async fn cancel_before_drain_stops_stream_and_cancels_op() {
         let (svc, sessions) = service();

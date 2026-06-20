@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! P2.11 — [`SessionManager`]: connection-level session governance.
+//! [`SessionManager`]: connection-level session governance.
 //!
 //! Responsible for: open/close, the session registry, a max-session cap, an idle
 //! reaper, and basic lookup/snapshot reads. It deliberately does NOT do query
@@ -32,7 +32,7 @@ use crate::error::{GatewayError, GatewayResult};
 use crate::session::session::GatewaySession;
 use crate::types::{OpenSessionRequest, SessionId};
 
-/// Configuration for the session manager (design §P2.11).
+/// Configuration for the session manager.
 #[derive(Debug, Clone)]
 pub struct SessionManagerConfig {
     /// Maximum number of concurrently open sessions. Opening beyond this is
@@ -52,8 +52,8 @@ impl Default for SessionManagerConfig {
     }
 }
 
-/// Generates unique session ids. Phase 1 uses a simple monotonic counter; the
-/// scheme is internal and not protocol-visible.
+/// Generates unique session ids using a simple monotonic counter; the scheme is
+/// internal and not protocol-visible.
 fn next_session_id(counter: &std::sync::atomic::AtomicU64) -> SessionId {
     let n = counter.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     SessionId(format!("session-{n}"))
@@ -79,7 +79,7 @@ impl SessionManager {
         Self::new(SessionManagerConfig::default())
     }
 
-    /// §P2.11 — open a session. Rejects when at capacity. Refreshes access time.
+    /// Open a session. Rejects when at capacity. Refreshes access time.
     pub fn open(&self, req: OpenSessionRequest) -> GatewayResult<Arc<GatewaySession>> {
         let mut sessions = self.sessions.write().unwrap();
         if sessions.len() >= self.config.max_sessions {
@@ -116,7 +116,7 @@ impl SessionManager {
         Ok(session)
     }
 
-    /// §P2.6 — close: mark the session closed, cancel its active operations, and
+    /// Close: mark the session closed, cancel its active operations, and
     /// remove it from the registry. Subsequent requests on the id are not found.
     /// Does not synchronously wait for operations to drain.
     pub fn close(&self, id: &SessionId) -> GatewayResult<()> {
@@ -138,7 +138,7 @@ impl SessionManager {
         self.len() == 0
     }
 
-    /// §P2.11 — reclaim idle sessions: remove sessions whose last access is older
+    /// Reclaim idle sessions: remove sessions whose last access is older
     /// than `idle_timeout` AND that have no active operations. Returns the ids
     /// reaped. Sessions with active operations are always retained.
     pub fn reap_idle(&self) -> Vec<SessionId> {
@@ -186,7 +186,7 @@ mod tests {
         }
     }
 
-    // §P2.11 — opening beyond the cap is rejected.
+    // Opening beyond the cap is rejected.
     #[test]
     fn max_session_limit_is_enforced() {
         let mgr = SessionManager::new(SessionManagerConfig {
@@ -202,7 +202,7 @@ mod tests {
         assert_eq!(mgr.len(), 2);
     }
 
-    // §P2.6 — after close, the session id is not found for new requests.
+    // After close, the session id is not found for new requests.
     #[test]
     fn close_removes_session_and_rejects_reuse() {
         let mgr = SessionManager::with_defaults();
@@ -222,7 +222,7 @@ mod tests {
         ));
     }
 
-    // §P2.11 — idle reaper reclaims idle sessions but keeps ones with active ops.
+    // Idle reaper reclaims idle sessions but keeps ones with active ops.
     #[test]
     fn idle_reaper_keeps_sessions_with_active_operations() {
         let mgr = SessionManager::new(SessionManagerConfig {
@@ -245,7 +245,7 @@ mod tests {
         assert!(mgr.get(&busy.id).is_ok());
     }
 
-    // §P2.11 — recently accessed (non-idle) sessions are not reaped.
+    // Recently accessed (non-idle) sessions are not reaped.
     #[test]
     fn idle_reaper_keeps_recently_accessed_sessions() {
         let mgr = SessionManager::new(SessionManagerConfig {
@@ -259,7 +259,7 @@ mod tests {
         assert!(mgr.get(&s.id).is_ok());
     }
 
-    // §P2.11 — get refreshes last_access_at.
+    // get refreshes last_access_at.
     #[test]
     fn get_updates_last_access() {
         let mgr = SessionManager::with_defaults();

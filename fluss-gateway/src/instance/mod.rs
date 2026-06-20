@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! P1 — GatewayInstance facade.
+//! GatewayInstance facade.
 //!
 //! The unified, protocol-agnostic facade over session / SQL / operation /
 //! direct / metadata access. Protocol modules (PostgreSQL, REST, and future
@@ -23,10 +23,7 @@
 //! capabilities only — never internal service composition — so the protocol
 //! layer can integration-test and inject fakes against a stable surface while
 //! internal services are refactored freely.
-//! Design: `DESIGN.md` §2 (core layering) and `design/core-session.md` §P1.1.
-//!
-//! P1 only freezes the trait surface; concrete `GatewayInstance` implementations
-//! are built in P2+.
+//! Design: `DESIGN.md` (core layering) and `design/core-session.md`.
 
 use async_trait::async_trait;
 
@@ -71,8 +68,8 @@ pub trait GatewayInstance: Send + Sync {
 
     // --- Metadata ---
     async fn list_databases(&self, scope: MetadataScope) -> GatewayResult<Vec<String>>;
-    /// List table names within `database`. The `database` arg closes the P1 facade
-    /// gap: the backend `list_tables(db)` is database-scoped, and protocol frontends
+    /// List table names within `database`. The `database` arg matches the facade
+    /// shape: the backend `list_tables(db)` is database-scoped, and protocol frontends
     /// (REST `{db}` path segment, PG catalog views) always carry one.
     async fn list_tables(
         &self,

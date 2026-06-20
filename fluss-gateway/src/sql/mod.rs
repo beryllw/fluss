@@ -15,11 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! P3 — SQL path module aggregation.
+//! SQL path module aggregation.
 //!
 //! `gateway_service` orchestrates SQL execution against fluss-datafusion;
 //! `environment` installs SQL environment differences (pg_catalog, session vars)
-//! via `SqlEnvironmentProvider`. Design: `design/sql-path.md` P3.
+//! via `SqlEnvironmentProvider`. Design: `design/sql-path.md`.
 
 pub mod gateway_service;
 pub mod environment;

@@ -15,17 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Concrete [`GatewayInstance`] implementation (回指 P1 facade / P2 session model).
+//! Concrete [`GatewayInstance`] implementation (the facade / session model).
 //!
-//! Composes the Phase 1 services behind the protocol-agnostic facade:
-//! - session lifecycle (open/close/get/alter) -> [`SessionManager`] (P2);
-//! - direct write + read-only metadata -> [`BackendFacade`] (P6.2/P6.3), the
-//!   only path that actually reaches Fluss this task;
-//! - operation cancel/status -> the owning session's `OperationManager` (P2.10),
+//! Composes the services behind the protocol-agnostic facade:
+//! - session lifecycle (open/close/get/alter) -> [`SessionManager`];
+//! - direct write + read-only metadata -> [`BackendFacade`], the
+//!   only path that actually reaches Fluss;
+//! - operation cancel/status -> the owning session's `OperationManager`,
 //!   resolved through a small op->session index.
 //!
 //! SQL `describe_sql` / `execute_sql` delegate to the [`SqlGatewayService`]
-//! (sql/gateway_service, design P3): per-session `SessionContext` build/rebuild +
+//! (sql/gateway_service): per-session `SessionContext` build/rebuild +
 //! DataFusion planning/execution. `execute_sql` also records the produced
 //! operation in `op_index` so cancel/status route to the owning session.
 
@@ -35,6 +35,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use crate::backend::BackendFacade;
+use crate::connection::{is_connection_dead, ConnectionManager};
 use crate::error::{GatewayError, GatewayResult};
 use crate::instance::GatewayInstance;
 use crate::session::manager::SessionManager;
@@ -47,7 +48,7 @@ use crate::types::{
     SqlDescription, SqlExecution, TableInfo, TableRef,
 };
 
-/// Phase 1 concrete gateway facade.
+/// Concrete gateway facade.
 ///
 /// Holds the session manager and the direct-path backend. It is constructed once
 /// per gateway process and shared (`Arc<dyn GatewayInstance>`) across the
@@ -56,7 +57,7 @@ use crate::types::{
 pub struct GatewayInstanceImpl {
     sessions: Arc<SessionManager>,
     backend: Arc<dyn BackendFacade>,
-    /// SQL execution orchestration (P3): per-session context build/rebuild +
+    /// SQL execution orchestration: per-session context build/rebuild +
     /// DataFusion planning/execution. Shares the same `SessionManager` so the
     /// operations it registers live on the very sessions this facade owns.
     sql: SqlGatewayService,
@@ -64,6 +65,29 @@ pub struct GatewayInstanceImpl {
     /// route to the right `OperationManager` without scanning every session.
     /// `execute_sql` populates this for each Query it produces.
     op_index: Mutex<HashMap<OperationId, SessionId>>,
+    /// Optional connection-recovery manager (production). When set, a query that
+    /// fails because the shared Fluss connection died triggers a bounded rebuild
+    /// (and a one-shot retry for reads). `None` in tests with a fake backend.
+    conn_manager: Option<Arc<ConnectionManager>>,
+}
+
+/// Run `$call` (an async expression). If it fails with a dead-connection error
+/// and a recovery manager is wired, rebuild the connection (bounded) and run
+/// `$call` once more. `$call` is evaluated at most twice, so its inputs must be
+/// cloned inside the expression.
+macro_rules! retry_on_dead_conn {
+    ($self:expr, $call:expr) => {{
+        match $call {
+            Err(e) if is_connection_dead(&e.to_string()) => {
+                if $self.try_recover().await {
+                    $call
+                } else {
+                    Err(e)
+                }
+            }
+            other => other,
+        }
+    }};
 }
 
 impl GatewayInstanceImpl {
@@ -80,7 +104,15 @@ impl GatewayInstanceImpl {
             backend,
             sql,
             op_index: Mutex::new(HashMap::new()),
+            conn_manager: None,
         }
+    }
+
+    /// Wire the connection-recovery manager (production). Without it the instance
+    /// still works but does not auto-rebuild a dead connection.
+    pub fn with_recovery(mut self, conn_manager: Arc<ConnectionManager>) -> Self {
+        self.conn_manager = Some(conn_manager);
+        self
     }
 
     pub fn sessions(&self) -> &Arc<SessionManager> {
@@ -90,11 +122,26 @@ impl GatewayInstanceImpl {
     pub fn backend(&self) -> &Arc<dyn BackendFacade> {
         &self.backend
     }
+
+    /// Attempt a bounded connection rebuild; `true` if a healthy connection is in
+    /// place afterwards. No-op (returns `false`) when no manager is wired.
+    async fn try_recover(&self) -> bool {
+        match &self.conn_manager {
+            Some(m) => match m.recover().await {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!(error = %e, "connection recovery failed");
+                    false
+                }
+            },
+            None => false,
+        }
+    }
 }
 
 #[async_trait]
 impl GatewayInstance for GatewayInstanceImpl {
-    // --- Session: delegate to SessionManager (P2) ---
+    // --- Session: delegate to SessionManager ---
 
     async fn open_session(&self, req: OpenSessionRequest) -> GatewayResult<SessionSnapshot> {
         let session = self.sessions.open(req)?;
@@ -123,15 +170,17 @@ impl GatewayInstance for GatewayInstanceImpl {
         Ok(session.snapshot())
     }
 
-    // --- SQL: delegate to the SQL gateway service (P3) ---
+    // --- SQL: delegate to the SQL gateway service ---
 
     async fn describe_sql(&self, req: DescribeSqlRequest) -> GatewayResult<SqlDescription> {
-        self.sql.describe_sql(req).await
+        retry_on_dead_conn!(self, self.sql.describe_sql(req.clone()).await)
     }
 
     async fn execute_sql(&self, req: ExecuteSqlRequest) -> GatewayResult<SqlExecution> {
         let session_id = req.session_id.clone();
-        let exec = self.sql.execute_sql(req).await?;
+        // Read-only path (PG rejects writes upstream): a dead-connection failure at
+        // planning/execute is safe to retry once after a bounded rebuild.
+        let exec = retry_on_dead_conn!(self, self.sql.execute_sql(req.clone()).await)?;
         // Index the produced operation so cancel/status route to its owning session.
         let op_id = match &exec {
             SqlExecution::Query { operation_id, .. } => operation_id.clone(),
@@ -141,7 +190,7 @@ impl GatewayInstance for GatewayInstanceImpl {
         Ok(exec)
     }
 
-    // --- Operation: route to the owning session's OperationManager (P2.10) ---
+    // --- Operation: route to the owning session's OperationManager ---
 
     async fn cancel_operation(&self, op_id: OperationId) -> GatewayResult<CancelResult> {
         let session_id = self.op_index.lock().unwrap().get(&op_id).cloned();
@@ -173,22 +222,31 @@ impl GatewayInstance for GatewayInstanceImpl {
             .ok_or_else(|| GatewayError::OperationNotFound(op_id.0.clone()))
     }
 
-    // --- Direct path: delegate to the backend (P6.2). Reads deferred (P5/§7). ---
+    // --- Direct path: delegate to the backend. Reads go through the SQL path. ---
 
     async fn read_direct(&self, _req: DirectReadRequest) -> GatewayResult<DirectReadResult> {
         Err(GatewayError::Unsupported(
-            "direct read (lookup / scan) is deferred past Phase 1".into(),
+            "direct read (lookup / scan) is not supported; query via the PostgreSQL SQL path".into(),
         ))
     }
 
     async fn write_direct(&self, req: DirectWriteRequest) -> GatewayResult<DirectWriteResult> {
-        self.backend.write(req).await
+        // Writes are at-least-once and not idempotent to auto-retry, so on a dead
+        // connection we rebuild (so the NEXT write succeeds) but surface this
+        // failure to the caller rather than risk a double write.
+        let r = self.backend.write(req).await;
+        if let Err(e) = &r {
+            if is_connection_dead(&e.to_string()) {
+                self.try_recover().await;
+            }
+        }
+        r
     }
 
-    // --- Metadata: delegate to the backend's read surface (P6.3) ---
+    // --- Metadata: delegate to the backend's read surface ---
 
     async fn list_databases(&self, scope: MetadataScope) -> GatewayResult<Vec<String>> {
-        self.backend.list_databases(&scope).await
+        retry_on_dead_conn!(self, self.backend.list_databases(&scope).await)
     }
 
     async fn list_tables(
@@ -196,9 +254,9 @@ impl GatewayInstance for GatewayInstanceImpl {
         scope: MetadataScope,
         database: String,
     ) -> GatewayResult<Vec<String>> {
-        // P1 facade gap closed: delegate to the database-scoped backend surface and
+        // Delegate to the database-scoped backend surface and
         // project to bare table names (the REST view returns names within a `{db}`).
-        let tables = self.backend.list_tables(&scope, &database).await?;
+        let tables = retry_on_dead_conn!(self, self.backend.list_tables(&scope, &database).await)?;
         Ok(tables.into_iter().map(|t| t.table).collect())
     }
 
@@ -207,7 +265,7 @@ impl GatewayInstance for GatewayInstanceImpl {
         scope: MetadataScope,
         table: TableRef,
     ) -> GatewayResult<TableInfo> {
-        self.backend.get_table_info(&scope, &table).await
+        retry_on_dead_conn!(self, self.backend.get_table_info(&scope, &table).await)
     }
 
     // --- Table management / DDL: delegate to the backend (design/direct-path.md) ---
@@ -217,7 +275,14 @@ impl GatewayInstance for GatewayInstanceImpl {
         scope: MetadataScope,
         request: CreateTableRequest,
     ) -> GatewayResult<()> {
-        self.backend.create_table(&scope, request).await
+        // DDL is a write: rebuild on a dead connection but do not auto-retry.
+        let r = self.backend.create_table(&scope, request).await;
+        if let Err(e) = &r {
+            if is_connection_dead(&e.to_string()) {
+                self.try_recover().await;
+            }
+        }
+        r
     }
 
     async fn drop_table(
@@ -226,9 +291,16 @@ impl GatewayInstance for GatewayInstanceImpl {
         table: TableRef,
         ignore_if_not_exists: bool,
     ) -> GatewayResult<()> {
-        self.backend
+        let r = self
+            .backend
             .drop_table(&scope, &table, ignore_if_not_exists)
-            .await
+            .await;
+        if let Err(e) = &r {
+            if is_connection_dead(&e.to_string()) {
+                self.try_recover().await;
+            }
+        }
+        r
     }
 }
 
@@ -359,7 +431,7 @@ mod tests {
         .unwrap()
     }
 
-    // Session lifecycle round-trips through the SessionManager (P2).
+    // Session lifecycle round-trips through the SessionManager.
     #[tokio::test]
     async fn open_get_alter_close_session() {
         let inst = instance();
@@ -454,7 +526,7 @@ mod tests {
     }
 
     // SQL path now executes through the SQL gateway service; the produced
-    // operation is indexed so cancel/status route to its owning session (P3).
+    // operation is indexed so cancel/status route to its owning session.
     #[tokio::test]
     async fn sql_execute_runs_and_indexes_operation() {
         use futures::TryStreamExt;
@@ -516,7 +588,7 @@ mod tests {
         assert!(matches!(s, Err(GatewayError::OperationNotFound(_))));
     }
 
-    // read_direct is deferred past Phase 1.
+    // read_direct is not supported (reads go through the SQL path).
     #[tokio::test]
     async fn read_direct_is_unsupported() {
         let inst = instance();

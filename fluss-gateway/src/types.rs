@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! P1 — shared neutral domain types.
+//! Shared neutral domain types.
 //!
 //! Gateway-owned, protocol-neutral domain types: identity / routing newtypes,
 //! session / SQL / operation / direct / metadata DTOs, and Arrow-native result
@@ -23,8 +23,7 @@
 //! free of protocol types (pgwire / axum / HTTP / JSON) and free of any
 //! fluss-datafusion / fluss-rs dependency. They are NOT the fluss-datafusion
 //! `types/` (DataFusion type bridging); do not conflate the two.
-//! Design: `design/core-session.md` §P1.2-§P1.6, §P2.2-§P2.4 and
-//! `design/direct-path.md` §1-§3.
+//! Design: `design/core-session.md` and `design/direct-path.md`.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -36,7 +35,7 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use tokio_util::sync::CancellationToken;
 
 // ---------------------------------------------------------------------------
-// identity / routing (§P1.2)
+// identity / routing
 // ---------------------------------------------------------------------------
 
 /// Connection-scoped SQL session identifier.
@@ -52,12 +51,12 @@ pub struct OperationId(pub String);
 pub struct RequestId(pub String);
 
 /// Logical cluster identifier. The inner value is semantically a cluster name;
-/// Phase 1 is always `"default"`.
+/// always `"default"` (single-cluster).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ClusterId(pub String);
 
 /// Authenticated identity, preserved through the internal call chain even where
-/// Fluss does not yet consume it (DESIGN.md §2).
+/// Fluss does not consume it (DESIGN.md §2).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Principal {
     pub name: String,
@@ -68,7 +67,7 @@ pub struct Principal {
 pub struct SqlEnvironmentId(pub String);
 
 // ---------------------------------------------------------------------------
-// protocol context (§P1.2)
+// protocol context
 // ---------------------------------------------------------------------------
 
 /// Which frontend protocol a session / request arrived through.
@@ -87,7 +86,7 @@ pub struct ClientInfo {
 }
 
 // ---------------------------------------------------------------------------
-// session domain (§P2.2-§P2.4)
+// session domain
 // ---------------------------------------------------------------------------
 
 /// Information fixed at connection-establishment time.
@@ -138,7 +137,7 @@ pub struct SessionSnapshot {
 
 /// A single mutation applied to a live session. Processing order is fixed:
 /// update [`SessionVars`] first, then compute and apply the runtime effect.
-/// 详见 core-session.md §P2.4。
+/// 详见 core-session.md。
 #[derive(Debug, Clone)]
 pub enum SessionMutation {
     SetStatementTimeout(Option<Duration>),
@@ -149,13 +148,13 @@ pub enum SessionMutation {
     UnsetEnvironmentVar { key: String },
     /// Reset all mutable session state to the values fixed at `open_session`
     /// (the connection's initial [`SessionVars`]) and force a context rebuild
-    /// before the next query. Backs `DISCARD ALL` (sql-path.md §P4.3); its effect
+    /// before the next query. Backs `DISCARD ALL` (sql-path.md); its effect
     /// is always `RebuildContextBeforeNextQuery`.
     ResetAll,
 }
 
 /// How a [`SessionMutation`] affects the live `SessionContext`.
-/// 详见 core-session.md §P2.4 / §P2.5。
+/// 详见 core-session.md。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionMutationEffect {
     SessionOnly,
@@ -164,7 +163,7 @@ pub enum SessionMutationEffect {
 }
 
 // ---------------------------------------------------------------------------
-// SQL domain (§P1.4-§P1.5)
+// SQL domain
 // ---------------------------------------------------------------------------
 
 /// Request to describe (plan / analyze without executing) a SQL statement.
@@ -177,7 +176,7 @@ pub struct DescribeSqlRequest {
 /// Result of describing a SQL statement: the result schema plus the inferred
 /// parameter types, both Arrow-native. `param_types[i]` is the Arrow type of the
 /// `$(i+1)` placeholder; the protocol boundary maps these to PG type OIDs for the
-/// `ParameterDescription` reply (sql-path.md §P4.4). An empty vec means the
+/// `ParameterDescription` reply (sql-path.md). An empty vec means the
 /// statement is non-parameterized (or the environment cannot infer parameters).
 #[derive(Debug, Clone)]
 pub struct SqlDescription {
@@ -189,7 +188,7 @@ pub struct SqlDescription {
 #[derive(Debug, Clone, Default)]
 pub struct SqlExecutionOptions {
     /// Optional per-request timeout override; combined with the session
-    /// `statement_timeout` per core-session.md §P2.9.
+    /// `statement_timeout` per core-session.md.
     pub request_timeout: Option<Duration>,
 }
 
@@ -198,7 +197,7 @@ pub struct SqlExecutionOptions {
 /// `params` carries the bound positional parameter values for a parameterized
 /// statement (the `$1..$N` placeholders), already decoded to DataFusion-native
 /// [`ParamValues`] at the protocol boundary (PG wire text/binary -> `ScalarValue`,
-/// sql-path.md §P4.4). It is `None` for a plain, non-parameterized statement
+/// sql-path.md). It is `None` for a plain, non-parameterized statement
 /// (e.g. the simple-query path), and the SQL service applies it to the logical
 /// plan before execution.
 #[derive(Debug, Clone)]
@@ -211,9 +210,9 @@ pub struct ExecuteSqlRequest {
 
 /// Arrow-native result of executing a SQL statement.
 ///
-/// The `Command` branch is kept for shape stability even though Phase 1 PG is
+/// The `Command` branch is kept for shape stability even though PG is
 /// read-only — preserving the shape is not the same as supporting SQL writes
-/// (core-session.md §P1.5). Carries a stream, so this type is not `Clone`/`Debug`.
+/// (core-session.md). Carries a stream, so this type is not `Clone`/`Debug`.
 pub enum SqlExecution {
     Query {
         operation_id: OperationId,
@@ -227,12 +226,12 @@ pub enum SqlExecution {
 }
 
 // ---------------------------------------------------------------------------
-// operation domain (§P2.7, §P2.10)
+// operation domain
 // ---------------------------------------------------------------------------
 
 /// Operation lifecycle state. `CancelRequested` is transitional; `Cancelled` /
 /// `TimedOut` / `Failed` are mutually exclusive terminal states with no
-/// regression. 详见 core-session.md §P2.7。
+/// regression. 详见 core-session.md。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OperationState {
     Pending,
@@ -254,7 +253,7 @@ pub struct OperationStatusSnapshot {
 }
 
 /// Outcome of a cancel request. Distinguishes the three cases required by
-/// core-session.md §P2.10.
+/// core-session.md.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CancelResult {
     /// No operation matched the supplied id.
@@ -266,12 +265,12 @@ pub enum CancelResult {
 }
 
 // ---------------------------------------------------------------------------
-// direct domain (direct-path.md §1-§3)
+// direct domain (direct-path.md)
 // ---------------------------------------------------------------------------
 
 /// Request-scoped execution context for the direct path. Constructed per REST
 /// request and dropped at request end; never enters the SessionManager and
-/// never creates an Operation. 权威定义见 direct-path.md §1。
+/// never creates an Operation. 权威定义见 direct-path.md。
 pub struct RequestExecutionContext {
     pub principal: Principal,
     pub cluster: ClusterId,
@@ -280,8 +279,9 @@ pub struct RequestExecutionContext {
     pub cancel: CancellationToken,
 }
 
-/// Direct read request shapes. 本期后置（Phase 1 不实现），形状先冻结。
-/// 详见 direct-path.md §2。
+/// Direct read request shapes. The shape is frozen; direct read over the direct
+/// path is not currently supported (reads go via the PostgreSQL SQL path).
+/// 详见 direct-path.md。
 pub enum DirectReadRequest {
     /// Full primary-key equality point lookup.
     Lookup {
@@ -312,7 +312,7 @@ pub enum DirectReadRequest {
 
 /// Arrow-native direct read result; encoding to JSON / Arrow IPC happens at the
 /// REST boundary. Carries a stream, so this type is not `Clone`/`Debug`.
-/// 本期后置。详见 direct-path.md §2 / §5。
+/// Direct read over the direct path is not currently supported. 详见 direct-path.md。
 pub struct DirectReadResult {
     pub schema: SchemaRef,
     pub stream: SendableRecordBatchStream,
@@ -320,7 +320,7 @@ pub struct DirectReadResult {
 
 /// Direct write request shapes. Body is already decoded to Arrow-native at the
 /// boundary; schema is taken from the target table (no schema-on-write).
-/// 详见 direct-path.md §3。
+/// 详见 direct-path.md。
 pub enum DirectWriteRequest {
     /// KV table upsert of a batch of rows.
     KvUpsert {
@@ -343,7 +343,7 @@ pub enum DirectWriteRequest {
 }
 
 /// Domain write summary. Carries no HTTP status semantics; the REST boundary
-/// maps this (and any error) to a response. 详见 direct-path.md §6。
+/// maps this (and any error) to a response. 详见 direct-path.md。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirectWriteResult {
     /// Number of rows the gateway submitted to the backend.
@@ -351,11 +351,11 @@ pub struct DirectWriteResult {
 }
 
 // ---------------------------------------------------------------------------
-// metadata domain (§P1.3, §P1.6)
+// metadata domain
 // ---------------------------------------------------------------------------
 
 /// Explicit access scope for metadata APIs; metadata is cluster-scoped and does
-/// not implicitly read session state. 详见 core-session.md §P1.3。
+/// not implicitly read session state. 详见 core-session.md。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetadataScope {
     pub principal: Principal,
@@ -369,7 +369,7 @@ pub struct TableRef {
     pub table: String,
 }
 
-/// Minimal table metadata summary. 详见 core-session.md §P1.6（后续阶段充实）。
+/// Minimal table metadata summary. 详见 core-session.md。
 #[derive(Debug, Clone)]
 pub struct TableInfo {
     pub name: TableRef,
