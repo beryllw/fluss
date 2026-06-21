@@ -44,6 +44,18 @@ The gateway surface is split into two paths:
 - JSON 行格式写入
 - Arrow IPC stream 写入
 
+### MCP / MCP 入口
+
+- read-only MCP (Model Context Protocol) server for AI agents (Streamable HTTP)
+- four tools: `list_databases`, `list_tables`, `describe_table`, `query` (read-only SQL)
+- enable with `GATEWAY_MCP_ENABLED=true`; endpoint `http://<host>:8000/mcp`
+- agent onboarding guide: [`design/mcp-access.md`](./design/mcp-access.md)
+
+- 面向 AI agent 的只读 MCP server(Streamable HTTP)
+- 4 个工具：`list_databases`、`list_tables`、`describe_table`、`query`(只读 SQL)
+- 用 `GATEWAY_MCP_ENABLED=true` 开启；端点 `http://<host>:8000/mcp`
+- agent 接入指南：[`design/mcp-access.md`](./design/mcp-access.md)
+
 Implemented REST endpoints:
 
 ```text

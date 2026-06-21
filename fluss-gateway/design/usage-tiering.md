@@ -120,7 +120,8 @@ curl -u alice:s3cret -H 'Content-Type: application/json' -X POST \
 ### 3.5 读（MCP，给 agent）
 启用 `GATEWAY_MCP_ENABLED=true` 后，MCP 端点在 `http://<host>:8000/mcp`，提供 4 个只读工具：
 `list_databases` / `list_tables` / `describe_table` / `query`。`query` 跑单条只读 SQL，
-与上面 PG 的 SELECT 等价（同一条 SQL 路径）。
+与上面 PG 的 SELECT 等价（同一条 SQL 路径）。完整 agent 接入指南(客户端配置 / curl 握手 / 工具
+schema)见 [`mcp-access.md`](mcp-access.md)。
 
 ---
 

@@ -60,6 +60,8 @@ docker run --rm \
 | `FLUSS_BOOTSTRAP_SERVERS` | `127.0.0.1:9123`   | Fluss cluster bootstrap server(s)    |
 | `GATEWAY_PG_LISTEN`       | `0.0.0.0:5432`     | PostgreSQL bind address              |
 | `GATEWAY_REST_LISTEN`     | `0.0.0.0:8080`     | REST bind address                    |
+| `GATEWAY_MCP_ENABLED`     | `false`            | enable the read-only MCP server      |
+| `GATEWAY_MCP_LISTEN`      | `0.0.0.0:8000`     | MCP bind address (when enabled)      |
 | `FLUSS_CLUSTER`           | `default`          | Logical cluster id                   |
 | `GATEWAY_CONFIG`          | unset              | YAML config file path                |
 | `GATEWAY_USERS`           | unset              | `user:secret,...` auth override      |
@@ -73,6 +75,22 @@ docker run --rm \
 
 The gateway retries the cluster connection a few times at startup, so it can be
 launched slightly before the cluster is ready.
+
+## MCP (for AI agents)
+
+Enable the read-only MCP server with `GATEWAY_MCP_ENABLED=true` (publish port
+`8000`); agents connect at `http://<host>:8000/mcp` over MCP Streamable HTTP with
+`Authorization: Basic`, and get four read-only tools (`list_databases`,
+`list_tables`, `describe_table`, `query`). Full agent onboarding guide:
+[`fluss-gateway/design/mcp-access.md`](../../fluss-gateway/design/mcp-access.md).
+
+```bash
+docker run --rm \
+  -e FLUSS_BOOTSTRAP_SERVERS=host.docker.internal:9123 \
+  -e GATEWAY_MCP_ENABLED=true \
+  -p 5432:5432 -p 8080:8080 -p 8000:8000 \
+  apache/fluss-gateway
+```
 
 ## Connection recovery
 
