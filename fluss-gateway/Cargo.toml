@@ -1,6 +1,6 @@
 # Fluss Gateway — dependency version matrix (see DESIGN.md §3).
 #
-# Aligned to the upstream `fluss-rust` datafusion-v0.3.1 line:
+# Aligned to the upstream `fluss-rust` datafusion-v0.3.2 line:
 #   datafusion = 53.0.0, arrow = 58.0.0, tokio = 1.44.2
 # The PostgreSQL compatibility stack is pinned around that line:
 #   pgwire 0.40.x         -> matches arrow-pg 0.14 (pgwire ^0.40)
@@ -8,7 +8,7 @@
 #   datafusion-pg-catalog 0.17 -> targets datafusion ^53
 #
 # Fluss access uses the upstream `fluss-datafusion` + `fluss-rs` crates as pinned
-# git dependencies at rev aa19a58 (tag datafusion-v0.3.1). This line provides
+# git dependencies at rev 0422cb2 (tag datafusion-v0.3.2). This line provides
 # `FlussDatafusion::swap_connection` (runtime connection hot-swap) and a
 # self-healing RPC layer (a stopped connection is reconnected; scanner metadata
 # retries are bounded), which the gateway's connection-recovery manager builds on.
@@ -59,8 +59,8 @@ arc-swap = "1"
 
 # --- Fluss access (git deps; datafusion-v0.3.1 line aligns df53/arrow58) ---
 # `lake` (Paimon) left off -> self-contained git dependency.
-fluss = { package = "fluss-rs", git = "https://github.com/beryllw/fluss-rust.git", rev = "aa19a58f8a3d88b1e3b2447b6d41b6c28d9dd520", features = ["storage-all"] }
-fluss-datafusion = { git = "https://github.com/beryllw/fluss-rust.git", rev = "aa19a58f8a3d88b1e3b2447b6d41b6c28d9dd520" }
+fluss = { package = "fluss-rs", git = "https://github.com/beryllw/fluss-rust.git", rev = "0422cb20c29d151730ac97600bb4bd9c5398b13f", features = ["storage-all"] }
+fluss-datafusion = { git = "https://github.com/beryllw/fluss-rust.git", rev = "0422cb20c29d151730ac97600bb4bd9c5398b13f" }
 
 # --- HTTP (REST direct path + OTLP HTTP) ---
 axum = "0.8"
@@ -98,7 +98,7 @@ integration_tests = []
 [dev-dependencies]
 # Brings up a throwaway Fluss cluster in docker for the integration_tests path.
 # Same git rev as the `fluss` / `fluss-datafusion` deps so the client types unify.
-fluss-test-cluster = { git = "https://github.com/beryllw/fluss-rust.git", rev = "aa19a58f8a3d88b1e3b2447b6d41b6c28d9dd520" }
+fluss-test-cluster = { git = "https://github.com/beryllw/fluss-rust.git", rev = "0422cb20c29d151730ac97600bb4bd9c5398b13f" }
 # Real PostgreSQL wire client for protocol integration tests (P4). Drives the
 # gateway over loopback TCP with no Fluss cluster, against a fake GatewayInstance.
 tokio-postgres = "0.7"

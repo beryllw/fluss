@@ -16,13 +16,13 @@ gateway 只通过两个东西与该 crate 交互：**一个共享 `FlussDatafusi
 
 ### SQL 能力边界（gateway 依赖的下推语义）
 
-下面的能力以 `datafusion-v0.2.4` 为准（gateway 已在 cluster e2e 中端到端验证，自身无需改动，全部经由公共 `register_catalog` 契约消费）：
+下面的能力以当前 `fluss-rust` `datafusion-v0.3.2` line 为准（gateway 已在 cluster e2e 中端到端验证，自身无需改动，全部经由公共 `register_catalog` 契约消费）：
 
 - KV point lookup 下推：完整主键等值 → 单次 point lookup，**不经全表扫**。
 - KV prefix lookup 下推：当 bucket key 是物理主键的严格前缀时，bucket key 的完整等值谓词（如 `PRIMARY KEY (c1, c2)` + bucket key `c1` 上的 `WHERE c1 = ...`）→ prefix lookup，返回该前缀下的多行；分区 KV 表还要求所有分区键带等值谓词。
-- KV bounded scan 下推：无完整主键/前缀谓词但带 `LIMIT n` → **接受 `limit` 的 bounded KV scan**，返回至多 n 行（v0.2.4 起支持，`SELECT * FROM kv LIMIT n` 可用）。顺序不保证（按 bucket / 存储顺序），gateway 不假设有序。
-- Log scan 下推：带 `LIMIT n` → 从 earliest 起的前 n 行；不带 `LIMIT` → 取查询开始时的 latest offset 快照做有限全量扫描（v0.2.4 起）。
-- 非下推 SQL 的保守处理：KV 既无完整主键/前缀等值、又无 `LIMIT` → **返回清晰错误**，不伪装成无界全表扫（gateway 据此把错误映射到协议层）。
+- KV bounded scan 下推：无完整主键/前缀谓词但带 `LIMIT n` → **接受 `limit` 的 bounded KV scan**，返回至多 n 行（`SELECT * FROM kv LIMIT n` 可用）。顺序不保证（按 bucket / 存储顺序），gateway 不假设有序。
+- Log scan 下推：带 `LIMIT n` → 从 earliest 起的前 n 行；不带 `LIMIT` → 取查询开始时的 latest offset 快照做有限全量扫描。
+- 非下推 SQL 的保守处理：KV 既无完整主键/前缀等值、又无 `LIMIT` → **返回清晰错误**，不伪装成无界全表扫。`datafusion-v0.3.2` 进一步明确了这一点：非 lake KV full scan 直接拒绝，gateway 据此把错误映射到协议层，并验证失败后连接仍可继续服务支持路径。
 - **cancel 协作性（crate-facing 契约）**：下推的 KV lookup / KV scan / Log scan 对应的 `ExecutionPlan` / stream 必须接受协作取消（`CancellationToken` 或在 `poll_next` 中响应取消信号），在执行过程中尽快协作退出并释放底层资源。gateway 的 tracked stream 停止 poll 或触发 cancel/timeout 时，依赖这点真正中止后端读取——否则 [`core-session.md`](core-session.md) 的 cooperative cancel / timeout 语义无法落地。
 
 ### 类型与错误边界（跨 crate 的对接面）

@@ -33,7 +33,7 @@
 //!    with the Fluss client (KV `Lookuper`) to prove the write actually landed.
 //! 3. (c) PG SELECT: drive the spawned `PgServer` with `tokio-postgres` — a
 //!    full-PK point lookup on the KV table, a KV bounded `LIMIT` scan, a KV
-//!    prefix lookup (`WHERE c1 = ...` on a composite-PK table, datafusion-v0.2.4),
+//!    prefix lookup (`WHERE c1 = ...` on a composite-PK table),
 //!    and a `LIMIT` bounded scan on the Log table — asserting the just-written
 //!    rows come back through the gateway's own SQL catalog path.
 //! 4. (d) REST METADATA: list databases, list the tables in the database, and
@@ -105,8 +105,8 @@ const DATABASE: &str = "fluss";
 const KV_TABLE: &str = "gw_kv";
 const LOG_TABLE: &str = "gw_log";
 // Composite-PK KV table whose bucket key (`c1`) is a STRICT prefix of the PK
-// `(c1, c2)`, so a `WHERE c1 = ...` predicate exercises KV prefix lookup
-// (datafusion-v0.2.4). Seeded so one `c1` matches several rows.
+// `(c1, c2)`, so a `WHERE c1 = ...` predicate exercises KV prefix lookup.
+// Seeded so one `c1` matches several rows.
 const KV_PREFIX_TABLE: &str = "gw_kv_prefix";
 /// Append-only OTLP logs landing table (subset of the telemetry column contract).
 const OTLP_LOGS_TABLE: &str = "gw_otlp_logs";
@@ -445,9 +445,9 @@ async fn cluster_rest_kv_and_log_then_pg_selects() {
     assert_eq!(kv_rows[0].get("id"), Some("2"));
     assert_eq!(kv_rows[0].get("name"), Some("bob"));
 
-    // (c2) KV bounded scan (datafusion-v0.2.4): `SELECT ... LIMIT n` on a KV table
-    // without a primary-key predicate now returns up to n rows (previously a clear
-    // "unsupported" error). gw_kv has 2 rows; LIMIT 1 must bound to exactly one.
+    // (c2) KV bounded scan: `SELECT ... LIMIT n` on a KV table without a
+    // primary-key predicate returns up to n rows (previously a clear "unsupported"
+    // error). gw_kv has 2 rows; LIMIT 1 must bound to exactly one.
     let rows = tokio::time::timeout(
         Duration::from_secs(30),
         pg_client.simple_query(&format!(
@@ -463,8 +463,46 @@ async fn cluster_rest_kv_and_log_then_pg_selects() {
         .count();
     assert_eq!(kv_scan_rows, 1, "KV bounded scan respects LIMIT 1");
 
-    // (c3) KV prefix lookup (datafusion-v0.2.4): a `WHERE c1 = 10` predicate on the
-    // bucket-key prefix returns all matching rows (three share c1 = 10), not just one.
+    // (c2b) datafusion-v0.3.2: a non-lake KV full scan without a primary-key /
+    // bucket-key predicate or LIMIT is rejected cleanly rather than falling back
+    // to an unbounded scan. The shared connection must remain usable afterward.
+    let full_scan = tokio::time::timeout(
+        Duration::from_secs(30),
+        pg_client.simple_query(&format!(
+            "SELECT id, name FROM fluss.{DATABASE}.{KV_TABLE}"
+        )),
+    )
+    .await
+    .expect("PG KV full-scan rejection timed out");
+    let err = full_scan.expect_err("non-lake KV full scan should be rejected");
+    let msg = err.to_string();
+    assert!(
+        !msg.trim().is_empty(),
+        "rejected full-scan error should surface a non-empty message"
+    );
+
+    let rows = tokio::time::timeout(
+        Duration::from_secs(30),
+        pg_client.simple_query(&format!(
+            "SELECT id, name FROM fluss.{DATABASE}.{KV_TABLE} WHERE id = 1"
+        )),
+    )
+    .await
+    .expect("PG KV point lookup after rejected full scan timed out")
+    .expect("PG KV point lookup after rejected full scan");
+    let after_rows: Vec<_> = rows
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(r) => Some(r),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(after_rows.len(), 1, "connection stays usable after rejected full scan");
+    assert_eq!(after_rows[0].get("name"), Some("alice"));
+
+    // (c3) KV prefix lookup: a `WHERE c1 = 10` predicate on the bucket-key prefix
+    // (a strict prefix of the PK) returns all matching rows (three share c1 = 10),
+    // not just one.
     tokio::time::timeout(Duration::from_secs(30), wait_for_bucket0(&gw_conn, KV_PREFIX_TABLE))
         .await
         .expect("prefix table bucket never became readable");

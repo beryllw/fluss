@@ -5,19 +5,23 @@ work for additional information regarding copyright ownership. The ASF
 licenses this file to you under the Apache License, Version 2.0.
 -->
 
-# 升级到 fluss-rust datafusion-v0.3.1 + 连接自动恢复
+# 升级到 fluss-rust datafusion-v0.3.2 + 连接自动恢复
 
 ## 概要
-gateway 升级到上游 `beryllw/fluss-rust` `datafusion-v0.3.1`（rev `aa19a58`），并实现“Fluss 连接挂掉 → 自动关闭旧连接 + 新建 + 热替换、有界、不无限重试”。
+gateway 当前对齐上游 `beryllw/fluss-rust` `datafusion-v0.3.2`（rev `0422cb2`），连接自动恢复机制保持不变：当 Fluss 连接挂掉时，gateway 仍负责“关闭旧连接 → 新建 → 热替换”，并坚持有界、单飞、不无限重试。
 
-升级过程中发现并由 v0.3.1 解决的两个上游问题：
-1. **git 依赖不自洽**：`fluss-datafusion` 经 `fluss-lake` 用 path 依赖外部 `paimon`，git 消费无法解析。v0.3.1（`da2061c`）把 `fluss-lake` 改为可选特性 `lake`（默认关闭）并 cfg-gate 相关源码 → 默认 git 依赖自洽。
-2. **全量/Log 扫描打死共享连接且不自愈**：v0.3.1（`aa19a58`）自愈被 stop 的连接并对 scanner 元数据重试做有界化 → 共享连接不再永久死亡。
+当前这条升级线包含两个阶段性的上游修复：
+1. **v0.3.1 基线修复**：
+   - `fluss-datafusion` 经 `fluss-lake` 用 path 依赖外部 `paimon`，git 消费无法解析。v0.3.1（`da2061c`）把 `fluss-lake` 改为可选特性 `lake`（默认关闭）并 cfg-gate 相关源码 → 默认 git 依赖自洽。
+   - **全量/Log 扫描打死共享连接且不自愈**：v0.3.1（`aa19a58`）自愈被 stop 的连接并对 scanner 元数据重试做有界化 → 共享连接不再永久死亡。
+2. **v0.3.2 小修复**：
+   - `0422cb2 fix(datafusion): reject non-lake KV full scans`
+   - 语义收紧为：非 lake KV 表不再接受无界 full scan；point lookup、bucket-key prefix lookup、带 `LIMIT` 的 bounded scan 仍是支持路径。
 
 ## 依赖矩阵
 | 依赖 | 版本 |
 |---|---|
-| fluss / fluss-datafusion / fluss-test-cluster | git rev `aa19a58`（tag datafusion-v0.3.1） |
+| fluss / fluss-datafusion / fluss-test-cluster | git rev `0422cb2`（tag datafusion-v0.3.2） |
 | arrow / arrow-schema | 58 |
 | datafusion | 53 |
 | pgwire | 0.40 |
@@ -37,7 +41,7 @@ gateway 升级到上游 `beryllw/fluss-rust` `datafusion-v0.3.1`（rev `aa19a58`
 - 触发（`GatewayInstanceImpl`）：读/SQL 路径失败若 `is_connection_dead` → `recover()` → 重试一次；写/DDL → 仅 `recover()`（为下次成功，避免 at-least-once 双写）。
 - **绝不无限重试**：每次 `recover()` ≤3 次；每个失败查询至多 1 次重试。
 
-这层与上游 v0.3.1 的自愈互补：多数瞬时断连由上游 RPC 层透明重连，gateway 的重建是兜底。
+这层与上游 v0.3.x 的自愈互补：多数瞬时断连由上游 RPC 层透明重连，gateway 的重建是兜底。v0.3.2 在此基础上进一步收紧了非 lake KV full scan 的语义，但不改变这套恢复接线。
 
 ## 实测结论
 - **依赖自洽**：纯 git rev（无本地 path、无 paimon）即可 `cargo build`。
