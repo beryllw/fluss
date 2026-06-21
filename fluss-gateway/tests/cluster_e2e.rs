@@ -72,10 +72,11 @@ use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 
 use fluss::client::FlussConnection;
-use fluss::metadata::{DataTypes, Schema, TableDescriptor, TablePath};
+use fluss::metadata::{DataTypes, Schema, TableBucket, TableDescriptor, TablePath};
 use fluss::row::{DataGetters, GenericRow};
 use fluss::rpc::message::OffsetSpec;
-use fluss_test_cluster::{FlussTestingCluster, FlussTestingClusterBuilder};
+use fluss_datafusion::{clear_test_lake_s3_endpoint_override, set_test_lake_s3_endpoint_override};
+use fluss_test_cluster::{FlussTestingCluster, FlussTestingClusterBuilder, PaimonLakeConfig};
 
 use fluss_gateway::auth::TrustAuthenticator;
 use fluss_gateway::backend::FlussBackendFacade;
@@ -120,6 +121,8 @@ const LOG_TABLE: &str = "gw_log";
 const KV_PREFIX_TABLE: &str = "gw_kv_prefix";
 /// Append-only OTLP logs landing table (subset of the telemetry column contract).
 const OTLP_LOGS_TABLE: &str = "gw_otlp_logs";
+/// Lake-enabled KV (PRIMARY KEY) table for the lake+log union-read e2e.
+const LAKE_PK_TABLE: &str = "gw_lake_pk";
 
 const JSON: &str = "application/json";
 const ARROW: &str = "application/vnd.apache.arrow.stream";
@@ -1301,9 +1304,249 @@ async fn cluster_mcp_tools_against_live_fluss() {
     cluster.stop();
 }
 
+/// Lake + log UNION READ end-to-end through the gateway's MCP `query` tool.
+///
+/// Exercises the full production path: a `table.datalake.enabled = true` KV
+/// (PRIMARY KEY) table whose historical rows are tiered into Paimon by the real
+/// Flink tiering job, plus recent changelog still in the Fluss log tail. A
+/// `SELECT` then returns the PK-merged union (lake snapshot ++ log tail), and the
+/// `<table>$lake` suffix returns ONLY the tiered Paimon snapshot — both read
+/// through the gateway → fluss-datafusion union provider, driven by an MCP agent.
+///
+/// Mirrors upstream `lake_tiering_sql::sql_reads_real_tiered_lake_plus_log_tail`,
+/// but the read goes through the gateway's MCP tool instead of a raw SessionContext.
+#[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+async fn cluster_lake_log_union_read_via_mcp() {
+    let _permit = cluster_e2e_permit().await;
+    let cluster = FlussTestingClusterBuilder::new("gw-e2e-lake")
+        .with_port(MCP_CLUSTER_PORT + 1)
+        .with_paimon_lake(PaimonLakeConfig::new())
+        .with_tiering_service()
+        .build()
+        .await;
+    let bootstrap = cluster.plaintext_bootstrap_servers().to_string();
+    let connection = Arc::new(cluster.get_fluss_connection().await);
+
+    // Test seam: rewrite the lake S3 endpoint so the in-process Paimon reader
+    // (inside the gateway's FlussDatafusion) reaches the host-mapped RustFS store.
+    set_test_lake_s3_endpoint_override(
+        cluster.s3_endpoint_host().unwrap(),
+        cluster.s3_access_key().unwrap(),
+        cluster.s3_secret_key().unwrap(),
+    );
+
+    let admin = connection.get_admin().unwrap();
+    admin.create_database(DATABASE, None, true).await.unwrap();
+
+    // A lake-enabled KV (PRIMARY KEY) table: union read does PK merge of the
+    // tiered lake snapshot with the changelog tail.
+    let pk_path = TablePath::new(DATABASE, LAKE_PK_TABLE);
+    admin
+        .create_table(
+            &pk_path,
+            &TableDescriptor::builder()
+                .schema(
+                    Schema::builder()
+                        .column("id", DataTypes::int())
+                        .column("name", DataTypes::string())
+                        .primary_key(vec!["id".to_string()])
+                        .build()
+                        .unwrap(),
+                )
+                .distributed_by(Some(1), vec![])
+                .property("table.datalake.enabled", "true")
+                .property("table.datalake.freshness", "30s")
+                .build()
+                .unwrap(),
+            true,
+        )
+        .await
+        .unwrap();
+    let pk_table_id = admin.get_table_info(&pk_path).await.unwrap().get_table_id();
+
+    // Batch 1 -> tiered into Paimon. Upsert ids 1,2,3.
+    let pk_table = connection.get_table(&pk_path).await.unwrap();
+    let pk_writer = pk_table.new_upsert().unwrap().create_writer().unwrap();
+    pk_writer.upsert(&lake_pk_row(1, "v1")).unwrap();
+    pk_writer.upsert(&lake_pk_row(2, "v2")).unwrap();
+    pk_writer.upsert(&lake_pk_row(3, "v3")).unwrap();
+    pk_writer.flush().await.unwrap();
+    let pk_seam = lake_latest_offset(&connection, &pk_path).await;
+
+    // Run the real Flink tiering job until the Paimon snapshot reaches the seam,
+    // then stop it so the seam is frozen and batch 2 stays in the log tail.
+    let tiering = cluster.start_paimon_tiering().await;
+    wait_for_lake_seam(
+        &connection,
+        &pk_path,
+        pk_table_id,
+        pk_seam,
+        Duration::from_secs(240),
+    )
+    .await;
+    tiering.stop().await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Batch 2 stays in the Fluss log tail: update id 2, delete id 3, insert id 4.
+    pk_writer.upsert(&lake_pk_row(2, "v2b")).unwrap();
+    pk_writer.delete(&lake_pk_row(3, "v3")).unwrap();
+    pk_writer.upsert(&lake_pk_row(4, "v4")).unwrap();
+    pk_writer.flush().await.unwrap();
+
+    // Assemble the gateway over the same cluster and serve MCP.
+    let (instance, gw_conn) = assemble_instance(&bootstrap).await;
+    let mcp = McpServer::new(
+        instance.clone() as Arc<dyn GatewayInstance>,
+        Arc::new(TrustAuthenticator::new()),
+    );
+    let (mcp_listener, mcp_addr) = McpServer::bind("127.0.0.1:0").await.unwrap();
+    tokio::spawn(async move {
+        let _ = mcp.serve(mcp_listener).await;
+    });
+
+    let auth = format!("Basic {}", basic_auth("alice"));
+    let mut headers = HashMap::new();
+    headers.insert(AUTHORIZATION, HeaderValue::from_str(&auth).unwrap());
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(format!("http://{mcp_addr}/mcp"))
+            .custom_headers(headers),
+    );
+    let client = tokio::time::timeout(Duration::from_secs(30), ().serve(transport))
+        .await
+        .expect("MCP initialize timed out")
+        .expect("MCP initialize handshake");
+
+    // UNION READ via MCP query: lake current state (1,2,3) PK-merged with the
+    // changelog tail (update 2, delete 3, insert 4) => {1:v1, 2:v2b, 4:v4}.
+    let union = mcp_query_rows(
+        &client,
+        &format!("SELECT id, name FROM fluss.{DATABASE}.{LAKE_PK_TABLE}"),
+    )
+    .await;
+    assert_eq!(
+        union,
+        vec![
+            (1, "v1".to_string()),
+            (2, "v2b".to_string()),
+            (4, "v4".to_string()),
+        ],
+        "MCP union read: lake snapshot ++ log tail (id3 deleted, id2 updated, id4 inserted)"
+    );
+
+    // `<table>$lake` reads ONLY the tiered Paimon snapshot (1,2,3) — proving the
+    // union above genuinely combined the lake half with the live log tail.
+    let lake_only = mcp_query_rows(
+        &client,
+        &format!("SELECT id, name FROM fluss.{DATABASE}.{LAKE_PK_TABLE}$lake"),
+    )
+    .await;
+    let lake_ids: Vec<i64> = lake_only.iter().map(|(id, _)| *id).collect();
+    assert_eq!(
+        lake_ids,
+        vec![1, 2, 3],
+        "$lake returns only the tiered Paimon snapshot, excluding the log tail"
+    );
+
+    let _ = client.cancel().await;
+    clear_test_lake_s3_endpoint_override();
+    let admin = gw_conn.get_admin().unwrap();
+    let _ = admin.drop_table(&pk_path, true).await;
+    cluster.stop();
+}
+
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+/// Run an MCP `query` tool call and return its rows as sorted `(id, name)` pairs.
+async fn mcp_query_rows(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    sql: &str,
+) -> Vec<(i64, String)> {
+    let v = tokio::time::timeout(
+        Duration::from_secs(60),
+        client.call_tool(
+            CallToolRequestParams::new("query")
+                .with_arguments(object(serde_json::json!({ "sql": sql }))),
+        ),
+    )
+    .await
+    .expect("MCP query timed out")
+    .expect("MCP query call")
+    .structured_content
+    .expect("query structured content");
+    let mut rows: Vec<(i64, String)> = v["rows"]
+        .as_array()
+        .unwrap_or_else(|| panic!("query result has no rows array: {v}"))
+        .iter()
+        .map(|r| {
+            (
+                r["id"].as_i64().expect("id is an int"),
+                r["name"].as_str().unwrap_or("").to_string(),
+            )
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+fn lake_pk_row(id: i32, name: &str) -> GenericRow<'static> {
+    let mut r = GenericRow::new(2);
+    r.set_field(0, id);
+    r.set_field(1, name.to_string());
+    r
+}
+
+/// Latest log offset for bucket 0 — the tiering seam target.
+async fn lake_latest_offset(connection: &FlussConnection, table_path: &TablePath) -> i64 {
+    let admin = connection.get_admin().unwrap();
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(off) = admin
+            .list_offsets(table_path, &[0], OffsetSpec::Latest)
+            .await
+            .ok()
+            .and_then(|m| m.get(&0).copied())
+        {
+            return off;
+        }
+        if start.elapsed() >= READY_TIMEOUT {
+            panic!("bucket 0 of {table_path} not ready in {READY_TIMEOUT:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Wait until the Paimon lake snapshot for bucket 0 reaches `want_offset` (i.e.
+/// the tiering job has flushed batch 1 into the lake).
+async fn wait_for_lake_seam(
+    connection: &FlussConnection,
+    table_path: &TablePath,
+    table_id: i64,
+    want_offset: i64,
+    timeout: Duration,
+) {
+    let admin = connection.get_admin().unwrap();
+    let bucket = TableBucket::new(table_id, 0);
+    let start = std::time::Instant::now();
+    let mut last;
+    loop {
+        match admin.get_latest_lake_snapshot(table_path).await {
+            Ok(snapshot) => {
+                let offset = snapshot.table_buckets_offset().get(&bucket).copied();
+                last = format!("snapshot {} bucket0 offset {offset:?}", snapshot.snapshot_id());
+                if offset == Some(want_offset) {
+                    return;
+                }
+            }
+            Err(e) => last = format!("error: {e}"),
+        }
+        if start.elapsed() >= timeout {
+            panic!("lake seam did not reach offset {want_offset} within {timeout:?}; last = {last}");
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
 
 /// Append-only OTLP logs landing table. A subset of the telemetry column
 /// contract is enough to prove the adapter writes by column name; columns the
