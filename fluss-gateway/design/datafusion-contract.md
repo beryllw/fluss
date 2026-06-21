@@ -28,6 +28,10 @@ gateway 只通过两个东西与该 crate 交互：**一个共享 `FlussDatafusi
 ### 类型与错误边界（跨 crate 的对接面）
 
 - Arrow schema / row conversion 契约：Fluss schema → Arrow schema、Fluss row → `RecordBatch`，结果统一 Arrow-native（gateway 编码层依赖这点）。
+- lake 存储凭据注入契约：服务端会把 `datalake.paimon.s3.endpoint` / `region` 等非 secret
+  属性下发给客户端,但不会下发 `s3.access-key` / `s3.secret-key`。若 gateway 要在生产里读取
+  S3 上的 Paimon lake,`fluss-datafusion` / `fluss-lake` 需要提供一个 crate-facing API 让调用方补
+  这份 lake 存储凭据;详见 [`lake-s3-credentials-requirement.md`](lake-s3-credentials-requirement.md)。
 - `ScalarValue -> Fluss key` 转换边界：谓词/bind 值的基础 `ScalarValue` 安全转 Fluss key representation，转换失败给明确错误。
 - `FlussDatafusionError` 与 gateway domain error 的分层：crate 只产 DataFusion 集成层错误（不掺协议码），gateway 在 SQL 服务入口映射成 domain error（呼应 [`infra.md`](infra.md) 的错误分层）。
 

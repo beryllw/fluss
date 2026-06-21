@@ -105,6 +105,18 @@ curl -u alice:ignored \
   http://127.0.0.1:<rest-port>/v1/clusters/default/databases
 ```
 
+### Deploying against a Fluss cluster (with / without tiering) / 配合 Fluss 集群部署（带 / 不带 tiering）
+
+For end-to-end operation against a Fluss cluster — environment configuration,
+running with a plain real-time cluster, and running with lake (Paimon) **tiering**
+for `lake + log` union read (plus the required `datalake.*` / `s3.region` config and
+troubleshooting) — see the usage guide:
+
+配合 Fluss 集群的完整使用（环境变量配置、连普通实时集群、以及开 lake/Paimon **tiering**
+做 `lake + log` union read，含必需的 `datalake.*` / `s3.region` 配置与排错），见使用文档：
+
+- [`design/usage-tiering.md`](./design/usage-tiering.md) — gateway + Fluss cluster, with / without tiering / 带与不带 tiering 的使用文档
+
 ## Scope and limits / 范围与限制
 
 The gateway's behavior is bounded as follows:

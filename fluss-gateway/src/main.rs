@@ -32,6 +32,11 @@
 //! - `FLUSS_CLUSTER`           (default `default`)        — logical cluster id.
 //! - `GATEWAY_CONFIG`          (optional)                 — YAML config file.
 //! - `GATEWAY_USERS`           (optional)                 — `user:secret,...` auth override.
+//! - `GATEWAY_LAKE_S3_ACCESS_KEY` / `..._SECRET_KEY` (optional) — lake (Paimon) S3
+//!   credentials for reading lake-enabled tables; also `..._ENDPOINT` / `..._REGION`
+//!   / `..._PATH_STYLE_ACCESS`, and a generic `GATEWAY_LAKE_STORAGE_OPTIONS`
+//!   (`key=value,...`) passthrough. The Fluss server strips S3 secrets from table
+//!   properties, so the gateway supplies them here.
 //! - `RUST_LOG`                (default `info`)           — tracing filter.
 //!
 //! Auth note: when users are configured (YAML file and/or env override), the
@@ -77,6 +82,10 @@ struct GatewayConfig {
     otlp_logs_table: Option<TableRef>,
     otlp_metrics_table: Option<TableRef>,
     otlp_traces_table: Option<TableRef>,
+    /// Lake (Paimon) storage options forwarded to `fluss-datafusion` so the SQL
+    /// path can read lake tables on S3 (the Fluss server strips the credentials
+    /// from table properties; the gateway supplies them from its own config).
+    lake_storage_options: HashMap<String, String>,
 }
 
 impl GatewayConfig {
@@ -117,6 +126,7 @@ impl GatewayConfig {
             otlp_logs_table,
             otlp_metrics_table,
             otlp_traces_table,
+            lake_storage_options: lake_storage_options_from_env(),
         };
         cfg.validate_otlp()?;
         Ok(cfg)
@@ -170,6 +180,45 @@ fn parse_table_ref(name: &str, raw: &str) -> Result<TableRef, GatewayError> {
         database: database.to_string(),
         table: table.to_string(),
     })
+}
+
+/// Build the lake (Paimon) storage options forwarded to `fluss-datafusion` as
+/// `FlussDatafusionOptions.lake_storage_options`. They are merged (caller-wins)
+/// into each lake table's server-derived catalog properties just before the
+/// Paimon catalog is opened — used to supply the S3 credentials the Fluss server
+/// strips from table properties by policy. Keys are the prefix-stripped form
+/// (`s3.access-key`, `s3.secret-key`, `s3.endpoint`, `s3.region`, ...).
+///
+/// Sources (later wins): a generic `GATEWAY_LAKE_STORAGE_OPTIONS` passthrough
+/// (`key=value,key=value`, e.g. for `oss.*`), then the discrete `GATEWAY_LAKE_S3_*`
+/// vars (one whole value per var, so secrets containing `,`/`=` are safe).
+fn lake_storage_options_from_env() -> HashMap<String, String> {
+    let mut opts = HashMap::new();
+    if let Ok(raw) = std::env::var("GATEWAY_LAKE_STORAGE_OPTIONS") {
+        for pair in raw.split(',') {
+            if let Some((k, v)) = pair.split_once('=') {
+                let k = k.trim();
+                if !k.is_empty() {
+                    opts.insert(k.to_string(), v.trim().to_string());
+                }
+            }
+        }
+    }
+    for (env_key, opt_key) in [
+        ("GATEWAY_LAKE_S3_ACCESS_KEY", "s3.access-key"),
+        ("GATEWAY_LAKE_S3_SECRET_KEY", "s3.secret-key"),
+        ("GATEWAY_LAKE_S3_ENDPOINT", "s3.endpoint"),
+        ("GATEWAY_LAKE_S3_REGION", "s3.region"),
+        ("GATEWAY_LAKE_S3_PATH_STYLE_ACCESS", "s3.path-style-access"),
+    ] {
+        if let Ok(v) = std::env::var(env_key) {
+            let v = v.trim();
+            if !v.is_empty() {
+                opts.insert(opt_key.to_string(), v.to_string());
+            }
+        }
+    }
+    opts
 }
 
 fn build_authenticator(
@@ -303,10 +352,14 @@ async fn assemble_instance(
     let connection = resolve_with_retry(&conn_provider, &cluster, &principal).await?;
 
     // SQL path: real Fluss catalog behind the PostgreSQL SQL environment provider.
+    // Lake (Paimon) storage options carry the S3 credentials the Fluss server
+    // strips from table properties, so the union-read path can open the lake.
     let fluss_df = Arc::new(
         fluss_datafusion::FlussDatafusion::new(
             Arc::clone(&connection),
-            fluss_datafusion::FlussDatafusionOptions::default(),
+            fluss_datafusion::FlussDatafusionOptions {
+                lake_storage_options: config.lake_storage_options.clone(),
+            },
         )
         .await?,
     );
@@ -433,6 +486,7 @@ mod tests {
                 database: "obs".into(),
                 table: "traces".into(),
             }),
+            lake_storage_options: HashMap::new(),
         };
         let err = cfg.validate_otlp().unwrap_err();
         assert!(matches!(err, GatewayError::InvalidArgument(_)));

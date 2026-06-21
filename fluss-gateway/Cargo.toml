@@ -1,20 +1,22 @@
 # Fluss Gateway — dependency version matrix (see DESIGN.md §3).
 #
-# Aligned to the upstream `fluss-rust` datafusion-v0.4.1 line:
-#   datafusion = 53.0.0, arrow = 58.0.0, tokio = 1.44.2  (unchanged from v0.3.2)
+# Aligned to the upstream `fluss-rust` datafusion-v0.5.0 line:
+#   datafusion = 53.0.0, arrow = 58.0.0, tokio = 1.44.2  (unchanged since v0.3.2)
 # The PostgreSQL compatibility stack is pinned around that line:
 #   pgwire 0.40.x         -> matches arrow-pg 0.14 (pgwire ^0.40)
 #   arrow-pg 0.14         -> targets arrow ^58 / datafusion ^53 (feature "datafusion")
 #   datafusion-pg-catalog 0.17 -> targets datafusion ^53
 #
 # Fluss access uses the upstream `fluss-datafusion` + `fluss-rs` crates as pinned
-# git dependencies at rev cb11ac6 (tag datafusion-v0.4.1). This line provides
-# `FlussDatafusion::swap_connection` (runtime connection hot-swap) and a
-# self-healing RPC layer (a stopped connection is reconnected; scanner metadata
-# retries are bounded), which the gateway's connection-recovery manager builds on.
+# git dependencies at rev 3cf1603 (tag datafusion-v0.5.0). This line provides
+# `FlussDatafusion::swap_connection` (runtime connection hot-swap), a self-healing
+# RPC layer (a stopped connection is reconnected; scanner metadata retries are
+# bounded), and `FlussDatafusionOptions.lake_storage_options` — a production hook
+# to supply the lake (Paimon) S3 credentials the Fluss server strips from table
+# properties (the gateway forwards `GATEWAY_LAKE_S3_*` config into it).
 # fluss-datafusion's `lake` feature (Paimon union read) is ON: it pulls `fluss-lake`
 # (a path dep inside the git checkout) and transitively `paimon` (git tag
-# v0.3.0-fluss.1). v0.4.1 keeps the whole stack on a single arrow 58 / datafusion 53
+# v0.3.0-fluss.1). v0.5.0 keeps the whole stack on a single arrow 58 / datafusion 53
 # (paimon is the fluss-aligned tag), so the frozen line is unchanged.
 # Gateway code talks to Fluss only through narrow gateway-defined
 # contract traits (e.g. `FlussCatalogInstaller`, `FlussConnectionProvider`,
@@ -60,10 +62,10 @@ datafusion-pg-catalog = "0.17"
 # --- Connection hot-swap (recovery manager) ---
 arc-swap = "1"
 
-# --- Fluss access (git deps; datafusion-v0.4.1 line aligns df53/arrow58) ---
+# --- Fluss access (git deps; datafusion-v0.5.0 line aligns df53/arrow58) ---
 # `lake` (Paimon union read) ON for fluss-datafusion; pulls fluss-lake + paimon.
-fluss = { package = "fluss-rs", git = "https://github.com/beryllw/fluss-rust.git", rev = "cb11ac62d85a6b512540021a393e2f46b37ebd25", features = ["storage-all"] }
-fluss-datafusion = { git = "https://github.com/beryllw/fluss-rust.git", rev = "cb11ac62d85a6b512540021a393e2f46b37ebd25", features = ["lake"] }
+fluss = { package = "fluss-rs", git = "https://github.com/beryllw/fluss-rust.git", rev = "3cf1603e0864b08097368c6c6a49cc7ac8b6aa9e", features = ["storage-all"] }
+fluss-datafusion = { git = "https://github.com/beryllw/fluss-rust.git", rev = "3cf1603e0864b08097368c6c6a49cc7ac8b6aa9e", features = ["lake"] }
 
 # --- HTTP (REST direct path + OTLP HTTP) ---
 axum = "0.8"
@@ -124,7 +126,7 @@ integration_tests = ["fluss-datafusion/integration_tests"]
 [dev-dependencies]
 # Brings up a throwaway Fluss cluster in docker for the integration_tests path.
 # Same git rev as the `fluss` / `fluss-datafusion` deps so the client types unify.
-fluss-test-cluster = { git = "https://github.com/beryllw/fluss-rust.git", rev = "cb11ac62d85a6b512540021a393e2f46b37ebd25" }
+fluss-test-cluster = { git = "https://github.com/beryllw/fluss-rust.git", rev = "3cf1603e0864b08097368c6c6a49cc7ac8b6aa9e" }
 # Real PostgreSQL wire client for protocol integration tests (P4). Drives the
 # gateway over loopback TCP with no Fluss cluster, against a fake GatewayInstance.
 tokio-postgres = "0.7"

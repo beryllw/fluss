@@ -55,7 +55,9 @@ services:
       - shared-tmpfs:/tmp/fluss
 
   gateway:
-    image: apache/fluss-gateway
+    # Use the prebuilt gateway image (do not build from source here).
+    image: localhost/apache/fluss-gateway:latest
+    pull_policy: never
     depends_on:
       - coordinator-server
       - tablet-server
@@ -63,11 +65,14 @@ services:
       - FLUSS_BOOTSTRAP_SERVERS=coordinator-server:9123
       - GATEWAY_PG_LISTEN=0.0.0.0:5432
       - GATEWAY_REST_LISTEN=0.0.0.0:8080
+      - GATEWAY_MCP_ENABLED=true
+      - GATEWAY_MCP_LISTEN=0.0.0.0:8000
       - FLUSS_CLUSTER=default
       - RUST_LOG=info
     ports:
       - "5432:5432"
       - "8080:8080"
+      - "8000:8000"
 
   jobmanager:
     image: apache/fluss-quickstart-flink:1.20-0.9.1-incubating-rc1

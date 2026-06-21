@@ -1,0 +1,205 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Lake (Paimon) + tiering stack: a Fluss cluster backed by an S3-compatible store
+# (RustFS), a Flink jobmanager/taskmanager for the tiering job, and the gateway.
+# Use this to exercise lake + log UNION READ through the gateway end to end.
+#
+# PREREQUISITE — download the Paimon S3 plugin jar (mounted into the Fluss
+# servers; the base apache/fluss image does not bundle it):
+#
+#   mkdir -p lib
+#   curl -fL -o lib/paimon-s3-1.3.1.jar \
+#     https://repo1.maven.org/maven2/org/apache/paimon/paimon-s3/1.3.1/paimon-s3-1.3.1.jar
+#
+# Then:  docker compose -f docker-compose.tiering.yml up -d --build
+# Runbook + verification: see E2E.md.
+
+services:
+  rustfs:
+    image: rustfs/rustfs:latest
+    environment:
+      - RUSTFS_ACCESS_KEY=rustfsadmin
+      - RUSTFS_SECRET_KEY=rustfsadmin
+      - RUSTFS_CONSOLE_ENABLE=false
+    command: ["/data"]
+    volumes:
+      - rustfs-data:/data
+    # No host port mapping: only in-network services (Fluss servers, the gateway's
+    # Paimon reader, the Flink tiering job) reach it as http://rustfs:9000.
+
+  # One-shot: create the `fluss` bucket, then exit 0 so dependents can gate on it.
+  rustfs-init:
+    image: minio/mc:latest
+    depends_on:
+      - rustfs
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        until mc alias set rustfs http://rustfs:9000 rustfsadmin rustfsadmin;
+        do echo 'waiting for rustfs'; sleep 1; done;
+        mc mb --ignore-existing rustfs/fluss
+
+  zookeeper:
+    restart: always
+    image: zookeeper:3.9.2
+
+  coordinator-server:
+    image: apache/fluss:0.9.1-incubating
+    command: coordinatorServer
+    depends_on:
+      zookeeper:
+        condition: service_started
+      rustfs-init:
+        condition: service_completed_successfully
+    environment:
+      - |
+        FLUSS_PROPERTIES=
+        zookeeper.address: zookeeper:2181
+        bind.listeners: INTERNAL://coordinator-server:0, CLIENT://coordinator-server:9123
+        advertised.listeners: CLIENT://coordinator-server:9123
+        internal.listener.name: INTERNAL
+        remote.data.dir: /tmp/fluss/remote-data
+        datalake.enabled: true
+        datalake.format: paimon
+        datalake.paimon.metastore: filesystem
+        datalake.paimon.warehouse: s3://fluss/paimon
+        datalake.paimon.s3.endpoint: http://rustfs:9000
+        datalake.paimon.s3.access-key: rustfsadmin
+        datalake.paimon.s3.secret-key: rustfsadmin
+        datalake.paimon.s3.region: us-east-1
+        datalake.paimon.s3.path-style-access: true
+    volumes:
+      # Paimon S3 plugin jar (see PREREQUISITE in the header).
+      - ./lib/paimon-s3-1.3.1.jar:/opt/fluss/plugins/paimon/paimon-s3-1.3.1.jar:ro
+    # No host port: only in-network services reach it as coordinator-server:9123.
+
+  tablet-server:
+    image: apache/fluss:0.9.1-incubating
+    command: tabletServer
+    depends_on:
+      - coordinator-server
+    environment:
+      - |
+        FLUSS_PROPERTIES=
+        zookeeper.address: zookeeper:2181
+        bind.listeners: INTERNAL://tablet-server:0, CLIENT://tablet-server:9123
+        advertised.listeners: CLIENT://tablet-server:9123
+        internal.listener.name: INTERNAL
+        tablet-server.id: 0
+        kv.snapshot.interval: 0s
+        data.dir: /tmp/fluss/data
+        remote.data.dir: /tmp/fluss/remote-data
+        datalake.enabled: true
+        datalake.format: paimon
+        datalake.paimon.metastore: filesystem
+        datalake.paimon.warehouse: s3://fluss/paimon
+        datalake.paimon.s3.endpoint: http://rustfs:9000
+        datalake.paimon.s3.access-key: rustfsadmin
+        datalake.paimon.s3.secret-key: rustfsadmin
+        datalake.paimon.s3.region: us-east-1
+        datalake.paimon.s3.path-style-access: true
+    volumes:
+      - shared-tmpfs:/tmp/fluss
+      - ./lib/paimon-s3-1.3.1.jar:/opt/fluss/plugins/paimon/paimon-s3-1.3.1.jar:ro
+    # No host port: only in-network services reach it as tablet-server:9123.
+
+  gateway:
+    # Prebuilt gateway image (do not build here). For lake union read the gateway
+    # must be given the lake S3 credentials: the Fluss server strips them from the
+    # table properties by policy, so endpoint/region/path-style come through table
+    # props but access/secret keys are supplied here and forwarded to Paimon
+    # (FlussDatafusionOptions.lake_storage_options, datafusion-v0.5.0+).
+    image: localhost/apache/fluss-gateway:latest
+    pull_policy: never
+    depends_on:
+      - coordinator-server
+      - tablet-server
+    environment:
+      - FLUSS_BOOTSTRAP_SERVERS=coordinator-server:9123
+      - GATEWAY_PG_LISTEN=0.0.0.0:5432
+      - GATEWAY_REST_LISTEN=0.0.0.0:8080
+      - GATEWAY_MCP_ENABLED=true
+      - GATEWAY_MCP_LISTEN=0.0.0.0:8000
+      - FLUSS_CLUSTER=default
+      - RUST_LOG=info
+      # Lake (Paimon) S3 credentials for reading lake-enabled tables.
+      - GATEWAY_LAKE_S3_ACCESS_KEY=rustfsadmin
+      - GATEWAY_LAKE_S3_SECRET_KEY=rustfsadmin
+      - GATEWAY_LAKE_S3_ENDPOINT=http://rustfs:9000
+      - GATEWAY_LAKE_S3_REGION=us-east-1
+      - GATEWAY_LAKE_S3_PATH_STYLE_ACCESS=true
+    # Host ports remapped to the 1xxxx range to avoid clashing with any other
+    # local stack. psql connects to 127.0.0.1:15432; REST on :18080; MCP on :18000.
+    ports:
+      - "15432:5432"
+      - "18080:8080"
+      - "18000:8000"
+
+  jobmanager:
+    image: apache/fluss-quickstart-flink:1.20-0.9.1-incubating-rc1
+    depends_on:
+      - coordinator-server
+    # init_paimon.sh activates the Paimon + paimon-s3 jars in /opt/flink/lib.
+    entrypoint: ["/opt/flink/init_paimon.sh"]
+    command: jobmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        rest.address: jobmanager
+        rest.bind-address: 0.0.0.0
+    ports:
+      - "18083:8081"
+
+  taskmanager:
+    image: apache/fluss-quickstart-flink:1.20-0.9.1-incubating-rc1
+    depends_on:
+      - jobmanager
+    entrypoint: ["/opt/flink/init_paimon.sh"]
+    command: taskmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        taskmanager.memory.process.size: 2048m
+        taskmanager.memory.task.off-heap.size: 128m
+
+  sql-client:
+    image: apache/fluss-quickstart-flink:1.20-0.9.1-incubating-rc1
+    depends_on:
+      - jobmanager
+      - taskmanager
+    entrypoint: ["/opt/flink/init_paimon.sh"]
+    command: ["/opt/sql-client/sql-client"]
+    tty: true
+    stdin_open: true
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        rest.address: jobmanager
+
+volumes:
+  shared-tmpfs:
+    driver: local
+    driver_opts:
+      type: "tmpfs"
+      device: "tmpfs"
+  rustfs-data:
+    driver: local

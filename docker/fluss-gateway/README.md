@@ -63,6 +63,12 @@ docker run --rm \
 | `FLUSS_CLUSTER`           | `default`          | Logical cluster id                   |
 | `GATEWAY_CONFIG`          | unset              | YAML config file path                |
 | `GATEWAY_USERS`           | unset              | `user:secret,...` auth override      |
+| `GATEWAY_LAKE_S3_ACCESS_KEY` | unset          | lake (Paimon) S3 access key (server omits it) |
+| `GATEWAY_LAKE_S3_SECRET_KEY` | unset          | lake (Paimon) S3 secret key (server omits it) |
+| `GATEWAY_LAKE_S3_ENDPOINT` | unset            | lake S3 endpoint override (optional) |
+| `GATEWAY_LAKE_S3_REGION`  | unset              | lake S3 region override (optional)   |
+| `GATEWAY_LAKE_S3_PATH_STYLE_ACCESS` | unset    | `true` for MinIO/RustFS/path-style   |
+| `GATEWAY_LAKE_STORAGE_OPTIONS` | unset         | generic `key=value,...` lake options (e.g. `oss.*`) |
 | `RUST_LOG`                | `info`             | Tracing filter                       |
 
 The gateway retries the cluster connection a few times at startup, so it can be
