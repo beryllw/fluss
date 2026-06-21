@@ -18,7 +18,8 @@
 //! Protocol frontends.
 //!
 //! Transport + adaptation only; all execution goes through `Instance`. Ships
-//! `postgres` (read-only SQL) and `rest` (direct write).
+//! `postgres` (read-only SQL) and `rest` (table-oriented REST direct write plus
+//! optional OTLP-over-HTTP ingestion on the same listener).
 //! Design: `design/sql-path.md`, `design/direct-path.md`, infra.
 
 pub mod postgres;

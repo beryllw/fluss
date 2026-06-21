@@ -62,7 +62,7 @@
 
 #![cfg(feature = "integration_tests")]
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use arrow::array::{Int32Array, StringArray};
@@ -82,17 +82,23 @@ use fluss_gateway::cluster::{ClusterConfig, ClusterRegistry};
 use fluss_gateway::connection::{FlussConnectionProvider, SharedProxyConnectionProvider};
 use fluss_gateway::instance::{GatewayInstance, GatewayInstanceImpl};
 use fluss_gateway::server::postgres::PgServer;
-use fluss_gateway::server::rest::RestServer;
+use fluss_gateway::server::rest::{OtlpConfig, RestServer};
 use fluss_gateway::session::manager::{SessionManager, SessionManagerConfig};
 use fluss_gateway::sql::environment::{
     FlussDatafusionCatalogInstaller, PgSqlEnvironmentProvider, SqlEnvironmentRegistry,
     StubPgCatalogOverlayInstaller,
 };
-use fluss_gateway::types::{ClusterId, Principal, SqlEnvironmentId};
+use fluss_gateway::types::{ClusterId, Principal, SqlEnvironmentId, TableRef};
 
-/// Dedicated name/port so this binary's cluster never collides with another.
-const CLUSTER_NAME: &str = "gw-e2e";
-const CLUSTER_PORT: u16 = 9143;
+use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+use opentelemetry_proto::tonic::common::v1::{any_value::Value as OtlpValue, AnyValue};
+use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs, SeverityNumber};
+use prost::Message;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+/// Dedicated ports per e2e so the two live tests can run independently.
+const REST_CLUSTER_PORT: u16 = 9143;
+const OTLP_CLUSTER_PORT: u16 = 9144;
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 const DATABASE: &str = "fluss";
@@ -102,17 +108,35 @@ const LOG_TABLE: &str = "gw_log";
 // `(c1, c2)`, so a `WHERE c1 = ...` predicate exercises KV prefix lookup
 // (datafusion-v0.2.4). Seeded so one `c1` matches several rows.
 const KV_PREFIX_TABLE: &str = "gw_kv_prefix";
+/// Append-only OTLP logs landing table (subset of the telemetry column contract).
+const OTLP_LOGS_TABLE: &str = "gw_otlp_logs";
 
 const JSON: &str = "application/json";
 const ARROW: &str = "application/vnd.apache.arrow.stream";
+const PROTOBUF: &str = "application/x-protobuf";
+
+// The two live tests in this binary both start dockerized Fluss clusters on
+// fixed host ports. The Rust test harness runs them in parallel by default, so
+// serialize cluster bring-up/teardown here to avoid cross-test port/container
+// collisions while keeping the rest of the workspace tests parallel.
+static CLUSTER_E2E_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+async fn cluster_e2e_permit() -> OwnedSemaphorePermit {
+    CLUSTER_E2E_SEMAPHORE
+        .get_or_init(|| Arc::new(Semaphore::new(1)))
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("cluster e2e semaphore closed")
+}
 
 // ---------------------------------------------------------------------------
 // cluster bring-up (mirrors the fluss-datafusion integration setup template)
 // ---------------------------------------------------------------------------
 
-async fn start_cluster() -> FlussTestingCluster {
-    let cluster = FlussTestingClusterBuilder::new(CLUSTER_NAME)
-        .with_port(CLUSTER_PORT)
+async fn start_cluster(name: &str, port: u16) -> FlussTestingCluster {
+    let cluster = FlussTestingClusterBuilder::new(name)
+        .with_port(port)
         .build()
         .await;
     wait_for_ready(&cluster).await;
@@ -295,7 +319,8 @@ async fn assemble_instance(bootstrap: &str) -> (Arc<GatewayInstanceImpl>, Arc<Fl
 // starve one side. This mirrors how the gateway actually runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
 async fn cluster_rest_kv_and_log_then_pg_selects() {
-    let cluster = start_cluster().await;
+    let _permit = cluster_e2e_permit().await;
+    let cluster = start_cluster("gw-e2e-rest", REST_CLUSTER_PORT).await;
     let bootstrap = cluster.plaintext_bootstrap_servers().to_string();
     let connection = Arc::new(cluster.get_fluss_connection().await);
 
@@ -308,6 +333,7 @@ async fn cluster_rest_kv_and_log_then_pg_selects() {
     let rest = RestServer::new(
         instance.clone() as Arc<dyn GatewayInstance>,
         Arc::new(TrustAuthenticator::new()),
+        None,
     );
     let (rest_listener, rest_addr) = RestServer::bind("127.0.0.1:0").await.unwrap();
     tokio::spawn(async move {
@@ -962,9 +988,168 @@ async fn cluster_rest_kv_and_log_then_pg_selects() {
 }
 
 
+/// OTLP-over-HTTP end-to-end: POST a protobuf logs request to the gateway, then
+/// read the flattened rows back through the PG SQL path. Proves the OTLP HTTP
+/// adapter lands telemetry as a real Fluss `LogAppend` against a live cluster.
+#[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+async fn cluster_otlp_logs_lands_and_reads_back() {
+    let _permit = cluster_e2e_permit().await;
+    let cluster = start_cluster("gw-e2e-otlp", OTLP_CLUSTER_PORT).await;
+    let bootstrap = cluster.plaintext_bootstrap_servers().to_string();
+    let connection = Arc::new(cluster.get_fluss_connection().await);
+
+    create_otlp_logs_table(&connection).await;
+
+    let (instance, gw_conn) = assemble_instance(&bootstrap).await;
+
+    // All three signals must be configured; this test only exercises logs, so the
+    // metrics/traces refs point at the same landing table (never written here).
+    let logs_table = TableRef {
+        database: DATABASE.into(),
+        table: OTLP_LOGS_TABLE.into(),
+    };
+    let otlp = OtlpConfig {
+        logs_table: logs_table.clone(),
+        metrics_table: logs_table.clone(),
+        traces_table: logs_table,
+    };
+    let rest = RestServer::new(
+        instance.clone() as Arc<dyn GatewayInstance>,
+        Arc::new(TrustAuthenticator::new()),
+        Some(otlp),
+    );
+    let (rest_listener, rest_addr) = RestServer::bind("127.0.0.1:0").await.unwrap();
+    tokio::spawn(async move {
+        let _ = rest.serve(rest_listener).await;
+    });
+
+    let pg = PgServer::new(
+        instance.clone() as Arc<dyn GatewayInstance>,
+        Arc::new(TrustAuthenticator::new()),
+    );
+    let (pg_listener, pg_addr) = PgServer::bind("127.0.0.1:0").await.unwrap();
+    tokio::spawn(async move {
+        let _ = pg.serve(pg_listener).await;
+    });
+
+    let rest_base = format!("http://{rest_addr}/v1/clusters/default");
+    let http = reqwest::Client::new();
+    let auth = format!("Basic {}", basic_auth("alice"));
+
+    let resp = tokio::time::timeout(
+        Duration::from_secs(30),
+        http.post(format!("{rest_base}/otlp/v1/logs"))
+            .header("Authorization", &auth)
+            .header("Content-Type", PROTOBUF)
+            .body(otlp_logs_body())
+            .send(),
+    )
+    .await
+    .expect("OTLP logs POST timed out before the gateway replied")
+    .unwrap();
+    assert_eq!(resp.status(), 200, "OTLP logs ingest status");
+
+    tokio::time::timeout(Duration::from_secs(30), wait_for_bucket0(&gw_conn, OTLP_LOGS_TABLE))
+        .await
+        .expect("OTLP logs bucket never became readable");
+
+    let (pg_client, pg_conn) = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={} user=alice password=ignored dbname=fluss", pg_addr.port()),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("PG connect");
+    tokio::spawn(async move {
+        let _ = pg_conn.await;
+    });
+
+    let rows = tokio::time::timeout(
+        Duration::from_secs(30),
+        pg_client.simple_query(&format!(
+            "SELECT signal, severity_text, body FROM fluss.{DATABASE}.{OTLP_LOGS_TABLE} LIMIT 10"
+        )),
+    )
+    .await
+    .expect("PG read of OTLP logs timed out")
+    .expect("PG read of OTLP logs");
+    let log_rows: Vec<_> = rows
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(r) => Some(r),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(log_rows.len(), 2, "both OTLP log records land and read back");
+    assert!(
+        log_rows.iter().all(|r| r.get("signal") == Some("logs")),
+        "every landed row is tagged with the logs signal"
+    );
+    // `body` is stored as the JSON serialization of OTLP AnyValue, so a plain
+    // string log body reads back with JSON quotes preserved.
+    let bodies: Vec<&str> = log_rows.iter().filter_map(|r| r.get("body")).collect();
+    assert!(bodies.contains(&"\"first\""), "first log body reads back as OTLP JSON");
+    assert!(bodies.contains(&"\"second\""), "second log body reads back as OTLP JSON");
+
+    let admin = gw_conn.get_admin().unwrap();
+    let _ = admin.drop_table(&TablePath::new(DATABASE, OTLP_LOGS_TABLE), true).await;
+    cluster.stop();
+}
+
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+/// Append-only OTLP logs landing table. A subset of the telemetry column
+/// contract is enough to prove the adapter writes by column name; columns the
+/// adapter does not fill are simply absent here.
+async fn create_otlp_logs_table(conn: &FlussConnection) {
+    let path = TablePath::new(DATABASE, OTLP_LOGS_TABLE);
+    let admin = conn.get_admin().unwrap();
+    let descriptor = TableDescriptor::builder()
+        .schema(
+            Schema::builder()
+                .column("signal", DataTypes::string())
+                .column("severity_text", DataTypes::string())
+                .column("body", DataTypes::string())
+                .build()
+                .unwrap(),
+        )
+        .distributed_by(Some(1), vec![])
+        .build()
+        .unwrap();
+    admin.create_table(&path, &descriptor, true).await.unwrap();
+}
+
+/// Two-record OTLP logs export request, protobuf-encoded.
+fn otlp_logs_body() -> Vec<u8> {
+    let record = |severity: &str, body: &str| LogRecord {
+        time_unix_nano: 1,
+        observed_time_unix_nano: 1,
+        severity_number: SeverityNumber::Info as i32,
+        severity_text: severity.into(),
+        body: Some(AnyValue {
+            value: Some(OtlpValue::StringValue(body.into())),
+        }),
+        attributes: vec![],
+        dropped_attributes_count: 0,
+        flags: 0,
+        trace_id: vec![],
+        span_id: vec![],
+        event_name: String::new(),
+    };
+    ExportLogsServiceRequest {
+        resource_logs: vec![ResourceLogs {
+            resource: None,
+            scope_logs: vec![ScopeLogs {
+                scope: None,
+                log_records: vec![record("INFO", "first"), record("WARN", "second")],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    }
+    .encode_to_vec()
+}
 
 /// Three-row Arrow IPC stream for the Log table: (id, name) = (10,x),(20,y),(30,z).
 fn log_arrow_body() -> Vec<u8> {

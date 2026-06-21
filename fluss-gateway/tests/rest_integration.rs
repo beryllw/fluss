@@ -30,12 +30,30 @@ mod harness;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use arrow::datatypes::{DataType, Field, Schema};
 use fluss_gateway::auth::{ConfigUserStoreAuthenticator, StoredSecret};
+use fluss_gateway::server::rest::OtlpConfig;
+use fluss_gateway::types::TableRef;
 use harness::{FakeInstance, RestTestServer, WriteKind};
+use opentelemetry_proto::tonic::collector::{
+    logs::v1::{ExportLogsServiceRequest, ExportLogsServiceResponse},
+    metrics::v1::{ExportMetricsServiceRequest, ExportMetricsServiceResponse},
+    trace::v1::{ExportTraceServiceRequest, ExportTraceServiceResponse},
+};
+use opentelemetry_proto::tonic::common::v1::{any_value::Value, AnyValue, InstrumentationScope, KeyValue};
+use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs, SeverityNumber};
+use opentelemetry_proto::tonic::metrics::v1::{
+    metric::Data as MetricData, AggregationTemporality, Gauge, Histogram, HistogramDataPoint,
+    Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum,
+};
+use opentelemetry_proto::tonic::resource::v1::Resource;
+use opentelemetry_proto::tonic::trace::v1::{span::SpanKind, ResourceSpans, ScopeSpans, Span, Status};
+use prost::Message;
 use sha2::Digest;
 
 const JSON: &str = "application/json";
 const ARROW: &str = "application/vnd.apache.arrow.stream";
+const PROTOBUF: &str = "application/x-protobuf";
 
 /// Basic auth header for `user` with an ignored password (trust mode).
 fn basic(user: &str) -> String {
@@ -101,6 +119,425 @@ fn arrow_rows() -> Vec<u8> {
         w.finish().unwrap();
     }
     buf
+}
+
+fn telemetry_table_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("signal", DataType::Utf8, false),
+        Field::new("observed_time_unix_nano", DataType::Utf8, true),
+        Field::new("time_unix_nano", DataType::Utf8, true),
+        Field::new("trace_id", DataType::Utf8, true),
+        Field::new("span_id", DataType::Utf8, true),
+        Field::new("parent_span_id", DataType::Utf8, true),
+        Field::new("trace_state", DataType::Utf8, true),
+        Field::new("name", DataType::Utf8, true),
+        Field::new("kind", DataType::Utf8, true),
+        Field::new("severity_number", DataType::Int32, true),
+        Field::new("severity_text", DataType::Utf8, true),
+        Field::new("body", DataType::Utf8, true),
+        Field::new("metric_type", DataType::Utf8, true),
+        Field::new("metric_description", DataType::Utf8, true),
+        Field::new("metric_unit", DataType::Utf8, true),
+        Field::new("aggregation_temporality", DataType::Int32, true),
+        Field::new("is_monotonic", DataType::Boolean, true),
+        Field::new("value_double", DataType::Float64, true),
+        Field::new("value_int", DataType::Int64, true),
+        Field::new("count", DataType::Utf8, true),
+        Field::new("sum", DataType::Float64, true),
+        Field::new("bucket_counts", DataType::Utf8, true),
+        Field::new("explicit_bounds", DataType::Utf8, true),
+        Field::new("start_time_unix_nano", DataType::Utf8, true),
+        Field::new("end_time_unix_nano", DataType::Utf8, true),
+        Field::new("status_code", DataType::Int32, true),
+        Field::new("status_message", DataType::Utf8, true),
+        Field::new("flags", DataType::UInt32, true),
+        Field::new("resource_attributes", DataType::Utf8, true),
+        Field::new("scope_name", DataType::Utf8, true),
+        Field::new("scope_version", DataType::Utf8, true),
+        Field::new("scope_attributes", DataType::Utf8, true),
+        Field::new("attributes", DataType::Utf8, true),
+        Field::new("events", DataType::Utf8, true),
+        Field::new("links", DataType::Utf8, true),
+    ]))
+}
+
+fn otlp_config() -> OtlpConfig {
+    OtlpConfig {
+        logs_table: TableRef {
+            database: "obs".into(),
+            table: "logs".into(),
+        },
+        metrics_table: TableRef {
+            database: "obs".into(),
+            table: "metrics".into(),
+        },
+        traces_table: TableRef {
+            database: "obs".into(),
+            table: "traces".into(),
+        },
+    }
+}
+
+async fn otlp_server() -> RestTestServer {
+    let instance = Arc::new(FakeInstance::new());
+    let schema = telemetry_table_schema();
+    {
+        let mut table_schemas = instance.table_schemas.lock().unwrap();
+        table_schemas.insert("obs.logs".into(), schema.clone());
+        table_schemas.insert("obs.metrics".into(), schema.clone());
+        table_schemas.insert("obs.traces".into(), schema);
+    }
+    RestTestServer::start_with_authenticator_and_otlp(
+        instance,
+        Arc::new(fluss_gateway::auth::TrustAuthenticator::new()),
+        Some(otlp_config()),
+    )
+    .await
+}
+
+fn kv(key: &str, value: Value) -> KeyValue {
+    KeyValue {
+        key: key.into(),
+        value: Some(AnyValue { value: Some(value) }),
+        key_strindex: 0,
+    }
+}
+
+fn minimal_logs_payload() -> Vec<u8> {
+    ExportLogsServiceRequest {
+        resource_logs: vec![ResourceLogs {
+            resource: Some(Resource {
+                attributes: vec![kv("service.name", Value::StringValue("gateway".into()))],
+                dropped_attributes_count: 0,
+                entity_refs: vec![],
+            }),
+            scope_logs: vec![ScopeLogs {
+                scope: Some(InstrumentationScope {
+                    name: "tests.logs".into(),
+                    version: "1.0.0".into(),
+                    attributes: vec![kv("scope.attr", Value::StringValue("value".into()))],
+                    dropped_attributes_count: 0,
+                }),
+                log_records: vec![LogRecord {
+                    time_unix_nano: 10,
+                    observed_time_unix_nano: 11,
+                    severity_number: SeverityNumber::Info as i32,
+                    severity_text: "INFO".into(),
+                    body: Some(AnyValue {
+                        value: Some(Value::StringValue("hello otlp logs".into())),
+                    }),
+                    attributes: vec![kv("log.attr", Value::IntValue(7))],
+                    dropped_attributes_count: 0,
+                    flags: 1,
+                    trace_id: vec![1; 16],
+                    span_id: vec![2; 8],
+                    event_name: "test.event".into(),
+                }],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    }
+    .encode_to_vec()
+}
+
+fn minimal_traces_payload() -> Vec<u8> {
+    ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource: Some(Resource {
+                attributes: vec![kv("service.name", Value::StringValue("gateway".into()))],
+                dropped_attributes_count: 0,
+                entity_refs: vec![],
+            }),
+            scope_spans: vec![ScopeSpans {
+                scope: Some(InstrumentationScope {
+                    name: "tests.traces".into(),
+                    version: "1.0.0".into(),
+                    attributes: vec![kv("scope.attr", Value::StringValue("value".into()))],
+                    dropped_attributes_count: 0,
+                }),
+                spans: vec![Span {
+                    trace_id: vec![0x11; 16],
+                    span_id: vec![0x22; 8],
+                    trace_state: "state".into(),
+                    parent_span_id: vec![0x33; 8],
+                    flags: 1,
+                    name: "span-a".into(),
+                    kind: SpanKind::Server as i32,
+                    start_time_unix_nano: 100,
+                    end_time_unix_nano: 200,
+                    attributes: vec![kv("span.attr", Value::BoolValue(true))],
+                    dropped_attributes_count: 0,
+                    events: vec![],
+                    dropped_events_count: 0,
+                    links: vec![],
+                    dropped_links_count: 0,
+                    status: Some(Status {
+                        message: "ok".into(),
+                        code: opentelemetry_proto::tonic::trace::v1::status::StatusCode::Ok as i32,
+                    }),
+                }],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    }
+    .encode_to_vec()
+}
+
+fn minimal_metrics_payload() -> Vec<u8> {
+    use opentelemetry_proto::tonic::metrics::v1::number_data_point;
+
+    ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            resource: Some(Resource {
+                attributes: vec![kv("service.name", Value::StringValue("gateway".into()))],
+                dropped_attributes_count: 0,
+                entity_refs: vec![],
+            }),
+            scope_metrics: vec![ScopeMetrics {
+                scope: Some(InstrumentationScope {
+                    name: "tests.metrics".into(),
+                    version: "1.0.0".into(),
+                    attributes: vec![kv("scope.attr", Value::StringValue("value".into()))],
+                    dropped_attributes_count: 0,
+                }),
+                metrics: vec![
+                    Metric {
+                        name: "cpu.gauge".into(),
+                        description: "gauge".into(),
+                        unit: "%".into(),
+                        metadata: vec![],
+                        data: Some(MetricData::Gauge(Gauge {
+                            data_points: vec![NumberDataPoint {
+                                attributes: vec![kv("host", Value::StringValue("a".into()))],
+                                start_time_unix_nano: 0,
+                                time_unix_nano: 1000,
+                                exemplars: vec![],
+                                flags: 0,
+                                value: Some(number_data_point::Value::AsDouble(1.5)),
+                            }],
+                        })),
+                    },
+                    Metric {
+                        name: "requests.sum".into(),
+                        description: "sum".into(),
+                        unit: "1".into(),
+                        metadata: vec![],
+                        data: Some(MetricData::Sum(Sum {
+                            data_points: vec![NumberDataPoint {
+                                attributes: vec![kv("route", Value::StringValue("/".into()))],
+                                start_time_unix_nano: 10,
+                                time_unix_nano: 2000,
+                                exemplars: vec![],
+                                flags: 0,
+                                value: Some(number_data_point::Value::AsInt(9)),
+                            }],
+                            aggregation_temporality: AggregationTemporality::Delta as i32,
+                            is_monotonic: true,
+                        })),
+                    },
+                    Metric {
+                        name: "latency.histogram".into(),
+                        description: "hist".into(),
+                        unit: "ms".into(),
+                        metadata: vec![],
+                        data: Some(MetricData::Histogram(Histogram {
+                            data_points: vec![HistogramDataPoint {
+                                attributes: vec![kv("route", Value::StringValue("/hist".into()))],
+                                start_time_unix_nano: 20,
+                                time_unix_nano: 3000,
+                                count: 3,
+                                sum: Some(42.0),
+                                bucket_counts: vec![1, 2, 0],
+                                explicit_bounds: vec![10.0, 20.0],
+                                exemplars: vec![],
+                                flags: 0,
+                                min: Some(5.0),
+                                max: Some(30.0),
+                            }],
+                            aggregation_temporality: AggregationTemporality::Cumulative as i32,
+                        })),
+                    },
+                ],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    }
+    .encode_to_vec()
+}
+
+#[tokio::test]
+async fn otlp_logs_requires_auth() {
+    let server = otlp_server().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{}/otlp/v1/logs", server.base_url()))
+        .header("Content-Type", PROTOBUF)
+        .body(minimal_logs_payload())
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 401);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "unauthenticated");
+    assert!(server.instance.writes.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn otlp_metrics_wrong_content_type_maps_to_400() {
+    let server = otlp_server().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{}/otlp/v1/metrics", server.base_url()))
+        .header("Authorization", format!("Basic {}", basic("alice")))
+        .header("Content-Type", JSON)
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "invalid_argument");
+}
+
+#[tokio::test]
+async fn otlp_traces_malformed_protobuf_maps_to_400() {
+    let server = otlp_server().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{}/otlp/v1/traces", server.base_url()))
+        .header("Authorization", format!("Basic {}", basic("alice")))
+        .header("Content-Type", PROTOBUF)
+        .body(vec![0xff, 0x01, 0x02])
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "invalid_argument");
+}
+
+#[tokio::test]
+async fn otlp_logs_protobuf_succeeds_and_reaches_instance() {
+    let server = otlp_server().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{}/otlp/v1/logs", server.base_url()))
+        .header("Authorization", format!("Basic {}", basic("alice")))
+        .header("Content-Type", PROTOBUF)
+        .body(minimal_logs_payload())
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers().get("content-type").unwrap(),
+        PROTOBUF
+    );
+    let bytes = resp.bytes().await.unwrap();
+    let decoded = ExportLogsServiceResponse::decode(bytes.as_ref()).unwrap();
+    assert!(decoded.partial_success.is_none());
+
+    let writes = server.instance.writes.lock().unwrap();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0].kind, WriteKind::LogAppend);
+    assert_eq!(writes[0].table.database, "obs");
+    assert_eq!(writes[0].table.table, "logs");
+    assert_eq!(writes[0].principal, "alice");
+    assert_eq!(writes[0].cluster, "default");
+    assert_eq!(writes[0].rows, 1);
+}
+
+#[tokio::test]
+async fn otlp_metrics_protobuf_succeeds_and_reaches_instance() {
+    let server = otlp_server().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{}/otlp/v1/metrics", server.base_url()))
+        .header("Authorization", format!("Basic {}", basic("bob")))
+        .header("Content-Type", PROTOBUF)
+        .body(minimal_metrics_payload())
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let bytes = resp.bytes().await.unwrap();
+    let decoded = ExportMetricsServiceResponse::decode(bytes.as_ref()).unwrap();
+    assert!(decoded.partial_success.is_none());
+
+    let writes = server.instance.writes.lock().unwrap();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0].kind, WriteKind::LogAppend);
+    assert_eq!(writes[0].table.database, "obs");
+    assert_eq!(writes[0].table.table, "metrics");
+    assert_eq!(writes[0].principal, "bob");
+    assert_eq!(writes[0].rows, 3);
+}
+
+#[tokio::test]
+async fn otlp_traces_protobuf_succeeds_and_reaches_instance() {
+    let server = otlp_server().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{}/otlp/v1/traces", server.base_url()))
+        .header("Authorization", format!("Basic {}", basic("carol")))
+        .header("Content-Type", PROTOBUF)
+        .body(minimal_traces_payload())
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let bytes = resp.bytes().await.unwrap();
+    let decoded = ExportTraceServiceResponse::decode(bytes.as_ref()).unwrap();
+    assert!(decoded.partial_success.is_none());
+
+    let writes = server.instance.writes.lock().unwrap();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0].kind, WriteKind::LogAppend);
+    assert_eq!(writes[0].table.database, "obs");
+    assert_eq!(writes[0].table.table, "traces");
+    assert_eq!(writes[0].principal, "carol");
+    assert_eq!(writes[0].rows, 1);
+}
+
+#[tokio::test]
+async fn otlp_direct_path_opens_no_session() {
+    let server = otlp_server().await;
+    let client = reqwest::Client::new();
+    let auth = format!("Basic {}", basic("alice"));
+
+    client
+        .post(format!("{}/otlp/v1/logs", server.base_url()))
+        .header("Authorization", &auth)
+        .header("Content-Type", PROTOBUF)
+        .body(minimal_logs_payload())
+        .send()
+        .await
+        .unwrap();
+    client
+        .post(format!("{}/otlp/v1/metrics", server.base_url()))
+        .header("Authorization", &auth)
+        .header("Content-Type", PROTOBUF)
+        .body(minimal_metrics_payload())
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(*server.instance.sessions_opened.lock().unwrap(), 0);
 }
 
 #[tokio::test]

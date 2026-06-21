@@ -52,13 +52,13 @@ use fluss_gateway::connection::{
 use fluss_gateway::error::GatewayError;
 use fluss_gateway::instance::{GatewayInstance, GatewayInstanceImpl};
 use fluss_gateway::server::postgres::PgServer;
-use fluss_gateway::server::rest::RestServer;
+use fluss_gateway::server::rest::{OtlpConfig, RestServer};
 use fluss_gateway::session::manager::{SessionManager, SessionManagerConfig};
 use fluss_gateway::sql::environment::{
     FlussDatafusionCatalogInstaller, PgSqlEnvironmentProvider, SqlEnvironmentRegistry,
     StubPgCatalogOverlayInstaller,
 };
-use fluss_gateway::types::{ClusterId, Principal, SqlEnvironmentId};
+use fluss_gateway::types::{ClusterId, Principal, SqlEnvironmentId, TableRef};
 
 /// Resolved runtime configuration, read once from the environment at startup.
 struct GatewayConfig {
@@ -68,10 +68,14 @@ struct GatewayConfig {
     cluster: String,
     config_path: Option<String>,
     users_env: Option<String>,
+    otlp_enabled: bool,
+    otlp_logs_table: Option<TableRef>,
+    otlp_metrics_table: Option<TableRef>,
+    otlp_traces_table: Option<TableRef>,
 }
 
 impl GatewayConfig {
-    fn from_env() -> Self {
+    fn from_env() -> Result<Self, GatewayError> {
         let env_or = |key: &str, default: &str| {
             std::env::var(key)
                 .ok()
@@ -79,15 +83,83 @@ impl GatewayConfig {
                 .unwrap_or_else(|| default.to_string())
         };
         let env_opt = |key: &str| std::env::var(key).ok().filter(|v| !v.trim().is_empty());
-        Self {
+        let otlp_enabled = std::env::var("GATEWAY_OTLP_ENABLED")
+            .ok()
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
+        let otlp_logs_table = env_opt("GATEWAY_OTLP_LOGS_TABLE")
+            .map(|v| parse_table_ref("GATEWAY_OTLP_LOGS_TABLE", &v))
+            .transpose()?;
+        let otlp_metrics_table = env_opt("GATEWAY_OTLP_METRICS_TABLE")
+            .map(|v| parse_table_ref("GATEWAY_OTLP_METRICS_TABLE", &v))
+            .transpose()?;
+        let otlp_traces_table = env_opt("GATEWAY_OTLP_TRACES_TABLE")
+            .map(|v| parse_table_ref("GATEWAY_OTLP_TRACES_TABLE", &v))
+            .transpose()?;
+        let cfg = Self {
             bootstrap_servers: env_or("FLUSS_BOOTSTRAP_SERVERS", "127.0.0.1:9123"),
             pg_listen: env_or("GATEWAY_PG_LISTEN", "0.0.0.0:5432"),
             rest_listen: env_or("GATEWAY_REST_LISTEN", "0.0.0.0:8080"),
             cluster: env_or("FLUSS_CLUSTER", "default"),
             config_path: env_opt("GATEWAY_CONFIG"),
             users_env: env_opt("GATEWAY_USERS"),
-        }
+            otlp_enabled,
+            otlp_logs_table,
+            otlp_metrics_table,
+            otlp_traces_table,
+        };
+        cfg.validate_otlp()?;
+        Ok(cfg)
     }
+
+    fn validate_otlp(&self) -> Result<(), GatewayError> {
+        if !self.otlp_enabled {
+            return Ok(());
+        }
+        for (name, value) in [
+            ("GATEWAY_OTLP_LOGS_TABLE", &self.otlp_logs_table),
+            ("GATEWAY_OTLP_METRICS_TABLE", &self.otlp_metrics_table),
+            ("GATEWAY_OTLP_TRACES_TABLE", &self.otlp_traces_table),
+        ] {
+            if value.is_none() {
+                return Err(GatewayError::InvalidArgument(format!(
+                    "{name} is required when GATEWAY_OTLP_ENABLED=true"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn otlp_config(&self) -> Option<OtlpConfig> {
+        self.otlp_enabled.then(|| OtlpConfig {
+            logs_table: self.otlp_logs_table.clone().expect("validated logs table"),
+            metrics_table: self
+                .otlp_metrics_table
+                .clone()
+                .expect("validated metrics table"),
+            traces_table: self
+                .otlp_traces_table
+                .clone()
+                .expect("validated traces table"),
+        })
+    }
+}
+
+fn parse_table_ref(name: &str, raw: &str) -> Result<TableRef, GatewayError> {
+    let (database, table) = raw.split_once('.').ok_or_else(|| {
+        GatewayError::InvalidArgument(format!("{name} must be '<database>.<table>'"))
+    })?;
+    let database = database.trim();
+    let table = table.trim();
+    if database.is_empty() || table.is_empty() || table.contains('.') {
+        return Err(GatewayError::InvalidArgument(format!(
+            "{name} must be '<database>.<table>'"
+        )));
+    }
+    Ok(TableRef {
+        database: database.to_string(),
+        table: table.to_string(),
+    })
 }
 
 fn build_authenticator(
@@ -129,12 +201,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    let config = GatewayConfig::from_env();
+    let config = GatewayConfig::from_env()?;
     tracing::info!(
         bootstrap_servers = %config.bootstrap_servers,
         cluster = %config.cluster,
         pg_listen = %config.pg_listen,
         rest_listen = %config.rest_listen,
+        otlp_enabled = config.otlp_enabled,
         "starting fluss-gateway"
     );
 
@@ -154,6 +227,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rest = RestServer::new(
         Arc::clone(&instance) as Arc<dyn GatewayInstance>,
         Arc::clone(&authenticator),
+        config.otlp_config(),
     );
 
     let mut pg_task = tokio::spawn(async move { pg.serve(pg_listener).await });
@@ -287,5 +361,50 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {}
         _ = terminate => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_table_ref_accepts_database_dot_table() {
+        let table = parse_table_ref("GATEWAY_OTLP_LOGS_TABLE", "obs.logs").unwrap();
+        assert_eq!(table.database, "obs");
+        assert_eq!(table.table, "logs");
+    }
+
+    #[test]
+    fn parse_table_ref_rejects_invalid_shapes() {
+        for raw in ["logs", ".logs", "obs.", "obs.logs.more"] {
+            let err = parse_table_ref("GATEWAY_OTLP_LOGS_TABLE", raw).unwrap_err();
+            assert!(matches!(err, GatewayError::InvalidArgument(_)));
+        }
+    }
+
+    #[test]
+    fn validate_otlp_requires_all_three_tables_when_enabled() {
+        let cfg = GatewayConfig {
+            bootstrap_servers: "127.0.0.1:9123".into(),
+            pg_listen: "0.0.0.0:5432".into(),
+            rest_listen: "0.0.0.0:8080".into(),
+            cluster: "default".into(),
+            config_path: None,
+            users_env: None,
+            otlp_enabled: true,
+            otlp_logs_table: Some(TableRef {
+                database: "obs".into(),
+                table: "logs".into(),
+            }),
+            otlp_metrics_table: None,
+            otlp_traces_table: Some(TableRef {
+                database: "obs".into(),
+                table: "traces".into(),
+            }),
+        };
+        let err = cfg.validate_otlp().unwrap_err();
+        assert!(matches!(err, GatewayError::InvalidArgument(_)));
+        assert!(err.to_string().contains("GATEWAY_OTLP_METRICS_TABLE"));
     }
 }

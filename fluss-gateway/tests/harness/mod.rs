@@ -87,6 +87,9 @@ pub struct FakeInstance {
     /// Tables that should resolve as not-found from metadata (drives the 404
     /// mapping test). Anything not listed resolves to the canned schema.
     pub missing_tables: Mutex<Vec<String>>,
+    /// Optional per-table schemas for adapter tests that need more than the
+    /// canned `(id, name)` shape. Keyed by `"database.table"`.
+    pub table_schemas: Mutex<HashMap<String, SchemaRef>>,
     /// Number of sessions ever opened. Direct (REST) requests must NOT increment
     /// this — it backs the "direct path has no session" semantic test.
     pub sessions_opened: Mutex<u64>,
@@ -369,7 +372,17 @@ impl GatewayInstance for FakeInstance {
                 table: table.table,
             });
         }
-        let (schema, _) = Self::canned_result();
+        let key = format!("{}.{}", table.database, table.table);
+        let schema = self
+            .table_schemas
+            .lock()
+            .unwrap()
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(|| {
+                let (schema, _) = Self::canned_result();
+                schema
+            });
         Ok(TableInfo { name: table, schema })
     }
 
@@ -475,7 +488,15 @@ impl RestTestServer {
         instance: Arc<FakeInstance>,
         authenticator: Arc<dyn fluss_gateway::auth::Authenticator>,
     ) -> RestTestServer {
-        let server = RestServer::new(instance.clone(), authenticator);
+        Self::start_with_authenticator_and_otlp(instance, authenticator, None).await
+    }
+
+    pub async fn start_with_authenticator_and_otlp(
+        instance: Arc<FakeInstance>,
+        authenticator: Arc<dyn fluss_gateway::auth::Authenticator>,
+        otlp: Option<fluss_gateway::server::rest::OtlpConfig>,
+    ) -> RestTestServer {
+        let server = RestServer::new(instance.clone(), authenticator, otlp);
         let (listener, addr) = RestServer::bind("127.0.0.1:0").await.unwrap();
         tokio::spawn(async move {
             let _ = server.serve(listener).await;

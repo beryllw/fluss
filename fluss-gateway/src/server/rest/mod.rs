@@ -49,6 +49,8 @@ use serde::Deserialize;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
+mod otlp;
+
 use crate::auth::{credential_from_userpass, Authenticator};
 use crate::direct::{decode_write_body, WriteEncoding};
 use crate::error::GatewayError;
@@ -58,6 +60,15 @@ use crate::types::{
     Principal, RequestExecutionContext, RequestId, TableDistribution, TableRef,
 };
 
+/// Fixed OTLP destination tables configured at startup. Each signal maps to one
+/// append-only telemetry landing table, pre-created out-of-band.
+#[derive(Clone, Debug)]
+pub struct OtlpConfig {
+    pub logs_table: TableRef,
+    pub metrics_table: TableRef,
+    pub traces_table: TableRef,
+}
+
 /// Shared, cheaply-cloneable REST wiring: the gateway facade and the auth seam.
 /// One is built per server and cloned into axum state for every request. Holds
 /// no per-connection or per-session state — the direct path is request-scoped.
@@ -65,6 +76,7 @@ use crate::types::{
 pub struct RestState {
     instance: Arc<dyn GatewayInstance>,
     authenticator: Arc<dyn Authenticator>,
+    otlp: Option<Arc<OtlpConfig>>,
 }
 
 /// The REST frontend: builds the axum router and owns bind/serve, mirroring the
@@ -78,11 +90,13 @@ impl RestServer {
     pub fn new(
         instance: Arc<dyn GatewayInstance>,
         authenticator: Arc<dyn Authenticator>,
+        otlp: Option<OtlpConfig>,
     ) -> Self {
         Self {
             state: RestState {
                 instance,
                 authenticator,
+                otlp: otlp.map(Arc::new),
             },
         }
     }
@@ -91,7 +105,7 @@ impl RestServer {
     /// Exposed (not just `serve`) so tests can mount it onto a `oneshot` tower
     /// service as well as a real loopback listener.
     pub fn router(&self) -> Router {
-        Router::new()
+        let router = Router::new()
             // --- write (implemented) ---
             .route(
                 "/v1/clusters/{cluster}/databases/{db}/tables/{table}/records",
@@ -128,8 +142,27 @@ impl RestServer {
             .route(
                 "/v1/clusters/{cluster}/databases/{db}/tables/{table}/log-scan",
                 post(handle_read_not_implemented),
-            )
-            .with_state(self.state.clone())
+            );
+
+        let router = if self.state.otlp.is_some() {
+            router
+                .route(
+                    "/v1/clusters/{cluster}/otlp/v1/logs",
+                    post(otlp::handle_logs),
+                )
+                .route(
+                    "/v1/clusters/{cluster}/otlp/v1/metrics",
+                    post(otlp::handle_metrics),
+                )
+                .route(
+                    "/v1/clusters/{cluster}/otlp/v1/traces",
+                    post(otlp::handle_traces),
+                )
+        } else {
+            router
+        };
+
+        router.with_state(self.state.clone())
     }
 
     /// Bind a TCP listener and return it with the resolved local address. Tests
@@ -696,6 +729,13 @@ fn error_response(err: GatewayError) -> Response {
         }
     });
     (status, Json(body)).into_response()
+}
+
+fn require_otlp(state: &RestState) -> Result<&OtlpConfig, GatewayError> {
+    state
+        .otlp
+        .as_deref()
+        .ok_or_else(|| GatewayError::Unsupported("OTLP HTTP is not enabled".into()))
 }
 
 // ---------------------------------------------------------------------------

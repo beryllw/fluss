@@ -62,8 +62,11 @@ arc-swap = "1"
 fluss = { package = "fluss-rs", git = "https://github.com/beryllw/fluss-rust.git", rev = "aa19a58f8a3d88b1e3b2447b6d41b6c28d9dd520", features = ["storage-all"] }
 fluss-datafusion = { git = "https://github.com/beryllw/fluss-rust.git", rev = "aa19a58f8a3d88b1e3b2447b6d41b6c28d9dd520" }
 
-# --- HTTP (REST direct path) ---
+# --- HTTP (REST direct path + OTLP HTTP) ---
 axum = "0.8"
+# OTLP protobuf request/response messages (HTTP adapter only; no SDK/exporter).
+prost = "0.14"
+opentelemetry-proto = { version = "0.32.0", default-features = false, features = ["gen-tonic-messages", "trace", "logs", "metrics"] }
 
 # --- Serialization / error / misc ---
 serde = { version = "1", features = ["derive"] }
