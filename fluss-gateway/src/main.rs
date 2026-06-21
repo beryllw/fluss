@@ -27,6 +27,8 @@
 //! - `FLUSS_BOOTSTRAP_SERVERS` (default `127.0.0.1:9123`) — the Fluss cluster.
 //! - `GATEWAY_PG_LISTEN`       (default `0.0.0.0:5432`)   — PostgreSQL bind addr.
 //! - `GATEWAY_REST_LISTEN`     (default `0.0.0.0:8080`)   — REST bind addr.
+//! - `GATEWAY_MCP_ENABLED`     (default `false`)          — serve the MCP frontend.
+//! - `GATEWAY_MCP_LISTEN`      (default `0.0.0.0:8000`)   — MCP bind addr (when enabled).
 //! - `FLUSS_CLUSTER`           (default `default`)        — logical cluster id.
 //! - `GATEWAY_CONFIG`          (optional)                 — YAML config file.
 //! - `GATEWAY_USERS`           (optional)                 — `user:secret,...` auth override.
@@ -51,6 +53,7 @@ use fluss_gateway::connection::{
 };
 use fluss_gateway::error::GatewayError;
 use fluss_gateway::instance::{GatewayInstance, GatewayInstanceImpl};
+use fluss_gateway::server::mcp::McpServer;
 use fluss_gateway::server::postgres::PgServer;
 use fluss_gateway::server::rest::{OtlpConfig, RestServer};
 use fluss_gateway::session::manager::{SessionManager, SessionManagerConfig};
@@ -65,6 +68,8 @@ struct GatewayConfig {
     bootstrap_servers: String,
     pg_listen: String,
     rest_listen: String,
+    mcp_enabled: bool,
+    mcp_listen: String,
     cluster: String,
     config_path: Option<String>,
     users_env: Option<String>,
@@ -83,10 +88,13 @@ impl GatewayConfig {
                 .unwrap_or_else(|| default.to_string())
         };
         let env_opt = |key: &str| std::env::var(key).ok().filter(|v| !v.trim().is_empty());
-        let otlp_enabled = std::env::var("GATEWAY_OTLP_ENABLED")
-            .ok()
-            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-            .unwrap_or(false);
+        let env_flag = |key: &str| {
+            std::env::var(key)
+                .ok()
+                .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+                .unwrap_or(false)
+        };
+        let otlp_enabled = env_flag("GATEWAY_OTLP_ENABLED");
         let otlp_logs_table = env_opt("GATEWAY_OTLP_LOGS_TABLE")
             .map(|v| parse_table_ref("GATEWAY_OTLP_LOGS_TABLE", &v))
             .transpose()?;
@@ -100,6 +108,8 @@ impl GatewayConfig {
             bootstrap_servers: env_or("FLUSS_BOOTSTRAP_SERVERS", "127.0.0.1:9123"),
             pg_listen: env_or("GATEWAY_PG_LISTEN", "0.0.0.0:5432"),
             rest_listen: env_or("GATEWAY_REST_LISTEN", "0.0.0.0:8080"),
+            mcp_enabled: env_flag("GATEWAY_MCP_ENABLED"),
+            mcp_listen: env_or("GATEWAY_MCP_LISTEN", "0.0.0.0:8000"),
             cluster: env_or("FLUSS_CLUSTER", "default"),
             config_path: env_opt("GATEWAY_CONFIG"),
             users_env: env_opt("GATEWAY_USERS"),
@@ -207,6 +217,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cluster = %config.cluster,
         pg_listen = %config.pg_listen,
         rest_listen = %config.rest_listen,
+        mcp_enabled = config.mcp_enabled,
         otlp_enabled = config.otlp_enabled,
         "starting fluss-gateway"
     );
@@ -214,7 +225,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let instance = assemble_instance(&config).await?;
     let authenticator = build_authenticator(&config)?;
 
-    // Bind both frontends before serving so a bind failure (e.g. port in use)
+    // Bind the frontends before serving so a bind failure (e.g. port in use)
     // surfaces immediately rather than after the cluster handshake.
     let (pg_listener, pg_addr) = PgServer::bind(&config.pg_listen).await?;
     let (rest_listener, rest_addr) = RestServer::bind(&config.rest_listen).await?;
@@ -233,7 +244,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut pg_task = tokio::spawn(async move { pg.serve(pg_listener).await });
     let mut rest_task = tokio::spawn(async move { rest.serve(rest_listener).await });
 
-    // Run until either frontend exits (an error) or a shutdown signal arrives.
+    // MCP is opt-in. When disabled, a never-resolving placeholder keeps the
+    // select! arm uniform (same JoinHandle<io::Result<()>> type as pg/rest).
+    let mut mcp_task = if config.mcp_enabled {
+        let (mcp_listener, mcp_addr) = McpServer::bind(&config.mcp_listen).await?;
+        tracing::info!(%mcp_addr, "listening (mcp)");
+        let mcp = McpServer::new(
+            Arc::clone(&instance) as Arc<dyn GatewayInstance>,
+            Arc::clone(&authenticator),
+        );
+        tokio::spawn(async move { mcp.serve(mcp_listener).await })
+    } else {
+        tokio::spawn(async move { std::future::pending::<std::io::Result<()>>().await })
+    };
+
+    // Run until a frontend exits (an error) or a shutdown signal arrives.
     tokio::select! {
         res = &mut pg_task => {
             tracing::error!(?res, "postgres frontend exited");
@@ -241,10 +266,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         res = &mut rest_task => {
             tracing::error!(?res, "rest frontend exited");
         }
+        res = &mut mcp_task => {
+            tracing::error!(?res, "mcp frontend exited");
+        }
         _ = shutdown_signal() => {
             tracing::info!("shutdown signal received, stopping");
             pg_task.abort();
             rest_task.abort();
+            mcp_task.abort();
         }
     }
 
@@ -389,6 +418,8 @@ mod tests {
             bootstrap_servers: "127.0.0.1:9123".into(),
             pg_listen: "0.0.0.0:5432".into(),
             rest_listen: "0.0.0.0:8080".into(),
+            mcp_enabled: false,
+            mcp_listen: "0.0.0.0:8000".into(),
             cluster: "default".into(),
             config_path: None,
             users_env: None,

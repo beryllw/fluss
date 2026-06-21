@@ -18,12 +18,15 @@
 //! Protocol frontends.
 //!
 //! Transport + adaptation only; all execution goes through `Instance`. Ships
-//! `postgres` (read-only SQL) and `rest` (table-oriented REST direct write plus
-//! optional OTLP-over-HTTP ingestion on the same listener).
+//! `postgres` (read-only SQL), `rest` (table-oriented REST direct write plus
+//! optional OTLP-over-HTTP ingestion on the same listener), and `mcp`
+//! (Model Context Protocol read-only tools for AI agents).
 //! Design: `design/sql-path.md`, `design/direct-path.md`, infra.
 
+pub mod mcp;
 pub mod postgres;
 pub mod rest;
 
+pub use mcp::McpServer;
 pub use postgres::PgServer;
 pub use rest::RestServer;

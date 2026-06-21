@@ -45,6 +45,7 @@ use datafusion::scalar::ScalarValue;
 use fluss_gateway::auth::TrustAuthenticator;
 use fluss_gateway::error::{GatewayError, GatewayResult};
 use fluss_gateway::instance::GatewayInstance;
+use fluss_gateway::server::mcp::McpServer;
 use fluss_gateway::server::postgres::PgServer;
 use fluss_gateway::server::rest::RestServer;
 use fluss_gateway::types::{
@@ -510,5 +511,42 @@ impl RestTestServer {
     /// Base URL for the frozen `default` cluster prefix.
     pub fn base_url(&self) -> String {
         format!("http://127.0.0.1:{}/v1/clusters/default", self.port)
+    }
+}
+
+/// A running MCP (Streamable HTTP) frontend bound to an ephemeral loopback port,
+/// backed by a shared [`FakeInstance`].
+pub struct McpTestServer {
+    pub port: u16,
+    pub instance: Arc<FakeInstance>,
+}
+
+impl McpTestServer {
+    pub async fn start() -> McpTestServer {
+        Self::start_with_authenticator(
+            Arc::new(FakeInstance::new()),
+            Arc::new(TrustAuthenticator::new()),
+        )
+        .await
+    }
+
+    pub async fn start_with_authenticator(
+        instance: Arc<FakeInstance>,
+        authenticator: Arc<dyn fluss_gateway::auth::Authenticator>,
+    ) -> McpTestServer {
+        let server = McpServer::new(instance.clone(), authenticator);
+        let (listener, addr) = McpServer::bind("127.0.0.1:0").await.unwrap();
+        tokio::spawn(async move {
+            let _ = server.serve(listener).await;
+        });
+        McpTestServer {
+            port: addr.port(),
+            instance,
+        }
+    }
+
+    /// The Streamable HTTP endpoint an MCP client connects to.
+    pub fn endpoint(&self) -> String {
+        format!("http://127.0.0.1:{}/mcp", self.port)
     }
 }

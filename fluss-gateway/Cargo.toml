@@ -88,6 +88,24 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Unguessable per-connection PG cancel backend-key secret.
 rand = "0.8"
 
+# --- MCP (Model Context Protocol) read-only adapter (server/mcp/) ---
+# Official Rust SDK over Streamable HTTP. It does NOT depend on arrow/datafusion/
+# pgwire, so it is orthogonal to the frozen df53/arrow58 line; it unifies onto the
+# axum 0.8 / hyper 1 / tower 0.5 / tokio already in the tree (no version bump —
+# `cargo add` pulled only leaf crates: rmcp, rmcp-macros, sse-stream, pastey,
+# schemars_derive, serde_derive_internals). `default-features = false` keeps the
+# client/reqwest transports out; `macros` gives #[tool]/#[tool_router]. schemars
+# is re-exported as `rmcp::schemars`, so no direct schemars dependency is needed.
+rmcp = { version = "1.7", default-features = false, features = [
+    "server",
+    "transport-streamable-http-server",
+    "macros",
+] }
+# rmcp's #[derive(JsonSchema)] expands to `schemars::` paths, so schemars must be
+# a named dependency. It is already in the tree (serde_with pulls 1.2.x), so this
+# unifies onto that exact version with no bump — verified by the Cargo.lock diff.
+schemars = "1"
+
 [features]
 # Real-cluster end-to-end tests (tests/cluster_e2e.rs). Off by default so plain
 # `cargo test` stays cluster-free; enable with `--features integration_tests`,
@@ -105,3 +123,12 @@ tokio-postgres = "0.7"
 # Real HTTP client for REST direct-path integration tests (P5). Drives the axum
 # frontend over loopback TCP with no Fluss cluster, against a fake GatewayInstance.
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
+# Real MCP client for the MCP integration test: drives the Streamable HTTP server
+# the same way an agent would (initialize handshake, tools/list, tools/call). Same
+# rmcp version as the normal dependency; cargo unifies the feature set for the test
+# build, so this only turns on the client transports — no new crate version.
+rmcp = { version = "1.7", default-features = false, features = [
+    "client",
+    "transport-streamable-http-client",
+    "transport-streamable-http-client-reqwest",
+] }

@@ -62,6 +62,7 @@
 
 #![cfg(feature = "integration_tests")]
 
+use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -81,6 +82,7 @@ use fluss_gateway::backend::FlussBackendFacade;
 use fluss_gateway::cluster::{ClusterConfig, ClusterRegistry};
 use fluss_gateway::connection::{FlussConnectionProvider, SharedProxyConnectionProvider};
 use fluss_gateway::instance::{GatewayInstance, GatewayInstanceImpl};
+use fluss_gateway::server::mcp::McpServer;
 use fluss_gateway::server::postgres::PgServer;
 use fluss_gateway::server::rest::{OtlpConfig, RestServer};
 use fluss_gateway::session::manager::{SessionManager, SessionManagerConfig};
@@ -89,6 +91,13 @@ use fluss_gateway::sql::environment::{
     StubPgCatalogOverlayInstaller,
 };
 use fluss_gateway::types::{ClusterId, Principal, SqlEnvironmentId, TableRef};
+
+use reqwest::header::{HeaderValue, AUTHORIZATION};
+use rmcp::model::{object, CallToolRequestParams};
+use rmcp::transport::streamable_http_client::{
+    StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
+};
+use rmcp::ServiceExt;
 
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::common::v1::{any_value::Value as OtlpValue, AnyValue};
@@ -99,6 +108,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 /// Dedicated ports per e2e so the two live tests can run independently.
 const REST_CLUSTER_PORT: u16 = 9143;
 const OTLP_CLUSTER_PORT: u16 = 9144;
+const MCP_CLUSTER_PORT: u16 = 9145;
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 const DATABASE: &str = "fluss";
@@ -1130,6 +1140,164 @@ async fn cluster_otlp_logs_lands_and_reads_back() {
 
     let admin = gw_conn.get_admin().unwrap();
     let _ = admin.drop_table(&TablePath::new(DATABASE, OTLP_LOGS_TABLE), true).await;
+    cluster.stop();
+}
+
+/// MCP end-to-end: drive the four read-only MCP tools with the REAL rmcp client
+/// (Streamable HTTP) against a live cluster. Seeds a KV table via REST, then uses
+/// the MCP tools an agent would call: `list_databases`, `list_tables`,
+/// `describe_table`, and `query` (which borrows the SQL path through an ephemeral
+/// session). Also asserts the read-only guard rejects DDL end-to-end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+async fn cluster_mcp_tools_against_live_fluss() {
+    let _permit = cluster_e2e_permit().await;
+    let cluster = start_cluster("gw-e2e-mcp", MCP_CLUSTER_PORT).await;
+    let bootstrap = cluster.plaintext_bootstrap_servers().to_string();
+    let connection = Arc::new(cluster.get_fluss_connection().await);
+
+    create_kv_table(&connection).await;
+
+    let (instance, gw_conn) = assemble_instance(&bootstrap).await;
+
+    // REST only seeds data (writes go through the direct path); reads are MCP.
+    let rest = RestServer::new(
+        instance.clone() as Arc<dyn GatewayInstance>,
+        Arc::new(TrustAuthenticator::new()),
+        None,
+    );
+    let (rest_listener, rest_addr) = RestServer::bind("127.0.0.1:0").await.unwrap();
+    tokio::spawn(async move {
+        let _ = rest.serve(rest_listener).await;
+    });
+
+    let mcp = McpServer::new(
+        instance.clone() as Arc<dyn GatewayInstance>,
+        Arc::new(TrustAuthenticator::new()),
+    );
+    let (mcp_listener, mcp_addr) = McpServer::bind("127.0.0.1:0").await.unwrap();
+    tokio::spawn(async move {
+        let _ = mcp.serve(mcp_listener).await;
+    });
+
+    let http = reqwest::Client::new();
+    let auth = format!("Basic {}", basic_auth("alice"));
+    let rest_base = format!("http://{rest_addr}/v1/clusters/default");
+
+    // Seed two rows into the KV table via REST.
+    let resp = tokio::time::timeout(
+        Duration::from_secs(30),
+        http.post(format!("{rest_base}/databases/{DATABASE}/tables/{KV_TABLE}/records"))
+            .header("Authorization", &auth)
+            .header("Content-Type", JSON)
+            .body(r#"[{"id":1,"name":"alice"},{"id":2,"name":"bob"}]"#)
+            .send(),
+    )
+    .await
+    .expect("REST seed timed out before the gateway replied")
+    .unwrap();
+    assert_eq!(resp.status(), 200, "KV seed REST status");
+
+    // Connect the real MCP client (Basic auth via custom header — rmcp's
+    // `auth_header` would force a Bearer scheme).
+    let mut headers = HashMap::new();
+    headers.insert(AUTHORIZATION, HeaderValue::from_str(&auth).unwrap());
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(format!("http://{mcp_addr}/mcp"))
+            .custom_headers(headers),
+    );
+    let client = tokio::time::timeout(Duration::from_secs(30), ().serve(transport))
+        .await
+        .expect("MCP initialize timed out")
+        .expect("MCP initialize handshake");
+
+    // tools/list advertises exactly the four read-only tools.
+    let tools = client.list_tools(Default::default()).await.unwrap();
+    let mut names: Vec<String> = tools.tools.iter().map(|t| t.name.to_string()).collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["describe_table", "list_databases", "list_tables", "query"],
+        "MCP advertises the four read-only tools"
+    );
+
+    // list_databases includes the database we seeded.
+    let v = client
+        .call_tool(CallToolRequestParams::new("list_databases"))
+        .await
+        .unwrap()
+        .structured_content
+        .expect("list_databases structured content");
+    assert!(
+        v["databases"].as_array().unwrap().iter().any(|d| d == DATABASE),
+        "MCP list_databases includes {DATABASE}: {v}"
+    );
+
+    // list_tables includes the KV table.
+    let v = client
+        .call_tool(
+            CallToolRequestParams::new("list_tables")
+                .with_arguments(object(serde_json::json!({ "database": DATABASE }))),
+        )
+        .await
+        .unwrap()
+        .structured_content
+        .expect("list_tables structured content");
+    assert!(
+        v["tables"].as_array().unwrap().iter().any(|t| t == KV_TABLE),
+        "MCP list_tables includes {KV_TABLE}: {v}"
+    );
+
+    // describe_table reports the (id, name) schema from the live catalog.
+    let v = client
+        .call_tool(
+            CallToolRequestParams::new("describe_table").with_arguments(object(serde_json::json!({
+                "database": DATABASE,
+                "table": KV_TABLE,
+            }))),
+        )
+        .await
+        .unwrap()
+        .structured_content
+        .expect("describe_table structured content");
+    let cols: Vec<&str> = v["columns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["name"].as_str())
+        .collect();
+    assert_eq!(cols, vec!["id", "name"], "MCP describe_table columns");
+
+    // query borrows the SQL path: a PK point lookup reads back the seeded row.
+    let v = tokio::time::timeout(
+        Duration::from_secs(30),
+        client.call_tool(CallToolRequestParams::new("query").with_arguments(object(
+            serde_json::json!({
+                "sql": format!("SELECT id, name FROM fluss.{DATABASE}.{KV_TABLE} WHERE id = 2"),
+            }),
+        ))),
+    )
+    .await
+    .expect("MCP query timed out")
+    .unwrap()
+    .structured_content
+    .expect("query structured content");
+    assert_eq!(v["row_count"], 1, "MCP query returns one row: {v}");
+    assert_eq!(v["truncated"], false, "row fits under the cap");
+    assert_eq!(v["rows"][0]["name"], "bob", "MCP query reads back the seeded row");
+
+    // The read-only guard rejects DDL before it reaches the SQL path.
+    let rejected = client
+        .call_tool(
+            CallToolRequestParams::new("query")
+                .with_arguments(object(serde_json::json!({ "sql": "DROP TABLE x" }))),
+        )
+        .await;
+    assert!(rejected.is_err(), "MCP query rejects DDL end-to-end");
+
+    let _ = client.cancel().await;
+
+    let admin = gw_conn.get_admin().unwrap();
+    let _ = admin.drop_table(&TablePath::new(DATABASE, KV_TABLE), true).await;
     cluster.stop();
 }
 

@@ -75,6 +75,8 @@ pub struct SqlEnvironmentId(pub String);
 pub enum ProtocolKind {
     Postgres,
     Rest,
+    /// MCP (Model Context Protocol) read-only tool adapter (server/mcp/).
+    Mcp,
 }
 
 /// Minimal connection-origin information captured at session open time.

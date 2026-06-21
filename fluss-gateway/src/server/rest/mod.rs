@@ -188,7 +188,9 @@ impl RestServer {
 /// credential into a [`Principal`]. Extraction lives in the REST layer,
 /// not in `auth/`, which must stay free of HTTP types. Returns the raw
 /// `(username, password)` so the caller picks the credential variant.
-fn parse_basic_auth(headers: &HeaderMap) -> Result<(String, Option<String>), GatewayError> {
+pub(crate) fn parse_basic_auth(
+    headers: &HeaderMap,
+) -> Result<(String, Option<String>), GatewayError> {
     let value = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -756,7 +758,7 @@ fn new_request_id() -> String {
 
 /// Minimal RFC4648 standard base64 decoder (no padding requirement enforced).
 /// Avoids adding a base64 crate just for Basic-auth parsing.
-fn base64_decode(input: &str) -> Result<Vec<u8>, ()> {
+pub(crate) fn base64_decode(input: &str) -> Result<Vec<u8>, ()> {
     fn val(c: u8) -> Result<u8, ()> {
         match c {
             b'A'..=b'Z' => Ok(c - b'A'),
