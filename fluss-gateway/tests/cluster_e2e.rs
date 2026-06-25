@@ -1271,19 +1271,27 @@ async fn cluster_mcp_tools_against_live_fluss() {
     assert_eq!(cols, vec!["id", "name"], "MCP describe_table columns");
 
     // query borrows the SQL path: a PK point lookup reads back the seeded row.
-    let v = tokio::time::timeout(
+    let sql = format!("SELECT id, name FROM fluss.{DATABASE}.{KV_TABLE} WHERE id = 2");
+    let result = tokio::time::timeout(
         Duration::from_secs(30),
         client.call_tool(CallToolRequestParams::new("query").with_arguments(object(
             serde_json::json!({
-                "sql": format!("SELECT id, name FROM fluss.{DATABASE}.{KV_TABLE} WHERE id = 2"),
+                "sql": sql.clone(),
             }),
         ))),
     )
     .await
     .expect("MCP query timed out")
-    .unwrap()
-    .structured_content
-    .expect("query structured content");
+    .unwrap();
+    let v = result.structured_content.expect("query structured content");
+    let content_texts: Vec<&str> = result
+        .content
+        .iter()
+        .filter_map(|content| content.raw.as_text().map(|text| text.text.as_str()))
+        .collect();
+    let structured_json = v.to_string();
+    assert_eq!(content_texts.first().copied(), Some(structured_json.as_str()));
+    assert!(content_texts.iter().any(|text| *text == sql));
     assert_eq!(v["row_count"], 1, "MCP query returns one row: {v}");
     assert_eq!(v["truncated"], false, "row fits under the cap");
     assert_eq!(v["rows"][0]["name"], "bob", "MCP query reads back the seeded row");

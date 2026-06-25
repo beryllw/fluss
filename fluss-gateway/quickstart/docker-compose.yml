@@ -1,0 +1,192 @@
+# Fluss + Flink + Fluss Gateway + Paimon quickstart cluster.
+#
+# This stack is optimized for one MCP-only user story:
+#   customer support investigates a cancelled order whose refund has not arrived.
+#
+# Ports published to the host:
+#   5432  Gateway PostgreSQL (read-only SQL; not used in the main quickstart)
+#   8000  Gateway MCP (Streamable HTTP)
+#   8080  Gateway REST
+#   8083  Flink Web UI
+#   9000  RustFS S3 endpoint
+#   9001  RustFS console
+#   9123  Fluss coordinator (CLIENT listener)
+#   9124  Fluss tablet server (CLIENT listener)
+
+services:
+  zookeeper:
+    restart: always
+    image: zookeeper:3.9.2
+
+  rustfs:
+    image: rustfs/rustfs:${RUSTFS_VERSION}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      - RUSTFS_ACCESS_KEY=rustfsadmin
+      - RUSTFS_SECRET_KEY=rustfsadmin
+      - RUSTFS_CONSOLE_ENABLE=true
+    volumes:
+      - rustfs-data:/data
+    command: /data
+
+  rustfs-init:
+    image: minio/mc:${MC_VERSION}
+    depends_on:
+      - rustfs
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set rustfs http://rustfs:9000 rustfsadmin rustfsadmin; do
+        echo 'Waiting for RustFS...';
+        sleep 1;
+      done;
+      mc mb --ignore-existing rustfs/fluss;
+      "
+
+  coordinator-server:
+    image: apache/fluss:${FLUSS_DOCKER_VERSION}
+    command: coordinatorServer
+    depends_on:
+      zookeeper:
+        condition: service_started
+      rustfs-init:
+        condition: service_completed_successfully
+    environment:
+      - |
+        FLUSS_PROPERTIES=
+        zookeeper.address: zookeeper:2181
+        bind.listeners: INTERNAL://coordinator-server:0, CLIENT://coordinator-server:9123
+        advertised.listeners: CLIENT://coordinator-server:9123
+        internal.listener.name: INTERNAL
+        remote.data.dir: s3://fluss/remote-data
+        s3.endpoint: http://rustfs:9000
+        s3.access-key: rustfsadmin
+        s3.secret-key: rustfsadmin
+        s3.region: us-east-1
+        s3.path-style-access: true
+        s3.assumed.role.arn: arn:aws:iam::000000000000:role/rustfsadmin
+        s3.assumed.role.sts.endpoint: http://rustfs:9000
+        datalake.enabled: true
+        datalake.format: paimon
+        datalake.paimon.metastore: filesystem
+        datalake.paimon.warehouse: s3://fluss/paimon
+        datalake.paimon.s3.endpoint: http://rustfs:9000
+        datalake.paimon.s3.access-key: rustfsadmin
+        datalake.paimon.s3.secret-key: rustfsadmin
+        datalake.paimon.s3.region: us-east-1
+        datalake.paimon.s3.path.style.access: true
+    ports:
+      - "9123:9123"
+    volumes:
+      - ${PAIMON_S3_PLUGIN_JAR}:/opt/fluss/plugins/paimon/paimon-s3-${PAIMON_VERSION}.jar:ro
+
+  tablet-server:
+    image: apache/fluss:${FLUSS_DOCKER_VERSION}
+    command: tabletServer
+    depends_on:
+      - coordinator-server
+    environment:
+      - |
+        FLUSS_PROPERTIES=
+        zookeeper.address: zookeeper:2181
+        bind.listeners: INTERNAL://tablet-server:0, CLIENT://tablet-server:9123
+        advertised.listeners: CLIENT://tablet-server:9123
+        internal.listener.name: INTERNAL
+        tablet-server.id: 0
+        kv.snapshot.interval: 0s
+        data.dir: /tmp/fluss/data
+        remote.data.dir: s3://fluss/remote-data
+        s3.endpoint: http://rustfs:9000
+        s3.access-key: rustfsadmin
+        s3.secret-key: rustfsadmin
+        s3.region: us-east-1
+        s3.path-style-access: true
+        s3.assumed.role.arn: arn:aws:iam::000000000000:role/rustfsadmin
+        s3.assumed.role.sts.endpoint: http://rustfs:9000
+        datalake.enabled: true
+        datalake.format: paimon
+        datalake.paimon.metastore: filesystem
+        datalake.paimon.warehouse: s3://fluss/paimon
+        datalake.paimon.s3.endpoint: http://rustfs:9000
+        datalake.paimon.s3.access-key: rustfsadmin
+        datalake.paimon.s3.secret-key: rustfsadmin
+        datalake.paimon.s3.region: us-east-1
+        datalake.paimon.s3.path.style.access: true
+    ports:
+      - "9124:9123"
+    volumes:
+      - shared-tmpfs:/tmp/fluss
+      - ${PAIMON_S3_PLUGIN_JAR}:/opt/fluss/plugins/paimon/paimon-s3-${PAIMON_VERSION}.jar:ro
+
+  gateway:
+    image: ${FLUSS_GATEWAY_IMAGE}
+    depends_on:
+      - coordinator-server
+      - tablet-server
+    environment:
+      - FLUSS_BOOTSTRAP_SERVERS=coordinator-server:9123
+      - GATEWAY_PG_LISTEN=0.0.0.0:5432
+      - GATEWAY_REST_LISTEN=0.0.0.0:8080
+      - FLUSS_CLUSTER=default
+      - RUST_LOG=info
+      - GATEWAY_MCP_ENABLED=true
+      - GATEWAY_MCP_LISTEN=0.0.0.0:8000
+      - GATEWAY_LAKE_S3_ACCESS_KEY=rustfsadmin
+      - GATEWAY_LAKE_S3_SECRET_KEY=rustfsadmin
+      - GATEWAY_LAKE_S3_ENDPOINT=http://rustfs:9000
+      - GATEWAY_LAKE_S3_REGION=us-east-1
+      - GATEWAY_LAKE_S3_PATH_STYLE_ACCESS=true
+    ports:
+      - "5432:5432"
+      - "8080:8080"
+      - "8000:8000"
+
+  jobmanager:
+    image: apache/fluss-quickstart-flink:${FLUSS_QUICKSTART_FLINK_DOCKER_VERSION}
+    depends_on:
+      - coordinator-server
+    entrypoint: ["/opt/flink/init_paimon.sh"]
+    command: ["jobmanager"]
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+    ports:
+      - "8083:8081"
+
+  taskmanager:
+    image: apache/fluss-quickstart-flink:${FLUSS_QUICKSTART_FLINK_DOCKER_VERSION}
+    depends_on:
+      - jobmanager
+    entrypoint: ["/opt/flink/init_paimon.sh"]
+    command: ["taskmanager"]
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 10
+        taskmanager.memory.process.size: 2048m
+        taskmanager.memory.task.off-heap.size: 128m
+
+  sql-client:
+    image: apache/fluss-quickstart-flink:${FLUSS_QUICKSTART_FLINK_DOCKER_VERSION}
+    depends_on:
+      - jobmanager
+    entrypoint: ["/opt/flink/init_paimon.sh"]
+    command: ["/opt/sql-client/sql-client"]
+    tty: true
+    stdin_open: true
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        rest.address: jobmanager
+
+volumes:
+  rustfs-data:
+  shared-tmpfs:
+    driver: local
+    driver_opts:
+      type: "tmpfs"
+      device: "tmpfs"

@@ -48,11 +48,13 @@ The gateway surface is split into two paths:
 
 - read-only MCP (Model Context Protocol) server for AI agents (Streamable HTTP)
 - four tools: `list_databases`, `list_tables`, `describe_table`, `query` (read-only SQL)
+- `query` keeps rows in structured JSON and additionally echoes the submitted SQL in MCP text content
 - enable with `GATEWAY_MCP_ENABLED=true`; endpoint `http://<host>:8000/mcp`
 - agent onboarding guide: [`design/mcp-access.md`](./design/mcp-access.md)
 
 - 面向 AI agent 的只读 MCP server(Streamable HTTP)
 - 4 个工具：`list_databases`、`list_tables`、`describe_table`、`query`(只读 SQL)
+- `query` 会继续用结构化 JSON 返回行结果，并额外把提交的 SQL 作为 MCP 文本内容回显
 - 用 `GATEWAY_MCP_ENABLED=true` 开启；端点 `http://<host>:8000/mcp`
 - agent 接入指南：[`design/mcp-access.md`](./design/mcp-access.md)
 
@@ -116,6 +118,18 @@ Metadata:
 curl -u alice:ignored \
   http://127.0.0.1:<rest-port>/v1/clusters/default/databases
 ```
+
+### Quickstart / 快速上手
+
+If you want the fastest end-to-end path for understanding how `fluss-gateway` is used by an AI agent, start with the MCP quickstart:
+
+如果你想用一条最短路径理解 `fluss-gateway` 如何被 AI agent 使用，优先看 MCP quickstart：
+
+- [`quickstart/README.md`](./quickstart/README.md) — tiering-enabled local cluster + MCP-only refund investigation / 带 tiering 的本地集群与退款排查 quickstart
+
+It brings up a local Fluss + Gateway + Paimon environment, connects through MCP, and walks through a customer-support refund investigation story.
+
+它会启动一个本地 Fluss + Gateway + Paimon 环境，通过 MCP 接入，并演示一次客服退款排查流程。
 
 ### Deploying against a Fluss cluster (with / without tiering) / 配合 Fluss 集群部署（带 / 不带 tiering）
 

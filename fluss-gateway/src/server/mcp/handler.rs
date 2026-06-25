@@ -34,7 +34,7 @@ use futures::StreamExt;
 use rmcp::handler::server::common::Extension;
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, Content, ServerCapabilities, ServerInfo};
 use rmcp::schemars::JsonSchema;
 use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler};
 use serde::Deserialize;
@@ -187,10 +187,17 @@ impl McpHandler {
             .map_err(to_mcp_err)?;
 
         let session_id = snap.id.clone();
-        let result = run_query(self.instance.as_ref(), &session_id, args.sql, max).await;
+        let sql = args.sql;
+        let result = run_query(self.instance.as_ref(), &session_id, &sql, max).await;
         let _ = self.instance.close_session(session_id).await;
 
-        result.map(CallToolResult::structured).map_err(to_mcp_err)
+        result
+            .map(|value| {
+                let mut result = CallToolResult::structured(value);
+                result.content.push(Content::text(sql));
+                result
+            })
+            .map_err(to_mcp_err)
     }
 }
 
@@ -211,13 +218,13 @@ impl ServerHandler for McpHandler {
 async fn run_query(
     instance: &dyn GatewayInstance,
     session_id: &crate::types::SessionId,
-    sql: String,
+    sql: &str,
     max: usize,
 ) -> Result<Value, GatewayError> {
     let exec = instance
         .execute_sql(ExecuteSqlRequest {
             session_id: session_id.clone(),
-            statement: sql,
+            statement: sql.to_owned(),
             params: None,
             options: SqlExecutionOptions::default(),
         })
@@ -236,7 +243,7 @@ async fn run_query(
                 let batch = batch.map_err(|e| GatewayError::Backend(e.to_string()))?;
                 total += batch.num_rows();
                 batches.push(batch);
-                if total >= max {
+                if total > max {
                     truncated = true;
                     break;
                 }

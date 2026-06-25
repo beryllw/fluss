@@ -58,6 +58,14 @@ async fn connect(
     Ok(client)
 }
 
+fn text_contents(result: &rmcp::model::CallToolResult) -> Vec<String> {
+    result
+        .content
+        .iter()
+        .filter_map(|content| content.raw.as_text().map(|text| text.text.clone()))
+        .collect()
+}
+
 #[tokio::test]
 async fn initialize_and_list_tools_exposes_four_readonly_tools() {
     let server = McpTestServer::start().await;
@@ -131,7 +139,11 @@ async fn query_tool_returns_rows() {
         .await
         .unwrap();
 
+    let texts = text_contents(&result);
     let structured = result.structured_content.expect("structured content");
+    let structured_json = structured.to_string();
+    assert_eq!(texts.first().map(String::as_str), Some(structured_json.as_str()));
+    assert!(texts.iter().any(|text| text == "SELECT * FROM t"));
     assert_eq!(structured["row_count"], 2);
     assert_eq!(structured["truncated"], false);
     let rows = structured["rows"].as_array().unwrap();
@@ -154,9 +166,37 @@ async fn query_tool_truncates_at_max_rows() {
         .await
         .unwrap();
 
+    let texts = text_contents(&result);
     let structured = result.structured_content.expect("structured content");
+    let structured_json = structured.to_string();
+    assert_eq!(texts.first().map(String::as_str), Some(structured_json.as_str()));
+    assert!(texts.iter().any(|text| text == "SELECT * FROM t"));
     assert_eq!(structured["row_count"], 1);
     assert_eq!(structured["truncated"], true);
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn query_tool_does_not_mark_exact_cap_as_truncated() {
+    let server = McpTestServer::start().await;
+    let client = connect(server.endpoint(), ALICE_SECRET).await.unwrap();
+
+    let result = client
+        .call_tool(CallToolRequestParams::new("query").with_arguments(object(serde_json::json!({
+                "sql": "SELECT * FROM t",
+                "max_rows": 2,
+            }))))
+        .await
+        .unwrap();
+
+    let texts = text_contents(&result);
+    let structured = result.structured_content.expect("structured content");
+    let structured_json = structured.to_string();
+    assert_eq!(texts.first().map(String::as_str), Some(structured_json.as_str()));
+    assert!(texts.iter().any(|text| text == "SELECT * FROM t"));
+    assert_eq!(structured["row_count"], 2);
+    assert_eq!(structured["truncated"], false);
 
     client.cancel().await.unwrap();
 }
