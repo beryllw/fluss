@@ -24,8 +24,18 @@ permissions:
 on:
   push:
     tags:
-      - 'gateway-v*'
+      - 'v*'
+      - 'gateway-exp-*'
   workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build for an experimental image"
+        required: true
+        type: string
+      image_tag:
+        description: "Docker tag to publish (must start with exp-)"
+        required: true
+        type: string
 
 jobs:
   publish-gateway-image:
@@ -36,6 +46,9 @@ jobs:
     steps:
       - name: "Checkout code"
         uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0
 
       - name: "Set up QEMU"
         uses: docker/setup-qemu-action@v3
@@ -52,24 +65,43 @@ jobs:
       - name: "Derive image tags"
         id: vars
         shell: bash
+        env:
+          INPUT_IMAGE_TAG: ${{ inputs.image_tag }}
         run: |
-          if [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
-            echo "workflow_dispatch is only supported on git tags" >&2
-            exit 1
-          fi
-
-          raw_tag="${GITHUB_REF_NAME}"
-          version="${raw_tag#gateway-}"
           image="docker.io/beryllwang/fluss-gateway"
+          stable=false
 
-          if [[ "${version}" == "${raw_tag}" ]]; then
-            echo "unexpected tag format: ${raw_tag} (expected gateway-v*)" >&2
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            version="${INPUT_IMAGE_TAG}"
+            if [[ -z "${version}" || ! "${version}" =~ ^exp-[A-Za-z0-9._-]+$ ]]; then
+              echo "workflow_dispatch image_tag must start with exp- and contain only [A-Za-z0-9._-]" >&2
+              exit 1
+            fi
+          elif [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            raw_tag="${GITHUB_REF_NAME}"
+
+            if [[ "${raw_tag}" == v* ]]; then
+              version="${raw_tag}"
+              stable=true
+              if [[ "${version}" =~ -(alpha|beta|rc)[0-9.-]*$ ]]; then
+                stable=false
+              fi
+
+              reachable_refs="$(git branch -r --contains "${GITHUB_SHA}" | sed 's/^[*[:space:]]*//')"
+              if ! printf '%s\n' "${reachable_refs}" | grep -Eq '^origin/(main|release-[^[:space:]]+)$'; then
+                echo "official release tags must point to commits reachable from origin/main or origin/release-*" >&2
+                printf 'reachable refs:\n%s\n' "${reachable_refs}" >&2
+                exit 1
+              fi
+            elif [[ "${raw_tag}" == gateway-exp-* ]]; then
+              version="exp-${raw_tag#gateway-exp-}"
+            else
+              echo "unsupported tag format: ${raw_tag}" >&2
+              exit 1
+            fi
+          else
+            echo "unsupported event/ref combination: ${GITHUB_EVENT_NAME} ${GITHUB_REF_TYPE}" >&2
             exit 1
-          fi
-
-          stable=true
-          if [[ "${version}" =~ -(alpha|beta|rc)[0-9.-]*$ ]]; then
-            stable=false
           fi
 
           echo "version=${version}" >> "${GITHUB_OUTPUT}"
