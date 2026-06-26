@@ -94,7 +94,7 @@ use fluss_gateway::sql::environment::{
 use fluss_gateway::types::{ClusterId, Principal, SqlEnvironmentId, TableRef};
 
 use reqwest::header::{HeaderValue, AUTHORIZATION};
-use rmcp::model::{object, CallToolRequestParams};
+use rmcp::model::{object, CallToolRequestParams, Role};
 use rmcp::transport::streamable_http_client::{
     StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
 };
@@ -1289,7 +1289,14 @@ async fn cluster_mcp_tools_against_live_fluss() {
         .iter()
         .filter_map(|content| content.raw.as_text().map(|text| text.text.as_str()))
         .collect();
-    assert_eq!(content_texts, vec![sql.as_str()]);
+    let content_audiences: Vec<Option<Vec<Role>>> = result
+        .content
+        .iter()
+        .map(|content| content.audience().cloned())
+        .collect();
+    let structured_json = v.to_string();
+    assert_eq!(content_texts, vec![sql.as_str(), structured_json.as_str()]);
+    assert_eq!(content_audiences, vec![Some(vec![Role::User]), Some(vec![Role::Assistant])]);
     assert_eq!(v["row_count"], 1, "MCP query returns one row: {v}");
     assert_eq!(v["truncated"], false, "row fits under the cap");
     assert_eq!(v["rows"][0]["name"], "bob", "MCP query reads back the seeded row");
@@ -1315,7 +1322,14 @@ async fn cluster_mcp_tools_against_live_fluss() {
         .iter()
         .filter_map(|content| content.raw.as_text().map(|text| text.text.as_str()))
         .collect();
-    assert_eq!(content_texts, vec![sql.as_str()]);
+    let content_audiences: Vec<Option<Vec<Role>>> = result
+        .content
+        .iter()
+        .map(|content| content.audience().cloned())
+        .collect();
+    let structured_json = v.to_string();
+    assert_eq!(content_texts, vec![sql.as_str(), structured_json.as_str()]);
+    assert_eq!(content_audiences, vec![Some(vec![Role::User]), Some(vec![Role::Assistant])]);
     assert_eq!(v["row_count"], 1, "MCP two-part query returns one row: {v}");
     assert_eq!(v["rows"][0]["name"], "alice", "MCP two-part query resolves through default catalog");
 

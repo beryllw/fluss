@@ -34,7 +34,7 @@ use futures::StreamExt;
 use rmcp::handler::server::common::Extension;
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, Content, Role, ServerCapabilities, ServerInfo};
 use rmcp::schemars::JsonSchema;
 use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler};
 use serde::Deserialize;
@@ -201,8 +201,12 @@ impl McpHandler {
 
         result
             .map(|value| {
+                let structured_text = value.to_string();
                 let mut result = CallToolResult::structured(value);
-                result.content = vec![Content::text(sql)];
+                result.content = vec![
+                    Content::text(sql.clone()).with_audience(vec![Role::User]),
+                    Content::text(structured_text).with_audience(vec![Role::Assistant]),
+                ];
                 result
             })
             .map_err(to_mcp_err)

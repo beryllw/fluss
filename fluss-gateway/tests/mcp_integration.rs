@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use fluss_gateway::auth::ConfigUserStoreAuthenticator;
 use reqwest::header::{HeaderValue, AUTHORIZATION};
-use rmcp::model::{object, CallToolRequestParams};
+use rmcp::model::{object, CallToolRequestParams, Role};
 use rmcp::transport::streamable_http_client::{
     StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
 };
@@ -63,6 +63,14 @@ fn text_contents(result: &rmcp::model::CallToolResult) -> Vec<String> {
         .content
         .iter()
         .filter_map(|content| content.raw.as_text().map(|text| text.text.clone()))
+        .collect()
+}
+
+fn text_audiences(result: &rmcp::model::CallToolResult) -> Vec<Option<Vec<Role>>> {
+    result
+        .content
+        .iter()
+        .map(|content| content.audience().cloned())
         .collect()
 }
 
@@ -140,8 +148,11 @@ async fn query_tool_returns_rows() {
         .unwrap();
 
     let texts = text_contents(&result);
+    let audiences = text_audiences(&result);
     let structured = result.structured_content.expect("structured content");
-    assert_eq!(texts, vec!["SELECT * FROM t".to_string()]);
+    let structured_json = structured.to_string();
+    assert_eq!(texts, vec!["SELECT * FROM t".to_string(), structured_json]);
+    assert_eq!(audiences, vec![Some(vec![Role::User]), Some(vec![Role::Assistant])]);
     assert_eq!(structured["row_count"], 2);
     assert_eq!(structured["truncated"], false);
     let rows = structured["rows"].as_array().unwrap();
@@ -165,8 +176,11 @@ async fn query_tool_truncates_at_max_rows() {
         .unwrap();
 
     let texts = text_contents(&result);
+    let audiences = text_audiences(&result);
     let structured = result.structured_content.expect("structured content");
-    assert_eq!(texts, vec!["SELECT * FROM t".to_string()]);
+    let structured_json = structured.to_string();
+    assert_eq!(texts, vec!["SELECT * FROM t".to_string(), structured_json]);
+    assert_eq!(audiences, vec![Some(vec![Role::User]), Some(vec![Role::Assistant])]);
     assert_eq!(structured["row_count"], 1);
     assert_eq!(structured["truncated"], true);
 
@@ -187,8 +201,11 @@ async fn query_tool_does_not_mark_exact_cap_as_truncated() {
         .unwrap();
 
     let texts = text_contents(&result);
+    let audiences = text_audiences(&result);
     let structured = result.structured_content.expect("structured content");
-    assert_eq!(texts, vec!["SELECT * FROM t".to_string()]);
+    let structured_json = structured.to_string();
+    assert_eq!(texts, vec!["SELECT * FROM t".to_string(), structured_json]);
+    assert_eq!(audiences, vec![Some(vec![Role::User]), Some(vec![Role::Assistant])]);
     assert_eq!(structured["row_count"], 2);
     assert_eq!(structured["truncated"], false);
 
