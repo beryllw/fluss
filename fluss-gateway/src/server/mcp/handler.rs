@@ -43,6 +43,7 @@ use serde_json::{json, Value};
 use super::tools::{batch_to_json, ensure_read_only, table_info_json};
 use crate::error::GatewayError;
 use crate::instance::GatewayInstance;
+use crate::sql::environment::FLUSS_CATALOG;
 use crate::types::{
     ClientInfo, ClusterId, ExecuteSqlRequest, MetadataScope, OpenSessionRequest, Principal,
     ProtocolKind, SessionVars, SqlEnvironmentId, SqlExecution, SqlExecutionOptions, TableRef,
@@ -177,7 +178,14 @@ impl McpHandler {
                 principal,
                 cluster: self.cluster.clone(),
                 sql_environment: Some(SqlEnvironmentId(SQL_ENVIRONMENT.into())),
-                initial_vars: SessionVars::default(),
+                // Match the PostgreSQL path's default namespace shape: MCP reads
+                // still prefer fully-qualified `fluss.<db>.<table>`, but a
+                // session-scoped default catalog keeps two-part `<db>.<table>`
+                // queries working without SQL rewriting.
+                initial_vars: SessionVars {
+                    current_catalog: Some(FLUSS_CATALOG.to_string()),
+                    ..SessionVars::default()
+                },
                 client_info: ClientInfo {
                     protocol: ProtocolKind::Mcp,
                     peer_addr: None,

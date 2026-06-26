@@ -19,7 +19,7 @@ cd "${QUICKSTART_DIR}"
 
 INIT_SQL="sql/init-refund-context-tables.sql"
 PIPE_SQL="sql/seed-or-pipeline.sql"
-STAGE_DESC="create refund investigation tables -> seed deterministic refund orders, support cases, events, and lake-enabled audit history"
+STAGE_DESC="create refund investigation tables -> seed stable refund context -> start a live refund signal stream that keeps refund_events, refund_orders, support_cases, and refund_audit_history moving"
 
 for f in "${INIT_SQL}" "${PIPE_SQL}"; do
   [[ -f "${f}" ]] || { echo "ERROR: missing ${f}" >&2; exit 3; }

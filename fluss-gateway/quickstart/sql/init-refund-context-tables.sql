@@ -36,8 +36,10 @@ WITH (
 );
 
 CREATE TABLE IF NOT EXISTS refund_orders (
-    `order_id` STRING NOT NULL COMMENT 'Primary order key; the first lookup entry for the refund investigation',
-    `customer_id` STRING COMMENT 'Customer who owns this order; next-hop key into customer_profiles',
+    `order_id` STRING NOT NULL COMMENT 'Primary order key for the refund investigation',
+    `customer_id` STRING NOT NULL COMMENT 'Customer who owns this order; support can use this to narrow down candidate orders before they know the order id',
+    `item_name` STRING COMMENT 'Human-readable purchased item name; useful when the user describes what they bought instead of giving an order id',
+    `item_category` STRING COMMENT 'Item category used to narrow down candidate orders for the same customer',
     `order_status` STRING COMMENT 'Current order status such as PAID, CANCELLED, or FULFILLED',
     `refund_status` STRING COMMENT 'Current refund status such as NOT_REQUESTED, REQUESTED, or PROCESSING',
     `refund_amount` DECIMAL(18, 2) COMMENT 'Requested refund amount',
@@ -45,10 +47,13 @@ CREATE TABLE IF NOT EXISTS refund_orders (
     `cancel_reason` STRING COMMENT 'Human-readable cancellation reason',
     `cancelled_at` TIMESTAMP(3) COMMENT 'Cancellation time if the order was cancelled',
     `updated_at` TIMESTAMP(3) COMMENT 'Last order state update time',
-    PRIMARY KEY (`order_id`) NOT ENFORCED
+    PRIMARY KEY (`customer_id`, `order_id`) NOT ENFORCED
 ) COMMENT 'Current order state used to confirm whether a refund investigation starts from a cancelled order.'
 WITH (
-    'bucket.num' = '1'
+    'bucket.num' = '1',
+    'bucket.key' = 'customer_id',
+    'table.datalake.enabled' = 'true',
+    'table.datalake.freshness' = '30s'
 );
 
 CREATE TABLE IF NOT EXISTS support_cases (
@@ -77,7 +82,9 @@ CREATE TABLE IF NOT EXISTS refund_events (
 ) COMMENT 'Refund timeline keyed by order so an agent can explain what happened step by step.'
 WITH (
     'bucket.num' = '1',
-    'bucket.key' = 'order_id'
+    'bucket.key' = 'order_id',
+    'table.datalake.enabled' = 'true',
+    'table.datalake.freshness' = '30s'
 );
 
 CREATE TABLE IF NOT EXISTS refund_audit_history (

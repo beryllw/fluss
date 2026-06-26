@@ -44,6 +44,8 @@ pub trait SqlEnvironmentProvider: Send + Sync {
 - `Instance` 持有一个 `SqlEnvironmentRegistry`，按 `SqlEnvironmentId`（如 `"postgres"`）注册/查找 provider。`SqlEnvironmentId` 标识 SQL 协议环境，与 `ProtocolKind` 1:1 对应。
 - `OpenSessionRequest.sql_environment` 由协议层握手时填。SQL 路径首次执行时用它从 registry 取 provider。
 - registry 是 shared/只读；provider 内部的重对象（共享 `FlussDatafusion`、pg_catalog 模板）由 provider 自己持有并跨 session 复用，不每 session 重建。
+- **当前 SQL namespace** 仍是固定 catalog `fluss` + Fluss database + table,即 `fluss.<database>.<table>`。这适合 Phase 1 的“单 session 面向单 cluster”模型。
+- **长期多集群方向**:当 gateway 从“单 session 选一个 cluster”演进到“单入口原生探索多个 cluster”时,更合适的 namespace 是把 SQL 第一段 catalog 映射成 cluster alias,形成 `<cluster>.<database>.<table>`。当前阶段先不做这层迁移,避免把 cluster 语义硬塞进 MCP/PG 的短期体验修复里。
 
 ### 固定装配顺序（PgSqlEnvironmentProvider::prepare_session_context）
 

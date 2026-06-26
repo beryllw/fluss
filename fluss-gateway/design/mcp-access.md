@@ -38,12 +38,14 @@ gateway 内置一个 **只读 MCP server**,把 Fluss 的读能力暴露成 4 个
 | `query` | `{ "sql": "<read-only SQL>", "max_rows": <int?> }` | `structuredContent = { "rows":[{..}], "row_count": <int>, "truncated": <bool> }`; `content` 只回显提交的 SQL | 跑单条只读 SQL |
 
 `query` 细节:
-- **表名三段式**:`fluss.<database>.<table>`(catalog 固定 `fluss`)。例:`fluss.mydb.orders`。
+- **推荐表名三段式**:`fluss.<database>.<table>`(当前固定 catalog = `fluss`)。例:`fluss.mydb.orders`。
+- **MCP 默认 catalog**:每个 MCP `query` 会话都会把当前 catalog 设成 `fluss`,所以两段式 `<database>.<table>` 也能在当前实现里解析成功；但为了跨环境/跨前端一致性,文档与示例仍推荐始终写三段式。
 - **只读白名单**:仅 `SELECT/WITH/EXPLAIN/SHOW/DESCRIBE`;单条语句(多语句会被拒)。
 - **结果双通道**:`structuredContent` 仍是结构化 JSON 行结果,供 agent/客户端读取; `content` 只回显本次提交的 SQL,方便在工具展示里快速确认执行的语句。
 - **行数上界**:`max_rows` 默认 `1000`,硬上限 `10000`;超出则 `truncated=true`。
 - **lake 表**:普通 `SELECT ... FROM fluss.db.t` 即得 lake+log union;`...t$lake` 只读 Paimon 快照,
   `...t$options` 看 datalake 选项(详见 [`usage-tiering.md`](usage-tiering.md))。
+- **长期多集群方向**:当前 SQL namespace 仍是单 catalog `fluss`;当 gateway 进入真正的多集群单入口阶段,更合适的长期演进是把 SQL 第一段 catalog 映射成 cluster alias,再形成 `<cluster>.<database>.<table>` 的显式多集群名字空间。
 
 ## 4. 接入方式
 

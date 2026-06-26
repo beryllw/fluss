@@ -1294,6 +1294,31 @@ async fn cluster_mcp_tools_against_live_fluss() {
     assert_eq!(v["truncated"], false, "row fits under the cap");
     assert_eq!(v["rows"][0]["name"], "bob", "MCP query reads back the seeded row");
 
+    // MCP defaults the current catalog to `fluss`, so a two-part
+    // `<database>.<table>` name should resolve against the live Fluss catalog
+    // without SQL rewriting.
+    let sql = format!("SELECT id, name FROM {DATABASE}.{KV_TABLE} WHERE id = 1");
+    let result = tokio::time::timeout(
+        Duration::from_secs(30),
+        client.call_tool(CallToolRequestParams::new("query").with_arguments(object(
+            serde_json::json!({
+                "sql": sql.clone(),
+            }),
+        ))),
+    )
+    .await
+    .expect("MCP two-part query timed out")
+    .unwrap();
+    let v = result.structured_content.expect("two-part query structured content");
+    let content_texts: Vec<&str> = result
+        .content
+        .iter()
+        .filter_map(|content| content.raw.as_text().map(|text| text.text.as_str()))
+        .collect();
+    assert_eq!(content_texts, vec![sql.as_str()]);
+    assert_eq!(v["row_count"], 1, "MCP two-part query returns one row: {v}");
+    assert_eq!(v["rows"][0]["name"], "alice", "MCP two-part query resolves through default catalog");
+
     // The read-only guard rejects DDL before it reaches the SQL path.
     let rejected = client
         .call_tool(
