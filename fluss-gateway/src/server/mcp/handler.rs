@@ -194,7 +194,7 @@ impl McpHandler {
         result
             .map(|value| {
                 let mut result = CallToolResult::structured(value);
-                result.content.push(Content::text(sql));
+                result.content = vec![Content::text(sql)];
                 result
             })
             .map_err(to_mcp_err)

@@ -1289,9 +1289,7 @@ async fn cluster_mcp_tools_against_live_fluss() {
         .iter()
         .filter_map(|content| content.raw.as_text().map(|text| text.text.as_str()))
         .collect();
-    let structured_json = v.to_string();
-    assert_eq!(content_texts.first().copied(), Some(structured_json.as_str()));
-    assert!(content_texts.iter().any(|text| *text == sql));
+    assert_eq!(content_texts, vec![sql.as_str()]);
     assert_eq!(v["row_count"], 1, "MCP query returns one row: {v}");
     assert_eq!(v["truncated"], false, "row fits under the cap");
     assert_eq!(v["rows"][0]["name"], "bob", "MCP query reads back the seeded row");

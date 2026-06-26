@@ -141,9 +141,7 @@ async fn query_tool_returns_rows() {
 
     let texts = text_contents(&result);
     let structured = result.structured_content.expect("structured content");
-    let structured_json = structured.to_string();
-    assert_eq!(texts.first().map(String::as_str), Some(structured_json.as_str()));
-    assert!(texts.iter().any(|text| text == "SELECT * FROM t"));
+    assert_eq!(texts, vec!["SELECT * FROM t".to_string()]);
     assert_eq!(structured["row_count"], 2);
     assert_eq!(structured["truncated"], false);
     let rows = structured["rows"].as_array().unwrap();
@@ -168,9 +166,7 @@ async fn query_tool_truncates_at_max_rows() {
 
     let texts = text_contents(&result);
     let structured = result.structured_content.expect("structured content");
-    let structured_json = structured.to_string();
-    assert_eq!(texts.first().map(String::as_str), Some(structured_json.as_str()));
-    assert!(texts.iter().any(|text| text == "SELECT * FROM t"));
+    assert_eq!(texts, vec!["SELECT * FROM t".to_string()]);
     assert_eq!(structured["row_count"], 1);
     assert_eq!(structured["truncated"], true);
 
@@ -192,9 +188,7 @@ async fn query_tool_does_not_mark_exact_cap_as_truncated() {
 
     let texts = text_contents(&result);
     let structured = result.structured_content.expect("structured content");
-    let structured_json = structured.to_string();
-    assert_eq!(texts.first().map(String::as_str), Some(structured_json.as_str()));
-    assert!(texts.iter().any(|text| text == "SELECT * FROM t"));
+    assert_eq!(texts, vec!["SELECT * FROM t".to_string()]);
     assert_eq!(structured["row_count"], 2);
     assert_eq!(structured["truncated"], false);
 

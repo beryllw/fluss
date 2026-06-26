@@ -48,13 +48,13 @@ The gateway surface is split into two paths:
 
 - read-only MCP (Model Context Protocol) server for AI agents (Streamable HTTP)
 - four tools: `list_databases`, `list_tables`, `describe_table`, `query` (read-only SQL)
-- `query` keeps rows in structured JSON and additionally echoes the submitted SQL in MCP text content
+- `query` keeps rows in structured JSON and echoes only the submitted SQL in MCP text content
 - enable with `GATEWAY_MCP_ENABLED=true`; endpoint `http://<host>:8000/mcp`
 - agent onboarding guide: [`design/mcp-access.md`](./design/mcp-access.md)
 
 - 面向 AI agent 的只读 MCP server(Streamable HTTP)
 - 4 个工具：`list_databases`、`list_tables`、`describe_table`、`query`(只读 SQL)
-- `query` 会继续用结构化 JSON 返回行结果，并额外把提交的 SQL 作为 MCP 文本内容回显
+- `query` 会继续用结构化 JSON 返回行结果，MCP 文本内容里只回显提交的 SQL
 - 用 `GATEWAY_MCP_ENABLED=true` 开启；端点 `http://<host>:8000/mcp`
 - agent 接入指南：[`design/mcp-access.md`](./design/mcp-access.md)
 
