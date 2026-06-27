@@ -87,11 +87,13 @@ jobs:
                 stable=false
               fi
 
-              reachable_refs="$(git branch -r --contains "${GITHUB_SHA}" | sed 's/^[*[:space:]]*//')"
-              if ! printf '%s\n' "${reachable_refs}" | grep -Eq '^origin/(main|release-[^[:space:]]+)$'; then
-                echo "official release tags must point to commits reachable from origin/main or origin/release-*" >&2
-                printf 'reachable refs:\n%s\n' "${reachable_refs}" >&2
-                exit 1
+              if [[ "${stable}" == "true" ]]; then
+                reachable_refs="$(git branch -r --contains "${GITHUB_SHA}" | sed 's/^[*[:space:]]*//')"
+                if ! printf '%s\n' "${reachable_refs}" | grep -Eq '^origin/(main|release-[^[:space:]]+)$'; then
+                  echo "stable official tags must point to commits reachable from origin/main or origin/release-*" >&2
+                  printf 'reachable refs:\n%s\n' "${reachable_refs}" >&2
+                  exit 1
+                fi
               fi
             elif [[ "${raw_tag}" == gateway-exp-* ]]; then
               version="exp-${raw_tag#gateway-exp-}"
