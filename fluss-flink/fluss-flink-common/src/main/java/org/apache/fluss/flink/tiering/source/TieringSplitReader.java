@@ -528,6 +528,7 @@ public class TieringSplitReader<WriteResult>
                 lastWrittenTimestamp = record.timestamp();
                 if (record.getSizeInBytes() > 0) {
                     tieringMetrics.recordBytesRead(record.getSizeInBytes());
+                    tieringMetrics.recordSerializedBytesRead(record.getSizeInBytes());
                 }
             }
         }
@@ -577,11 +578,15 @@ public class TieringSplitReader<WriteResult>
                 batchToWrite = batch.truncateAndTransferOwnership(writableRows);
             }
             long batchSizeInBytes = batchToWrite.getSizeInBytes();
+            long serializedBatchSizeInBytes = batchToWrite.getEstimatedSerializedSizeInBytes();
             try (ArrowRecordBatch arrowRecordBatch = new ArrowRecordBatch(batchToWrite)) {
                 batchWriter.write(arrowRecordBatch);
             }
             if (batchSizeInBytes > 0) {
                 tieringMetrics.recordBytesRead(batchSizeInBytes);
+            }
+            if (serializedBatchSizeInBytes > 0) {
+                tieringMetrics.recordSerializedBytesRead(serializedBatchSizeInBytes);
             }
             lastWrittenTimestamp = batchTimestamp;
         }

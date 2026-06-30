@@ -295,6 +295,7 @@ public abstract class CompletedFetch {
                 }
 
                 ArrowBatchData arrowBatchData = batch.loadArrowBatch(readContext);
+                arrowBatchData.setEstimatedSerializedSizeInBytes(batch.sizeInBytes());
                 if (arrowBatchData.getRecordCount() == 0) {
                     arrowBatchData.close();
                     continue;

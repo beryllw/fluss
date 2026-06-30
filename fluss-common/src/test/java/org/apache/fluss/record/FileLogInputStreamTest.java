@@ -17,6 +17,8 @@
 
 package org.apache.fluss.record;
 
+import org.apache.fluss.compression.ArrowCompressionInfo;
+import org.apache.fluss.compression.ArrowCompressionType;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.utils.CloseableIterator;
 
@@ -31,15 +33,20 @@ import java.io.File;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V0;
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V1;
 import static org.apache.fluss.record.LogRecordBatchFormat.LOG_MAGIC_VALUE_V2;
+import static org.apache.fluss.record.LogRecordBatchFormat.NO_BATCH_SEQUENCE;
+import static org.apache.fluss.record.LogRecordBatchFormat.NO_WRITER_ID;
 import static org.apache.fluss.record.TestData.DATA1;
 import static org.apache.fluss.record.TestData.DATA1_ROW_TYPE;
 import static org.apache.fluss.record.TestData.DATA1_SCHEMA;
 import static org.apache.fluss.record.TestData.DEFAULT_SCHEMA_ID;
 import static org.apache.fluss.record.TestData.TEST_SCHEMA_GETTER;
+import static org.apache.fluss.testutils.DataTestUtils.createBasicMemoryLogRecords;
 import static org.apache.fluss.testutils.DataTestUtils.createRecordsWithoutBaseLogOffset;
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -306,5 +313,61 @@ public class FileLogInputStreamTest extends LogTestBase {
                 }
             }
         }
+    }
+
+    @Test
+    void testArrowBatchSerializedSizeScalesAfterTruncate() throws Exception {
+        List<Object[]> data = createHighlyCompressibleData();
+        try (FileLogRecords fileLogRecords =
+                FileLogRecords.open(new File(tempDir, "test_arrow_batch_partial_size.tmp"))) {
+            fileLogRecords.append(
+                    createBasicMemoryLogRecords(
+                            DATA1_ROW_TYPE,
+                            DEFAULT_SCHEMA_ID,
+                            0L,
+                            -1L,
+                            LOG_MAGIC_VALUE_V1,
+                            NO_WRITER_ID,
+                            NO_BATCH_SEQUENCE,
+                            Collections.nCopies(data.size(), ChangeType.APPEND_ONLY),
+                            data,
+                            LogFormat.ARROW,
+                            new ArrowCompressionInfo(ArrowCompressionType.ZSTD, 3),
+                            true));
+            fileLogRecords.flush();
+
+            FileLogInputStream logInputStream =
+                    new FileLogInputStream(fileLogRecords, 0, fileLogRecords.sizeInBytes());
+            FileLogInputStream.FileChannelLogRecordBatch batch = logInputStream.nextBatch();
+            assertThat(batch).isNotNull();
+            long serializedBytes = batch.sizeInBytes();
+
+            TestingSchemaGetter schemaGetter =
+                    new TestingSchemaGetter(DEFAULT_SCHEMA_ID, DATA1_SCHEMA);
+            try (LogRecordReadContext readContext =
+                    LogRecordReadContext.createArrowReadContext(
+                            DATA1_ROW_TYPE, DEFAULT_SCHEMA_ID, schemaGetter)) {
+                ArrowBatchData arrowBatchData = batch.loadArrowBatch(readContext);
+                int originalRowCount = arrowBatchData.getRecordCount();
+                arrowBatchData.setEstimatedSerializedSizeInBytes(serializedBytes);
+
+                int keptRows = originalRowCount / 4;
+                try (ArrowBatchData truncated =
+                        arrowBatchData.truncateAndTransferOwnership(keptRows)) {
+                    long expectedSerializedBytes =
+                            Math.round((double) serializedBytes * keptRows / originalRowCount);
+                    assertThat(truncated.getRecordCount()).isEqualTo(keptRows);
+                    assertThat(truncated.getEstimatedSerializedSizeInBytes())
+                            .isEqualTo(expectedSerializedBytes);
+                }
+            }
+        }
+    }
+
+    private List<Object[]> createHighlyCompressibleData() {
+        String repeatedPayload = "tiering-compression-" + "x".repeat(4096);
+        return IntStream.range(0, 256)
+                .mapToObj(i -> new Object[] {i, repeatedPayload})
+                .collect(Collectors.toList());
     }
 }

@@ -24,9 +24,11 @@ import org.apache.fluss.metadata.SchemaInfo;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TableInfo;
+import org.apache.fluss.record.ArrowBatchData;
 import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.record.FileLogProjection;
 import org.apache.fluss.record.FileLogRecords;
+import org.apache.fluss.record.LogRecordBatch;
 import org.apache.fluss.record.LogRecordReadContext;
 import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.record.ProjectionPushdownCache;
@@ -223,6 +225,45 @@ public class DefaultCompletedFetchTest {
             InternalRow row = actualRecord.getRow();
             assertThat(row.getString(0).toString()).isEqualTo(expectObject[1]);
             assertThat(row.getInt(1)).isEqualTo(expectObject[0]);
+        }
+    }
+
+    @Test
+    void testFetchArrowBatchesCarriesSerializedSizeEstimate() throws Exception {
+        long fetchOffset = 3L;
+        int bucketId = 0;
+        TableBucket tb = new TableBucket(DATA2_TABLE_ID, bucketId);
+        MemoryLogRecords logRecords =
+                createRecordsWithoutBaseLogOffset(
+                        rowType,
+                        DEFAULT_SCHEMA_ID,
+                        0L,
+                        1000L,
+                        LOG_MAGIC_VALUE_V1,
+                        DATA2,
+                        LogFormat.ARROW,
+                        true);
+        LogRecordBatch originalBatch = logRecords.batches().iterator().next();
+        long originalSerializedSize = originalBatch.sizeInBytes();
+        int originalRecordCount = originalBatch.getRecordCount();
+        FetchLogResultForBucket resultForBucket = new FetchLogResultForBucket(tb, logRecords, 10L);
+        DefaultCompletedFetch defaultCompletedFetch =
+                makeCompletedFetch(tb, resultForBucket, fetchOffset);
+
+        List<ArrowBatchData> arrowBatches = defaultCompletedFetch.fetchArrowBatches(10);
+        assertThat(arrowBatches).hasSize(1);
+
+        try (ArrowBatchData arrowBatchData = arrowBatches.get(0)) {
+            int remainingRows = originalRecordCount - (int) fetchOffset;
+            long expectedSerializedSize =
+                    Math.round(
+                            (double) originalSerializedSize * remainingRows / originalRecordCount);
+            assertThat(arrowBatchData.getBaseLogOffset()).isEqualTo(fetchOffset);
+            assertThat(arrowBatchData.getRecordCount()).isEqualTo(remainingRows);
+            assertThat(arrowBatchData.getEstimatedSerializedSizeInBytes())
+                    .isEqualTo(expectedSerializedSize);
+        } finally {
+            defaultCompletedFetch.readContext.close();
         }
     }
 

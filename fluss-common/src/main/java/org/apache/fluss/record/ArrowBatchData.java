@@ -36,18 +36,36 @@ import static org.apache.fluss.utils.Preconditions.checkNotNull;
 @Internal
 public class ArrowBatchData implements AutoCloseable {
 
+    public static final long UNKNOWN_SERIALIZED_SIZE_IN_BYTES = -1L;
+
     private final VectorSchemaRoot vectorSchemaRoot;
     private final long baseLogOffset;
     private final long timestamp;
     private final int schemaId;
+    private long estimatedSerializedSizeInBytes;
     private boolean closed;
 
     public ArrowBatchData(
             VectorSchemaRoot vectorSchemaRoot, long baseLogOffset, long timestamp, int schemaId) {
+        this(
+                vectorSchemaRoot,
+                baseLogOffset,
+                timestamp,
+                schemaId,
+                UNKNOWN_SERIALIZED_SIZE_IN_BYTES);
+    }
+
+    public ArrowBatchData(
+            VectorSchemaRoot vectorSchemaRoot,
+            long baseLogOffset,
+            long timestamp,
+            int schemaId,
+            long estimatedSerializedSizeInBytes) {
         this.vectorSchemaRoot = checkNotNull(vectorSchemaRoot, "vectorSchemaRoot must not be null");
         this.baseLogOffset = baseLogOffset;
         this.timestamp = timestamp;
         this.schemaId = schemaId;
+        this.estimatedSerializedSizeInBytes = estimatedSerializedSizeInBytes;
     }
 
     /** Returns the Arrow vectors of this batch. */
@@ -87,6 +105,19 @@ public class ArrowBatchData implements AutoCloseable {
     }
 
     /**
+     * Returns the estimated serialized size in bytes of the source log batch backing this Arrow
+     * batch. For partial batches produced by slicing/truncation, this value is scaled
+     * proportionally by row count.
+     */
+    public long getEstimatedSerializedSizeInBytes() {
+        return estimatedSerializedSizeInBytes;
+    }
+
+    public void setEstimatedSerializedSizeInBytes(long estimatedSerializedSizeInBytes) {
+        this.estimatedSerializedSizeInBytes = estimatedSerializedSizeInBytes;
+    }
+
+    /**
      * Creates a new {@link ArrowBatchData} containing a contiguous slice of this batch's rows and
      * releases the original vector data.
      *
@@ -98,16 +129,22 @@ public class ArrowBatchData implements AutoCloseable {
      */
     public ArrowBatchData sliceAndTransferOwnership(int skipRows) {
         checkArgument(skipRows >= 0, "skipRows must be >= 0, but is %s", skipRows);
+        int recordCount = getRecordCount();
         checkArgument(
-                skipRows < getRecordCount(),
+                skipRows < recordCount,
                 "skipRows(%s) must be < recordCount(%s)",
                 skipRows,
-                getRecordCount());
-        int remainingRows = getRecordCount() - skipRows;
+                recordCount);
+        int remainingRows = recordCount - skipRows;
         VectorSchemaRoot slicedRoot = vectorSchemaRoot.slice(skipRows, remainingRows);
         // release original vector buffers; sliced vectors hold independent copies
         close();
-        return new ArrowBatchData(slicedRoot, baseLogOffset + skipRows, timestamp, schemaId);
+        return new ArrowBatchData(
+                slicedRoot,
+                baseLogOffset + skipRows,
+                timestamp,
+                schemaId,
+                scaleEstimatedSerializedSize(remainingRows, recordCount));
     }
 
     /**
@@ -122,14 +159,31 @@ public class ArrowBatchData implements AutoCloseable {
      */
     public ArrowBatchData truncateAndTransferOwnership(int rowCount) {
         checkArgument(rowCount > 0, "rowCount must be > 0, but is %s", rowCount);
+        int recordCount = getRecordCount();
         checkArgument(
-                rowCount <= getRecordCount(),
+                rowCount <= recordCount,
                 "rowCount(%s) must be <= recordCount(%s)",
                 rowCount,
-                getRecordCount());
+                recordCount);
         VectorSchemaRoot slicedRoot = vectorSchemaRoot.slice(0, rowCount);
         close();
-        return new ArrowBatchData(slicedRoot, baseLogOffset, timestamp, schemaId);
+        return new ArrowBatchData(
+                slicedRoot,
+                baseLogOffset,
+                timestamp,
+                schemaId,
+                scaleEstimatedSerializedSize(rowCount, recordCount));
+    }
+
+    private long scaleEstimatedSerializedSize(int keptRows, int totalRows) {
+        if (estimatedSerializedSizeInBytes == UNKNOWN_SERIALIZED_SIZE_IN_BYTES || totalRows <= 0) {
+            return UNKNOWN_SERIALIZED_SIZE_IN_BYTES;
+        }
+        if (keptRows >= totalRows) {
+            return estimatedSerializedSizeInBytes;
+        }
+        return Math.max(
+                1L, Math.round((double) estimatedSerializedSizeInBytes * keptRows / totalRows));
     }
 
     @Override

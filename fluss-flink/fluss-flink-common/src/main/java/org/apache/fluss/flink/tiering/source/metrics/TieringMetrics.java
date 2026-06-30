@@ -35,9 +35,15 @@ import org.apache.flink.metrics.groups.SourceReaderMetricGroup;
  *
  * <ul>
  *   <li>{@code fluss.tieringService.readBytes} - Counter: cumulative bytes read from Fluss records
- *       since the job started (actual Fluss records size).
+ *       since the job started. For Arrow batch path, this measures loaded Arrow buffer size; for
+ *       row path, this measures record-level size estimates.
  *   <li>{@code fluss.tieringService.readBytesPerSecond} - Meter: bytes-per-second rate derived from
  *       the counter using a 60-second sliding window.
+ *   <li>{@code fluss.tieringService.serializedReadBytes} - Counter: cumulative serialized bytes
+ *       consumed from Fluss logs since the job started. For partial Arrow batch writes, this is
+ *       estimated proportionally by written row count.
+ *   <li>{@code fluss.tieringService.serializedReadBytesPerSecond} - Meter: serialized read
+ *       throughput derived from the serializedReadBytes counter using a 60-second sliding window.
  * </ul>
  */
 @Internal
@@ -48,6 +54,7 @@ public class TieringMetrics {
     public static final String TIERING_SERVICE_GROUP = "tieringService";
 
     private final Counter readBytesCounter;
+    private final Counter serializedReadBytesCounter;
 
     public TieringMetrics(SourceReaderMetricGroup sourceReaderMetricGroup) {
         MetricGroup tieringServiceGroup =
@@ -58,10 +65,21 @@ public class TieringMetrics {
         this.readBytesCounter = tieringServiceGroup.counter(MetricNames.TIERING_SERVICE_READ_BYTES);
         tieringServiceGroup.meter(
                 MetricNames.TIERING_SERVICE_READ_BYTES_RATE, new MeterView(readBytesCounter));
+
+        this.serializedReadBytesCounter =
+                tieringServiceGroup.counter(MetricNames.TIERING_SERVICE_SERIALIZED_READ_BYTES);
+        tieringServiceGroup.meter(
+                MetricNames.TIERING_SERVICE_SERIALIZED_READ_BYTES_RATE,
+                new MeterView(serializedReadBytesCounter));
     }
 
     /** Records bytes read from Fluss records. Called per batch or record processing. */
     public void recordBytesRead(long bytes) {
         readBytesCounter.inc(bytes);
+    }
+
+    /** Records serialized bytes read from Fluss logs. Called per batch or record processing. */
+    public void recordSerializedBytesRead(long bytes) {
+        serializedReadBytesCounter.inc(bytes);
     }
 }

@@ -1189,13 +1189,25 @@ All metrics are registered under the `fluss.tieringService` metric group, which 
         <tr>
             <td>readBytes</td>
             <td>Flink Source Operator</td>
-            <td>The cumulative bytes read from Fluss records since the tiering job started. For the snapshot path, this measures per-record BinaryRow size; for the log path, this measures batch-level byte size from log fetches.</td>
+            <td>The cumulative bytes read from Fluss records since the tiering job started. For the snapshot path, this measures per-record BinaryRow size. For the log path, this measures the decoded data size processed by tiering: Arrow batch path counts loaded Arrow buffer bytes, while row path counts record-level size estimates.</td>
             <td>Counter</td>
         </tr>
         <tr>
             <td>readBytesPerSecond</td>
             <td>Flink Source Operator</td>
             <td>The read throughput rate in bytes per second, derived from the readBytes counter using a 60-second sliding window.</td>
+            <td>Meter</td>
+        </tr>
+        <tr>
+            <td>serializedReadBytes</td>
+            <td>Flink Source Operator</td>
+            <td>The cumulative serialized bytes consumed from Fluss logs since the tiering job started. For row path, this uses record-level serialized size estimates. For Arrow batch path, this uses the source LogRecordBatch serialized size; if only part of a batch is written, the metric is estimated proportionally by written row count.</td>
+            <td>Counter</td>
+        </tr>
+        <tr>
+            <td>serializedReadBytesPerSecond</td>
+            <td>Flink Source Operator</td>
+            <td>The serialized read throughput rate in bytes per second, derived from the serializedReadBytes counter using a 60-second sliding window.</td>
             <td>Meter</td>
         </tr>
     </tbody>
