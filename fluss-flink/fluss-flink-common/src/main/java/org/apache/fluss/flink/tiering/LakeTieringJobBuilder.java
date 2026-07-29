@@ -109,6 +109,8 @@ public class LakeTieringJobBuilder {
                                 flussConfig, lakeTieringConfig, lakeTieringFactory))
                 .setParallelism(1)
                 .setMaxParallelism(1)
+                // disable chaining with the tiering source
+                .startNewChain()
                 .sinkTo(new DiscardingSink())
                 .name("end")
                 .setParallelism(1);
