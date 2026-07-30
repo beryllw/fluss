@@ -18,6 +18,7 @@
 
 package org.apache.fluss.lake.paimon.source;
 
+import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.lake.serializer.SimpleVersionedSerializer;
 
 import org.apache.paimon.data.BinaryRow;
@@ -29,6 +30,8 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.ObjectStreamClass;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -65,7 +68,9 @@ public class PaimonSplitSerializer implements SimpleVersionedSerializer<PaimonSp
         ByteArrayInputStream in = new ByteArrayInputStream(serialized);
         DataSplit dataSplit;
         try {
-            dataSplit = InstantiationUtil.deserializeObject(in, getClass().getClassLoader());
+            RelocatingObjectInputStream ois =
+                    new RelocatingObjectInputStream(in, getClass().getClassLoader());
+            dataSplit = (DataSplit) ois.readObject();
             DataInputStream dis = new DataInputStream(in);
             boolean isBucketUnAware = dis.readBoolean();
             if (version == VERSION_1) {
@@ -98,5 +103,64 @@ public class PaimonSplitSerializer implements SimpleVersionedSerializer<PaimonSp
             partitions.add(partition.getString(i).toString());
         }
         return partitions;
+    }
+
+    /**
+     * An {@link java.io.ObjectInputStream} that restores state written before Paimon classes were
+     * relocated (shaded): class names starting with the original {@code org.apache.paimon.} prefix
+     * in the serialization stream are remapped to the actual (possibly relocated) class names at
+     * deserialization time.
+     *
+     * <p>In non-relocated builds the actual prefix equals the original prefix, so the remapping
+     * degrades to a no-op and behavior is unchanged.
+     */
+    static class RelocatingObjectInputStream
+            extends InstantiationUtil.ClassLoaderObjectInputStream {
+
+        // The prefix must NOT appear as a plain string literal: shade plugins rewrite matching
+        // constant-pool strings, which would silently turn old and new prefixes into the same
+        // string. Build it at runtime instead.
+        private static final String ORIGINAL_PREFIX =
+                String.join(".", "org", "apache", "paimon") + ".";
+
+        // Derived from the actually loaded class, so any relocation prefix works; in
+        // non-relocated builds it equals ORIGINAL_PREFIX.
+        private static final String ACTUAL_PREFIX;
+
+        static {
+            String cls = DataSplit.class.getName();
+            ACTUAL_PREFIX = cls.substring(0, cls.length() - "table.source.DataSplit".length());
+        }
+
+        private final String originalPrefix;
+        private final String actualPrefix;
+
+        RelocatingObjectInputStream(InputStream in, ClassLoader cl) throws IOException {
+            this(in, cl, ORIGINAL_PREFIX, ACTUAL_PREFIX);
+        }
+
+        @VisibleForTesting
+        RelocatingObjectInputStream(
+                InputStream in, ClassLoader cl, String originalPrefix, String actualPrefix)
+                throws IOException {
+            super(in, cl);
+            this.originalPrefix = originalPrefix;
+            this.actualPrefix = actualPrefix;
+        }
+
+        @Override
+        protected Class<?> resolveClass(ObjectStreamClass desc)
+                throws IOException, ClassNotFoundException {
+            String name = desc.getName();
+            if (!actualPrefix.equals(originalPrefix) && name.startsWith(originalPrefix)) {
+                String relocated = actualPrefix + name.substring(originalPrefix.length());
+                try {
+                    return Class.forName(relocated, false, classLoader);
+                } catch (ClassNotFoundException ignored) {
+                    // fall back to the default resolution to keep the original exception path
+                }
+            }
+            return super.resolveClass(desc);
+        }
     }
 }
