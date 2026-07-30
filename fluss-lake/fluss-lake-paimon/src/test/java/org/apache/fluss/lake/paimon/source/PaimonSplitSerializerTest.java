@@ -39,6 +39,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.Collections;
 import java.util.List;
 
@@ -51,13 +52,13 @@ class PaimonSplitSerializerTest extends PaimonSourceTestBase {
 
     @Test
     void testSerializeAndDeserialize() throws Exception {
-        PaimonSplit originalPaimonSplit = createStringPartitionSplit();
-        byte[] serialized = serializer.serialize(originalPaimonSplit);
-        PaimonSplit deserialized = serializer.deserialize(serializer.getVersion(), serialized);
+        // partitioned pk-table split and bucket-unaware append-table split with empty partition
+        assertV3RoundTrip(createStringPartitionSplit());
 
-        assertThat(deserialized.dataSplit()).isEqualTo(originalPaimonSplit.dataSplit());
-        assertThat(deserialized.isBucketUnAware()).isEqualTo(originalPaimonSplit.isBucketUnAware());
-        assertThat(deserialized.partition()).isEqualTo(originalPaimonSplit.partition());
+        PaimonSplit bucketUnAwareSplit = createBucketUnAwareSplit();
+        assertThat(bucketUnAwareSplit.isBucketUnAware()).isTrue();
+        assertThat(bucketUnAwareSplit.partition()).isEmpty();
+        assertV3RoundTrip(bucketUnAwareSplit);
     }
 
     @Test
@@ -83,22 +84,46 @@ class PaimonSplitSerializerTest extends PaimonSourceTestBase {
     }
 
     @Test
-    void testDeserializeVersion1PreservesStringPartition() throws Exception {
+    void testDeserializeLegacyBytes() throws Exception {
+        // VERSION_1/VERSION_2 bytes written by older versions must remain restorable after the
+        // VERSION_3 upgrade
         PaimonSplit original = createStringPartitionSplit();
-        byte[] serialized = serializeVersion1(original);
 
-        PaimonSplit deserialized = serializer.deserialize(1, serialized);
+        // VERSION_1 did not store partition values, they were derived from DataSplit.partition()
+        PaimonSplit fromV1 = serializer.deserialize(1, serializeVersion1(original));
+        assertThat(fromV1.dataSplit()).isEqualTo(original.dataSplit());
+        assertThat(fromV1.isBucketUnAware()).isEqualTo(original.isBucketUnAware());
+        assertThat(fromV1.partition()).isEqualTo(Collections.singletonList("A"));
 
-        assertThat(deserialized.dataSplit()).isEqualTo(original.dataSplit());
-        assertThat(deserialized.isBucketUnAware()).isEqualTo(original.isBucketUnAware());
-        assertThat(deserialized.partition()).isEqualTo(Collections.singletonList("A"));
+        PaimonSplit fromV2 = serializer.deserialize(2, serializeVersion2(original));
+        assertThat(fromV2.dataSplit()).isEqualTo(original.dataSplit());
+        assertThat(fromV2.isBucketUnAware()).isEqualTo(original.isBucketUnAware());
+        assertThat(fromV2.partition()).isEqualTo(original.partition());
     }
 
     @Test
-    void testDeserializeWithInvalidData() {
+    void testDeserializeInvalidInput() {
         byte[] invalidData = "invalid".getBytes();
         assertThatThrownBy(() -> serializer.deserialize(1, invalidData))
                 .isInstanceOf(IOException.class);
+        assertThatThrownBy(() -> serializer.deserialize(3, invalidData))
+                .isInstanceOf(IOException.class);
+        assertThatThrownBy(() -> serializer.deserialize(99, new byte[0]))
+                .isInstanceOf(IOException.class)
+                .hasMessageContaining("Unsupported PaimonSplit serialization version");
+    }
+
+    private void assertV3RoundTrip(PaimonSplit original) throws IOException {
+        byte[] serialized = serializer.serialize(original);
+        // VERSION_3 bytes must not embed any Java class name, otherwise relocation (shading) in
+        // downstream distributions would break state restore again
+        assertThat(new String(serialized, StandardCharsets.ISO_8859_1))
+                .doesNotContain("org.apache.paimon");
+
+        PaimonSplit deserialized = serializer.deserialize(serializer.getVersion(), serialized);
+        assertThat(deserialized.dataSplit()).isEqualTo(original.dataSplit());
+        assertThat(deserialized.isBucketUnAware()).isEqualTo(original.isBucketUnAware());
+        assertThat(deserialized.partition()).isEqualTo(original.partition());
     }
 
     private PaimonSplit createStringPartitionSplit() throws Exception {
@@ -127,11 +152,42 @@ class PaimonSplitSerializerTest extends PaimonSourceTestBase {
         return plan.get(0);
     }
 
+    private PaimonSplit createBucketUnAwareSplit() throws Exception {
+        // an append table without primary key and bucket key is bucket-unaware
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "bucket_unaware_table");
+        Schema.Builder builder =
+                Schema.newBuilder().column("c1", DataTypes.INT()).column("c2", DataTypes.STRING());
+        createTable(tablePath, builder.build());
+        Table table = getTable(tablePath);
+
+        GenericRow record1 = GenericRow.of(12, BinaryString.fromString("a"));
+        writeRecord(tablePath, Collections.singletonList(record1));
+        Snapshot snapshot = table.latestSnapshot().get();
+
+        LakeSource<PaimonSplit> lakeSource = lakeStorage.createLakeSource(tablePath);
+        List<PaimonSplit> plan = lakeSource.createPlanner(snapshot::id).plan();
+
+        return plan.get(0);
+    }
+
     private byte[] serializeVersion1(PaimonSplit paimonSplit) throws IOException {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         DataOutputViewStreamWrapper view = new DataOutputViewStreamWrapper(out);
         InstantiationUtil.serializeObject(view, paimonSplit.dataSplit());
         view.writeBoolean(paimonSplit.isBucketUnAware());
+        return out.toByteArray();
+    }
+
+    private byte[] serializeVersion2(PaimonSplit paimonSplit) throws IOException {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        DataOutputViewStreamWrapper view = new DataOutputViewStreamWrapper(out);
+        InstantiationUtil.serializeObject(view, paimonSplit.dataSplit());
+        view.writeBoolean(paimonSplit.isBucketUnAware());
+        List<String> partition = paimonSplit.partition();
+        view.writeInt(partition.size());
+        for (String value : partition) {
+            view.writeUTF(value);
+        }
         return out.toByteArray();
     }
 }

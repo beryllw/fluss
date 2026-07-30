@@ -18,17 +18,23 @@
 
 package org.apache.fluss.lake.paimon.source;
 
+import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.lake.serializer.SimpleVersionedSerializer;
 
 import org.apache.paimon.data.BinaryRow;
+import org.apache.paimon.io.DataInputViewStreamWrapper;
 import org.apache.paimon.io.DataOutputViewStreamWrapper;
 import org.apache.paimon.table.source.DataSplit;
 import org.apache.paimon.utils.InstantiationUtil;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.ObjectStreamClass;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -36,21 +42,27 @@ import java.util.List;
 /** Serializer for paimon split. */
 public class PaimonSplitSerializer implements SimpleVersionedSerializer<PaimonSplit> {
 
+    private static final Logger LOG = LoggerFactory.getLogger(PaimonSplitSerializer.class);
+
+    // VERSION_1 and VERSION_2 persisted DataSplit via Java serialization; kept read-only to
+    // restore state written by older versions and must never be changed.
     private static final int VERSION_1 = 1;
     // VERSION_2 additionally persists the partition values.
     private static final int VERSION_2 = 2;
+    // VERSION_3 persists DataSplit via Paimon's own versioned binary protocol whose bytes contain
+    // no Java class names, so it survives class relocation (shading) in downstream distributions.
+    private static final int VERSION_3 = 3;
 
     @Override
     public int getVersion() {
-        return VERSION_2;
+        return VERSION_3;
     }
 
     @Override
     public byte[] serialize(PaimonSplit paimonSplit) throws IOException {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         DataOutputViewStreamWrapper view = new DataOutputViewStreamWrapper(out);
-        DataSplit dataSplit = paimonSplit.dataSplit();
-        InstantiationUtil.serializeObject(view, dataSplit);
+        paimonSplit.dataSplit().serialize(view);
         view.writeBoolean(paimonSplit.isBucketUnAware());
         List<String> partition = paimonSplit.partition();
         view.writeInt(partition.size());
@@ -62,10 +74,38 @@ public class PaimonSplitSerializer implements SimpleVersionedSerializer<PaimonSp
 
     @Override
     public PaimonSplit deserialize(int version, byte[] serialized) throws IOException {
+        switch (version) {
+            case VERSION_1:
+            case VERSION_2:
+                return deserializeLegacy(version, serialized);
+            case VERSION_3:
+                return deserializeV3(serialized);
+            default:
+                throw new IOException("Unsupported PaimonSplit serialization version: " + version);
+        }
+    }
+
+    private PaimonSplit deserializeV3(byte[] serialized) throws IOException {
+        ByteArrayInputStream in = new ByteArrayInputStream(serialized);
+        DataInputViewStreamWrapper view = new DataInputViewStreamWrapper(in);
+        DataSplit dataSplit = DataSplit.deserialize(view);
+        boolean isBucketUnAware = view.readBoolean();
+        int size = view.readInt();
+        List<String> partition = new ArrayList<>(size);
+        for (int i = 0; i < size; i++) {
+            partition.add(view.readUTF());
+        }
+        return new PaimonSplit(dataSplit, isBucketUnAware, partition);
+    }
+
+    private PaimonSplit deserializeLegacy(int version, byte[] serialized) throws IOException {
+        LOG.info("Restoring PaimonSplit from legacy state format (version {}).", version);
         ByteArrayInputStream in = new ByteArrayInputStream(serialized);
         DataSplit dataSplit;
         try {
-            dataSplit = InstantiationUtil.deserializeObject(in, getClass().getClassLoader());
+            RelocatingObjectInputStream ois =
+                    new RelocatingObjectInputStream(in, getClass().getClassLoader());
+            dataSplit = (DataSplit) ois.readObject();
             DataInputStream dis = new DataInputStream(in);
             boolean isBucketUnAware = dis.readBoolean();
             if (version == VERSION_1) {
@@ -73,15 +113,13 @@ public class PaimonSplitSerializer implements SimpleVersionedSerializer<PaimonSp
                 // exposed through DataSplit.partition(). Preserve that old behavior.
                 return new PaimonSplit(
                         dataSplit, isBucketUnAware, readStringPartition(dataSplit.partition()));
-            } else if (version == VERSION_2) {
+            } else {
                 int size = dis.readInt();
                 List<String> partition = new ArrayList<>(size);
                 for (int i = 0; i < size; i++) {
                     partition.add(dis.readUTF());
                 }
                 return new PaimonSplit(dataSplit, isBucketUnAware, partition);
-            } else {
-                throw new IOException("Unsupported PaimonSplit serialization version: " + version);
             }
         } catch (ClassNotFoundException e) {
             throw new IOException("Failed to deserialize PaimonSplit", e);
@@ -98,5 +136,64 @@ public class PaimonSplitSerializer implements SimpleVersionedSerializer<PaimonSp
             partitions.add(partition.getString(i).toString());
         }
         return partitions;
+    }
+
+    /**
+     * An {@link java.io.ObjectInputStream} that restores legacy state written before Paimon classes
+     * were relocated (shaded): class names starting with the original {@code org.apache.paimon.}
+     * prefix in the serialization stream are remapped to the actual (possibly relocated) class
+     * names at deserialization time.
+     *
+     * <p>In non-relocated builds the actual prefix equals the original prefix, so the remapping
+     * degrades to a no-op and behavior is unchanged.
+     */
+    static class RelocatingObjectInputStream
+            extends InstantiationUtil.ClassLoaderObjectInputStream {
+
+        // The prefix must NOT appear as a plain string literal: shade plugins rewrite matching
+        // constant-pool strings, which would silently turn old and new prefixes into the same
+        // string. Build it at runtime instead.
+        private static final String ORIGINAL_PREFIX =
+                String.join(".", "org", "apache", "paimon") + ".";
+
+        // Derived from the actually loaded class, so any relocation prefix works; in
+        // non-relocated builds it equals ORIGINAL_PREFIX.
+        private static final String ACTUAL_PREFIX;
+
+        static {
+            String cls = DataSplit.class.getName();
+            ACTUAL_PREFIX = cls.substring(0, cls.length() - "table.source.DataSplit".length());
+        }
+
+        private final String originalPrefix;
+        private final String actualPrefix;
+
+        RelocatingObjectInputStream(InputStream in, ClassLoader cl) throws IOException {
+            this(in, cl, ORIGINAL_PREFIX, ACTUAL_PREFIX);
+        }
+
+        @VisibleForTesting
+        RelocatingObjectInputStream(
+                InputStream in, ClassLoader cl, String originalPrefix, String actualPrefix)
+                throws IOException {
+            super(in, cl);
+            this.originalPrefix = originalPrefix;
+            this.actualPrefix = actualPrefix;
+        }
+
+        @Override
+        protected Class<?> resolveClass(ObjectStreamClass desc)
+                throws IOException, ClassNotFoundException {
+            String name = desc.getName();
+            if (!actualPrefix.equals(originalPrefix) && name.startsWith(originalPrefix)) {
+                String relocated = actualPrefix + name.substring(originalPrefix.length());
+                try {
+                    return Class.forName(relocated, false, classLoader);
+                } catch (ClassNotFoundException ignored) {
+                    // fall back to the default resolution to keep the original exception path
+                }
+            }
+            return super.resolveClass(desc);
+        }
     }
 }
