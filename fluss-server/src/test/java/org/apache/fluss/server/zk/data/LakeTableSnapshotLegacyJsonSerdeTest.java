@@ -17,6 +17,7 @@
 
 package org.apache.fluss.server.zk.data;
 
+import org.apache.fluss.lake.committer.TieringStateEntry;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.server.zk.data.lake.LakeTableSnapshot;
 import org.apache.fluss.server.zk.data.lake.LakeTableSnapshotLegacyJsonSerde;
@@ -26,10 +27,12 @@ import org.apache.fluss.utils.json.JsonSerdeUtils;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Test for {@link LakeTableSnapshotLegacyJsonSerde}. */
 class LakeTableSnapshotLegacyJsonSerdeTest extends JsonSerdeTestBase<LakeTableSnapshot> {
@@ -103,5 +106,26 @@ class LakeTableSnapshotLegacyJsonSerdeTest extends JsonSerdeTestBase<LakeTableSn
                         version1Json3.getBytes(StandardCharsets.UTF_8),
                         LakeTableSnapshotLegacyJsonSerde.INSTANCE);
         assertThat(snapshot3.getSnapshotId()).isEqualTo(3);
+    }
+
+    @Test
+    void testSerializeRejectsTieringStates() {
+        // Tiering states are a version-2 only feature; the legacy v1 format must reject them
+        // rather than silently drop them.
+        Map<TableBucket, Long> offsets = new HashMap<>();
+        offsets.put(new TableBucket(1L, 0), 100L);
+        LakeTableSnapshot withState =
+                new LakeTableSnapshot(
+                        1L,
+                        offsets,
+                        Collections.singletonList(
+                                new TieringStateEntry(
+                                        "some-key", 1, "{}".getBytes(StandardCharsets.UTF_8))));
+        assertThatThrownBy(
+                        () ->
+                                JsonSerdeUtils.writeValueAsBytes(
+                                        withState, LakeTableSnapshotLegacyJsonSerde.INSTANCE))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("does not support tiering states");
     }
 }

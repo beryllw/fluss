@@ -21,6 +21,7 @@ package org.apache.fluss.server.zk.data.lake;
 import org.apache.fluss.fs.FSDataOutputStream;
 import org.apache.fluss.fs.FileSystem;
 import org.apache.fluss.fs.FsPath;
+import org.apache.fluss.lake.committer.TieringStateEntry;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.server.zk.ZooKeeperClient;
@@ -33,6 +34,7 @@ import javax.annotation.Nullable;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -63,12 +65,21 @@ public class LakeTableHelper {
         Optional<LakeTable> optPreviousLakeTable = zkClient.getLakeTable(tableId);
         // Merge with previous snapshot if exists
         if (optPreviousLakeTable.isPresent()) {
-            TableBucketOffsets tableBucketOffsets =
-                    mergeTableBucketOffsets(
-                            optPreviousLakeTable.get(),
-                            new TableBucketOffsets(
-                                    tableId, lakeTableSnapshot.getBucketLogEndOffset()));
-            lakeTableSnapshot = new LakeTableSnapshot(tableId, tableBucketOffsets.getOffsets());
+            LakeTableSnapshot previousSnapshot =
+                    optPreviousLakeTable.get().getOrReadLatestTableSnapshot();
+            // The legacy (v1) format cannot carry tiering states. This path is not expected to run
+            // on a state-bearing table; if it does (e.g. an old committer), drop the states with a
+            // warning instead of failing the commit.
+            if (!previousSnapshot.getTieringStates().isEmpty()) {
+                LOG.warn(
+                        "Dropping tiering states for table {} on a legacy (v1) lake commit; "
+                                + "the v1 format cannot store them.",
+                        tableId);
+            }
+            Map<TableBucket, Long> bucketLogEndOffset =
+                    new HashMap<>(previousSnapshot.getBucketLogEndOffset());
+            bucketLogEndOffset.putAll(lakeTableSnapshot.getBucketLogEndOffset());
+            lakeTableSnapshot = new LakeTableSnapshot(tableId, bucketLogEndOffset);
         }
         zkClient.upsertLakeTable(
                 tableId, new LakeTable(lakeTableSnapshot), optPreviousLakeTable.isPresent());
@@ -171,13 +182,28 @@ public class LakeTableHelper {
         // Merge current  with previous one since the current request
         // may not carry all buckets for the table. It typically only carries buckets
         // that were written after the previous commit.
+        LakeTableSnapshot previousSnapshot = previousLakeTable.getOrReadLatestTableSnapshot();
 
         // merge log end offsets, current will override the previous
         Map<TableBucket, Long> bucketLogEndOffset =
-                new HashMap<>(
-                        previousLakeTable.getOrReadLatestTableSnapshot().getBucketLogEndOffset());
+                new HashMap<>(previousSnapshot.getBucketLogEndOffset());
         bucketLogEndOffset.putAll(newTableBucketOffsets.getOffsets());
-        return new TableBucketOffsets(newTableBucketOffsets.getTableId(), bucketLogEndOffset);
+
+        // merge tiering states by key (upsert): entries not carried by the request are inherited
+        // from the previous snapshot, so a writer only sends the keys it wants to update and never
+        // touches states owned by others (including keys it does not understand).
+        Map<String, TieringStateEntry> mergedStates = new LinkedHashMap<>();
+        for (TieringStateEntry entry : previousSnapshot.getTieringStates()) {
+            mergedStates.put(entry.getStateKey(), entry);
+        }
+        for (TieringStateEntry entry : newTableBucketOffsets.getTieringStates()) {
+            mergedStates.put(entry.getStateKey(), entry);
+        }
+
+        return new TableBucketOffsets(
+                newTableBucketOffsets.getTableId(),
+                bucketLogEndOffset,
+                new ArrayList<>(mergedStates.values()));
     }
 
     public FsPath storeLakeTableOffsetsFile(

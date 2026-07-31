@@ -24,6 +24,9 @@ import org.apache.fluss.fs.FileSystem;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.fs.local.LocalFileSystem;
 import org.apache.fluss.lake.committer.LakeCommitResult;
+import org.apache.fluss.lake.committer.PartitionMarkDoneState;
+import org.apache.fluss.lake.committer.PartitionMarkDoneState.PartitionState;
+import org.apache.fluss.lake.committer.TieringStateEntry;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TablePath;
@@ -42,7 +45,9 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -251,6 +256,147 @@ class LakeTableHelperTest {
         assertThat(zookeeperClient.getLakeTable(tableId).get().getLakeSnapshotMetadatas())
                 .extracting(LakeTable.LakeSnapshotMetadata::getSnapshotId)
                 .containsExactly(4L, 5L, 6L);
+    }
+
+    /**
+     * Verifies the tiering states merge by key (upsert): a request entry replaces the previous
+     * entry with the same key, entries of other keys (even unrecognized ones) are inherited, and
+     * bucket offsets are still merged.
+     */
+    @Test
+    void testMergeUpsertsTieringStateByKey(@TempDir Path tempDir) throws Exception {
+        LakeTableHelper lakeTableHelper = new LakeTableHelper(zookeeperClient, tempDir.toString());
+        long tableId = 100L;
+        TablePath tablePath = TablePath.of("test_db", "markdone_merge_test");
+        zookeeperClient.registerTable(tablePath, createTableReg(tableId));
+
+        // --- Previous snapshot: partitions 1, 2, 3 with a mark-done state and a foreign state ---
+        Map<TableBucket, Long> prevOffsets = new HashMap<>();
+        prevOffsets.put(new TableBucket(tableId, 1L, 0), 100L);
+        prevOffsets.put(new TableBucket(tableId, 2L, 0), 200L);
+        prevOffsets.put(new TableBucket(tableId, 3L, 0), 300L);
+        Map<Long, PartitionState> prevStates = new HashMap<>();
+        prevStates.put(1L, new PartitionState(1000L, PartitionMarkDoneState.NOT_DONE));
+        prevStates.put(2L, new PartitionState(2000L, PartitionMarkDoneState.NOT_DONE));
+        prevStates.put(3L, new PartitionState(3000L, PartitionMarkDoneState.NOT_DONE));
+        TieringStateEntry foreignEntry =
+                new TieringStateEntry(
+                        "future-key", 7, "{\"x\":1}".getBytes(StandardCharsets.UTF_8));
+        FsPath prevPath =
+                lakeTableHelper.storeLakeTableOffsetsFile(
+                        tablePath,
+                        new TableBucketOffsets(
+                                tableId,
+                                prevOffsets,
+                                Arrays.asList(
+                                        new PartitionMarkDoneState(prevStates).toStateEntry(),
+                                        foreignEntry)));
+        lakeTableHelper.registerLakeTableSnapshotV2(
+                tableId, new LakeTable.LakeSnapshotMetadata(1L, prevPath, prevPath));
+        LakeTable previousLakeTable = zookeeperClient.getLakeTable(tableId).get();
+
+        // --- New offsets: advance partitions 1 & 3, carry only the mark-done state (partition 2
+        // now done). ---
+        Map<TableBucket, Long> newOffsets = new HashMap<>();
+        newOffsets.put(new TableBucket(tableId, 1L, 0), 150L);
+        newOffsets.put(new TableBucket(tableId, 3L, 0), 350L);
+        Map<Long, PartitionState> newStates = new HashMap<>();
+        newStates.put(1L, new PartitionState(1500L, PartitionMarkDoneState.NOT_DONE));
+        newStates.put(2L, new PartitionState(2000L, 2500L));
+        newStates.put(3L, new PartitionState(3500L, PartitionMarkDoneState.NOT_DONE));
+        PartitionMarkDoneState newState = new PartitionMarkDoneState(newStates);
+        TableBucketOffsets merged =
+                lakeTableHelper.mergeTableBucketOffsets(
+                        previousLakeTable,
+                        new TableBucketOffsets(
+                                tableId,
+                                newOffsets,
+                                Collections.singletonList(newState.toStateEntry())));
+
+        // mark-done entry replaced by the new value; the foreign entry survives untouched
+        assertThat(merged.getTieringStates())
+                .containsExactlyInAnyOrder(newState.toStateEntry(), foreignEntry);
+        // bucket offsets merged (partition 2 kept from previous)
+        assertThat(merged.getOffsets()).containsEntry(new TableBucket(tableId, 1L, 0), 150L);
+        assertThat(merged.getOffsets()).containsEntry(new TableBucket(tableId, 2L, 0), 200L);
+        assertThat(merged.getOffsets()).containsEntry(new TableBucket(tableId, 3L, 0), 350L);
+    }
+
+    /**
+     * Verifies the upsert semantics for absent states: a request without tiering states leaves the
+     * previous entries untouched (a writer that sends nothing touches nothing), while bucket
+     * offsets are still merged.
+     */
+    @Test
+    void testMergePreservesTieringStatesWhenAbsent(@TempDir Path tempDir) throws Exception {
+        LakeTableHelper lakeTableHelper = new LakeTableHelper(zookeeperClient, tempDir.toString());
+        long tableId = 101L;
+        TablePath tablePath = TablePath.of("test_db", "markdone_keep_test");
+        zookeeperClient.registerTable(tablePath, createTableReg(tableId));
+
+        Map<TableBucket, Long> prevOffsets = new HashMap<>();
+        prevOffsets.put(new TableBucket(tableId, 1L, 0), 100L);
+        TieringStateEntry prevEntry =
+                new PartitionMarkDoneState(
+                                Collections.singletonMap(
+                                        1L,
+                                        new PartitionState(1000L, PartitionMarkDoneState.NOT_DONE)))
+                        .toStateEntry();
+        FsPath prevPath =
+                lakeTableHelper.storeLakeTableOffsetsFile(
+                        tablePath,
+                        new TableBucketOffsets(
+                                tableId, prevOffsets, Collections.singletonList(prevEntry)));
+        lakeTableHelper.registerLakeTableSnapshotV2(
+                tableId, new LakeTable.LakeSnapshotMetadata(1L, prevPath, prevPath));
+        LakeTable previousLakeTable = zookeeperClient.getLakeTable(tableId).get();
+
+        Map<TableBucket, Long> newOffsets = new HashMap<>();
+        newOffsets.put(new TableBucket(tableId, 1L, 0), 150L);
+        // new request carries no tiering states -> previous entries preserved, offsets merged.
+        TableBucketOffsets merged =
+                lakeTableHelper.mergeTableBucketOffsets(
+                        previousLakeTable, new TableBucketOffsets(tableId, newOffsets));
+
+        assertThat(merged.getTieringStates()).containsExactly(prevEntry);
+        assertThat(merged.getOffsets()).containsEntry(new TableBucket(tableId, 1L, 0), 150L);
+    }
+
+    /**
+     * A legacy (v1) commit on a state-bearing table drops the states (with a warning), not fails.
+     */
+    @Test
+    void testRegisterV1DropsExistingTieringStates(@TempDir Path tempDir) throws Exception {
+        LakeTableHelper lakeTableHelper = new LakeTableHelper(zookeeperClient, tempDir.toString());
+        long tableId = 102L;
+        TablePath tablePath = TablePath.of("test_db", "v1_drop_state_test");
+        zookeeperClient.registerTable(tablePath, createTableReg(tableId));
+
+        // previous v2 snapshot carrying a tiering state
+        Map<TableBucket, Long> offsets = new HashMap<>();
+        offsets.put(new TableBucket(tableId, 0), 100L);
+        TieringStateEntry entry =
+                new PartitionMarkDoneState(
+                                Collections.singletonMap(
+                                        1L,
+                                        new PartitionState(1000L, PartitionMarkDoneState.NOT_DONE)))
+                        .toStateEntry();
+        FsPath path =
+                lakeTableHelper.storeLakeTableOffsetsFile(
+                        tablePath,
+                        new TableBucketOffsets(tableId, offsets, Collections.singletonList(entry)));
+        lakeTableHelper.registerLakeTableSnapshotV2(
+                tableId, new LakeTable.LakeSnapshotMetadata(1L, path, path));
+
+        // a v1 commit drops the states without throwing
+        Map<TableBucket, Long> newOffsets = new HashMap<>();
+        newOffsets.put(new TableBucket(tableId, 0), 150L);
+        lakeTableHelper.registerLakeTableSnapshotV1(tableId, new LakeTableSnapshot(2L, newOffsets));
+
+        LakeTableSnapshot stored =
+                zookeeperClient.getLakeTable(tableId).get().getOrReadLatestTableSnapshot();
+        assertThat(stored.getTieringStates()).isEmpty();
+        assertThat(stored.getBucketLogEndOffset()).containsEntry(new TableBucket(tableId, 0), 150L);
     }
 
     /** Helper to store offset files and return the FsPath. */

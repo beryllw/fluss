@@ -477,6 +477,8 @@ message GetLakeSnapshotResponse {
   required int64 table_id = 1;
   required int64 snapshotId = 2;
   repeated PbLakeSnapshotForBucket bucket_snapshots = 3;
+  // The keyed tiering-state entries (e.g. partition mark-done state), passed through unparsed.
+  repeated PbTieringStateEntry tiering_states = 4;
 }
 
 message GetFileSystemSecurityTokenRequest {
@@ -1250,6 +1252,8 @@ message PbRebalancePlanForBucket {
 
 message PbLakeTableSnapshotMetadata {
   required int64 table_id = 1;
+  // The lake snapshot id; may repeat across entries when a state-only round (no new lake commit)
+  // reuses it. Reads resolve to the latest entry for a given id.
   required int64 snapshot_id = 2;
   required string tiered_bucket_offsets_file_path = 3;
   optional string readable_bucket_offsets_file_path = 4;
@@ -1257,6 +1261,9 @@ message PbLakeTableSnapshotMetadata {
   // 1. If set, the system will keep all snapshots in the range [earliest_snapshot_id_to_keep, current_snapshot_id].
   // 2. If not set, the system defaults to a "Single Snapshot Retention" policy, keeping only the snapshot specified in this request.
   optional int64 earliest_snapshot_id_to_keep = 5;
+  // Tiering assignment epoch for fencing (optional for compatibility). When present, the commit is
+  // rejected unless it matches the table's current epoch. Requires COMMIT api version >= 1.
+  optional int64 tiering_epoch = 6;
 }
 
 message PbLakeTableSnapshotInfo {
@@ -1289,6 +1296,16 @@ message PbTableOffsets {
   required int64 table_id = 1;
   required PbTablePath table_path = 2;
   repeated PbBucketOffset bucket_offsets = 3;
+  // The keyed tiering-state entries (e.g. partition mark-done state), passed through unparsed.
+  repeated PbTieringStateEntry tiering_states = 4;
+}
+
+// A keyed, versioned tiering-state entry carried by the lake offsets file. The payload is an
+// opaque JSON object owned by the state key (see TieringStateEntry); servers never parse it.
+message PbTieringStateEntry {
+  required string state_key = 1;
+  required int32 state_version = 2;
+  required bytes payload = 3;
 }
 
 message PbBucketOffset {

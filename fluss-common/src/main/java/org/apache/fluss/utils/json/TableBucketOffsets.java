@@ -18,18 +18,24 @@
 
 package org.apache.fluss.utils.json;
 
+import org.apache.fluss.lake.committer.TieringStateEntry;
 import org.apache.fluss.metadata.TableBucket;
 
+import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
 /**
  * Represents the offsets for all buckets of a table. This class stores the mapping from {@link
- * TableBucket} to their corresponding offsets.
+ * TableBucket} to their corresponding offsets, as well as the keyed tiering-state entries.
  *
  * <p>This class is used to track the log end offsets for each bucket in a table. It supports both
  * non-partitioned tables (where buckets are identified only by bucket id) and partitioned tables
  * (where buckets are identified by partition id and bucket id).
+ *
+ * <p>It also carries the table-level {@link TieringStateEntry}s (e.g. the partition mark-done
+ * state), passed through without parsing the payloads.
  *
  * <p>The offsets map contains entries for each bucket that has a valid offset. Missing buckets are
  * not included in the map.
@@ -47,15 +53,31 @@ public class TableBucketOffsets {
      */
     private final Map<TableBucket, Long> offsets;
 
+    /** The keyed tiering-state entries, passed through by the serde without parsing payloads. */
+    private final List<TieringStateEntry> tieringStates;
+
     /**
-     * Creates a new {@link TableBucketOffsets} instance.
+     * Creates a new {@link TableBucketOffsets} instance without tiering states.
      *
      * @param tableId the table ID that all buckets belong to
      * @param offsets the mapping from {@link TableBucket} to their offsets
      */
     public TableBucketOffsets(long tableId, Map<TableBucket, Long> offsets) {
+        this(tableId, offsets, Collections.emptyList());
+    }
+
+    /**
+     * Creates a new {@link TableBucketOffsets} instance with tiering-state entries.
+     *
+     * @param tableId the table ID that all buckets belong to
+     * @param offsets the mapping from {@link TableBucket} to their offsets
+     * @param tieringStates the keyed tiering-state entries (passed through)
+     */
+    public TableBucketOffsets(
+            long tableId, Map<TableBucket, Long> offsets, List<TieringStateEntry> tieringStates) {
         this.tableId = tableId;
         this.offsets = offsets;
+        this.tieringStates = tieringStates;
     }
 
     /**
@@ -74,6 +96,11 @@ public class TableBucketOffsets {
      */
     public Map<TableBucket, Long> getOffsets() {
         return offsets;
+    }
+
+    /** Returns the keyed tiering-state entries; empty when absent. */
+    public List<TieringStateEntry> getTieringStates() {
+        return tieringStates;
     }
 
     /**
@@ -103,16 +130,25 @@ public class TableBucketOffsets {
             return false;
         }
         TableBucketOffsets that = (TableBucketOffsets) o;
-        return tableId == that.tableId && Objects.equals(offsets, that.offsets);
+        return tableId == that.tableId
+                && Objects.equals(offsets, that.offsets)
+                && Objects.equals(tieringStates, that.tieringStates);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(tableId, offsets);
+        return Objects.hash(tableId, offsets, tieringStates);
     }
 
     @Override
     public String toString() {
-        return "TableBucketOffsets{" + "tableId=" + tableId + ", offsets=" + offsets + '}';
+        return "TableBucketOffsets{"
+                + "tableId="
+                + tableId
+                + ", offsets="
+                + offsets
+                + ", tieringStates="
+                + tieringStates
+                + '}';
     }
 }

@@ -41,6 +41,7 @@ import org.apache.fluss.config.cluster.ConfigEntry;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.fs.FsPathAndFileName;
 import org.apache.fluss.fs.token.ObtainedSecurityToken;
+import org.apache.fluss.lake.committer.TieringStateEntry;
 import org.apache.fluss.metadata.AggFunction;
 import org.apache.fluss.metadata.DatabaseChange;
 import org.apache.fluss.metadata.DatabaseSummary;
@@ -97,6 +98,7 @@ import org.apache.fluss.rpc.messages.PbRemotePathAndLocalFile;
 import org.apache.fluss.rpc.messages.PbRenameColumn;
 import org.apache.fluss.rpc.messages.PbTableBucket;
 import org.apache.fluss.rpc.messages.PbTableStatsReqForBucket;
+import org.apache.fluss.rpc.messages.PbTieringStateEntry;
 import org.apache.fluss.rpc.messages.PrefixLookupRequest;
 import org.apache.fluss.rpc.messages.ProduceLogRequest;
 import org.apache.fluss.rpc.messages.PutKvRequest;
@@ -286,7 +288,18 @@ public class ClientRpcMessageUtils {
                     new TableBucket(tableId, partitionId, pbLakeSnapshotForBucket.getBucketId());
             tableBucketsOffset.put(tableBucket, pbLakeSnapshotForBucket.getLogOffset());
         }
-        return new LakeSnapshot(snapshotId, tableBucketsOffset);
+
+        // pass through the tiering-state entries unparsed (typed parsing happens lazily in
+        // LakeSnapshot).
+        List<TieringStateEntry> tieringStates = new ArrayList<>();
+        for (PbTieringStateEntry pbEntry : response.getTieringStatesList()) {
+            tieringStates.add(
+                    new TieringStateEntry(
+                            pbEntry.getStateKey(),
+                            pbEntry.getStateVersion(),
+                            pbEntry.getPayload()));
+        }
+        return new LakeSnapshot(snapshotId, tableBucketsOffset, tieringStates);
     }
 
     public static List<FsPathAndFileName> toFsPathAndFileName(

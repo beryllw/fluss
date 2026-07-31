@@ -18,12 +18,15 @@
 
 package org.apache.fluss.utils.json;
 
+import org.apache.fluss.lake.committer.TieringStateEntry;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.shaded.jackson2.com.fasterxml.jackson.core.JsonGenerator;
 import org.apache.fluss.shaded.jackson2.com.fasterxml.jackson.databind.JsonNode;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
@@ -58,6 +61,8 @@ import static org.apache.fluss.utils.Preconditions.checkState;
  *   <li>"bucket_offsets": array of offsets for non-partitioned table buckets (optional)
  *   <li>"partition_offsets": array of partition offset objects for partitioned table buckets
  *       (optional)
+ *   <li>"tiering_states": array of keyed tiering-state entries, each {@code {"key", "version",
+ *       "payload"}} with the payload embedded as a JSON object but not parsed (optional)
  * </ul>
  */
 public class TableBucketOffsetsJsonSerde
@@ -70,8 +75,13 @@ public class TableBucketOffsetsJsonSerde
     private static final String BUCKET_OFFSETS_KEY = "bucket_offsets";
     private static final String PARTITION_OFFSETS_KEY = "partition_offsets";
     private static final String PARTITION_ID_KEY = "partition_id";
+    private static final String TIERING_STATES_KEY = "tiering_states";
+    private static final String STATE_ENTRY_KEY = "key";
+    private static final String STATE_ENTRY_VERSION = "version";
+    private static final String STATE_ENTRY_PAYLOAD = "payload";
 
-    private static final int VERSION = 1;
+    private static final int VERSION_1 = 1;
+    private static final int CURRENT_VERSION = VERSION_1;
     private static final long UNKNOWN_OFFSET = -1;
 
     /**
@@ -94,7 +104,7 @@ public class TableBucketOffsetsJsonSerde
             throws IOException {
         generator.writeStartObject();
         long expectedTableId = tableBucketOffsets.getTableId();
-        generator.writeNumberField(VERSION_KEY, VERSION);
+        generator.writeNumberField(VERSION_KEY, CURRENT_VERSION);
         generator.writeNumberField(TABLE_ID_KEY, expectedTableId);
 
         Map<TableBucket, Long> offsets = tableBucketOffsets.getOffsets();
@@ -149,6 +159,38 @@ public class TableBucketOffsetsJsonSerde
             }
         }
 
+        // embed the tiering-state entries (optional); each payload must be a JSON object, its
+        // content is not parsed.
+        List<TieringStateEntry> tieringStates = tableBucketOffsets.getTieringStates();
+        if (!tieringStates.isEmpty()) {
+            generator.writeArrayFieldStart(TIERING_STATES_KEY);
+            for (TieringStateEntry entry : tieringStates) {
+                JsonNode payloadNode;
+                try {
+                    payloadNode = JsonSerdeUtils.readTree(entry.getPayload());
+                } catch (IOException e) {
+                    throw new IllegalArgumentException(
+                            "tiering-state payload of key '"
+                                    + entry.getStateKey()
+                                    + "' is not valid JSON",
+                            e);
+                }
+                if (payloadNode == null || !payloadNode.isObject()) {
+                    throw new IllegalArgumentException(
+                            "tiering-state payload of key '"
+                                    + entry.getStateKey()
+                                    + "' must be a JSON object");
+                }
+                generator.writeStartObject();
+                generator.writeStringField(STATE_ENTRY_KEY, entry.getStateKey());
+                generator.writeNumberField(STATE_ENTRY_VERSION, entry.getStateVersion());
+                generator.writeFieldName(STATE_ENTRY_PAYLOAD);
+                generator.writeTree(payloadNode);
+                generator.writeEndObject();
+            }
+            generator.writeEndArray();
+        }
+
         generator.writeEndObject();
     }
 
@@ -165,7 +207,7 @@ public class TableBucketOffsetsJsonSerde
     @Override
     public TableBucketOffsets deserialize(JsonNode node) {
         int version = node.get(VERSION_KEY).asInt();
-        if (version != VERSION) {
+        if (version != CURRENT_VERSION) {
             throw new IllegalArgumentException("Unsupported version: " + version);
         }
 
@@ -211,7 +253,29 @@ public class TableBucketOffsetsJsonSerde
             }
         }
 
-        return new TableBucketOffsets(tableId, offsets);
+        // read the tiering-state entries (optional); payloads are kept as raw JSON bytes.
+        List<TieringStateEntry> tieringStates = Collections.emptyList();
+        JsonNode tieringStatesNode = node.get(TIERING_STATES_KEY);
+        if (tieringStatesNode != null && !tieringStatesNode.isNull()) {
+            tieringStates = new ArrayList<>();
+            for (JsonNode entryNode : tieringStatesNode) {
+                JsonNode keyNode = entryNode.get(STATE_ENTRY_KEY);
+                JsonNode versionNode = entryNode.get(STATE_ENTRY_VERSION);
+                JsonNode payloadNode = entryNode.get(STATE_ENTRY_PAYLOAD);
+                if (keyNode == null || versionNode == null || payloadNode == null) {
+                    throw new IllegalArgumentException(
+                            "Corrupt tiering-state entry: missing key/version/payload in "
+                                    + entryNode);
+                }
+                tieringStates.add(
+                        new TieringStateEntry(
+                                keyNode.asText(),
+                                versionNode.asInt(),
+                                payloadNode.toString().getBytes(StandardCharsets.UTF_8)));
+            }
+        }
+
+        return new TableBucketOffsets(tableId, offsets, tieringStates);
     }
 
     private void serializeBucketLogEndOffset(
