@@ -24,6 +24,7 @@ import org.apache.fluss.lake.serializer.SimpleVersionedSerializer;
 import org.apache.paimon.data.BinaryRow;
 import org.apache.paimon.io.DataInputViewStreamWrapper;
 import org.apache.paimon.io.DataOutputViewStreamWrapper;
+import org.apache.paimon.table.FallbackReadFileStoreTable;
 import org.apache.paimon.table.source.DataSplit;
 import org.apache.paimon.utils.InstantiationUtil;
 import org.slf4j.Logger;
@@ -55,6 +56,13 @@ public class PaimonSplitSerializer implements SimpleVersionedSerializer<PaimonSp
     // no Java class names, so it survives class relocation (shading) in downstream distributions.
     private static final int VERSION_3 = 3;
 
+    // Split type tags of VERSION_3, aligned with Paimon master's SplitSerializer type ids.
+    // Serialization must dispatch on the concrete split class: DataSplit subclasses append extra
+    // fields after the base payload (e.g. FallbackDataSplit), so deserializing them with the base
+    // DataSplit.deserialize would leave trailing bytes and shift all subsequent reads.
+    private static final int SPLIT_TYPE_DATA_SPLIT = 1;
+    private static final int SPLIT_TYPE_FALLBACK_DATA_SPLIT = 6;
+
     @Override
     public int getVersion() {
         return VERSION_3;
@@ -64,7 +72,7 @@ public class PaimonSplitSerializer implements SimpleVersionedSerializer<PaimonSp
     public byte[] serialize(PaimonSplit paimonSplit) throws IOException {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         DataOutputViewStreamWrapper view = new DataOutputViewStreamWrapper(out);
-        paimonSplit.dataSplit().serialize(view);
+        serializeDataSplit(paimonSplit.dataSplit(), view);
         view.writeBoolean(paimonSplit.isBucketUnAware());
         List<String> partition = paimonSplit.partition();
         view.writeInt(partition.size());
@@ -72,6 +80,21 @@ public class PaimonSplitSerializer implements SimpleVersionedSerializer<PaimonSp
             view.writeUTF(value);
         }
         return out.toByteArray();
+    }
+
+    private void serializeDataSplit(DataSplit dataSplit, DataOutputViewStreamWrapper view)
+            throws IOException {
+        if (dataSplit.getClass() == DataSplit.class) {
+            view.writeByte(SPLIT_TYPE_DATA_SPLIT);
+            dataSplit.serialize(view);
+        } else if (dataSplit instanceof FallbackReadFileStoreTable.FallbackDataSplit) {
+            view.writeByte(SPLIT_TYPE_FALLBACK_DATA_SPLIT);
+            dataSplit.serialize(view);
+        } else {
+            // fail fast: an unknown subclass may append extra fields after the base payload,
+            // silently corrupting the stream on restore
+            throw new IOException("Unsupported DataSplit class: " + dataSplit.getClass().getName());
+        }
     }
 
     @Override
@@ -90,7 +113,18 @@ public class PaimonSplitSerializer implements SimpleVersionedSerializer<PaimonSp
     private PaimonSplit deserializeV3(byte[] serialized) throws IOException {
         ByteArrayInputStream in = new ByteArrayInputStream(serialized);
         DataInputViewStreamWrapper view = new DataInputViewStreamWrapper(in);
-        DataSplit dataSplit = DataSplit.deserialize(view);
+        int splitType = view.readByte();
+        DataSplit dataSplit;
+        switch (splitType) {
+            case SPLIT_TYPE_DATA_SPLIT:
+                dataSplit = DataSplit.deserialize(view);
+                break;
+            case SPLIT_TYPE_FALLBACK_DATA_SPLIT:
+                dataSplit = FallbackReadFileStoreTable.FallbackDataSplit.deserialize(view);
+                break;
+            default:
+                throw new IOException("Unsupported DataSplit type: " + splitType);
+        }
         boolean isBucketUnAware = view.readBoolean();
         int size = view.readInt();
         List<String> partition = new ArrayList<>(size);

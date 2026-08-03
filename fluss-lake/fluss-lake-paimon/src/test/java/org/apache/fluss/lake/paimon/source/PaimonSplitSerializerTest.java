@@ -27,8 +27,10 @@ import org.apache.paimon.CoreOptions;
 import org.apache.paimon.Snapshot;
 import org.apache.paimon.data.BinaryString;
 import org.apache.paimon.data.GenericRow;
+import org.apache.paimon.io.DataInputViewStreamWrapper;
 import org.apache.paimon.io.DataOutputViewStreamWrapper;
 import org.apache.paimon.schema.Schema;
+import org.apache.paimon.table.FallbackReadFileStoreTable;
 import org.apache.paimon.table.Table;
 import org.apache.paimon.table.source.DataSplit;
 import org.apache.paimon.types.DataTypes;
@@ -103,6 +105,35 @@ class PaimonSplitSerializerTest extends PaimonSourceTestBase {
     }
 
     @Test
+    void testDataSplitSubclassDispatch() throws Exception {
+        PaimonSplit original = createStringPartitionSplit();
+
+        // FallbackDataSplit appends the isFallback flag after the base payload; the subtype and
+        // its extra state must survive the round trip. Its constructors are private, so build one
+        // via its public deserialize API.
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        DataOutputViewStreamWrapper view = new DataOutputViewStreamWrapper(out);
+        original.dataSplit().serialize(view);
+        view.writeBoolean(true);
+        DataSplit fallbackDataSplit =
+                FallbackReadFileStoreTable.FallbackDataSplit.deserialize(
+                        new DataInputViewStreamWrapper(
+                                new ByteArrayInputStream(out.toByteArray())));
+
+        PaimonSplit fallbackSplit = new PaimonSplit(fallbackDataSplit, false, original.partition());
+        PaimonSplit deserialized = assertV3RoundTrip(fallbackSplit);
+        assertThat(deserialized.dataSplit())
+                .isInstanceOf(FallbackReadFileStoreTable.FallbackDataSplit.class);
+
+        // unknown subclasses may append extra fields as well and must be rejected at write time
+        // instead of silently corrupting the stream on restore
+        PaimonSplit unknown = new PaimonSplit(new DataSplit() {}, false, Collections.emptyList());
+        assertThatThrownBy(() -> serializer.serialize(unknown))
+                .isInstanceOf(IOException.class)
+                .hasMessageContaining("Unsupported DataSplit class");
+    }
+
+    @Test
     void testDeserializeInvalidInput() {
         byte[] invalidData = "invalid".getBytes();
         assertThatThrownBy(() -> serializer.deserialize(1, invalidData))
@@ -114,7 +145,7 @@ class PaimonSplitSerializerTest extends PaimonSourceTestBase {
                 .hasMessageContaining("Unsupported PaimonSplit serialization version");
     }
 
-    private void assertV3RoundTrip(PaimonSplit original) throws IOException {
+    private PaimonSplit assertV3RoundTrip(PaimonSplit original) throws IOException {
         byte[] serialized = serializer.serialize(original);
         // VERSION_3 bytes must not embed the DataSplit class name, otherwise relocation (shading)
         // in downstream distributions would break state restore again
@@ -125,6 +156,7 @@ class PaimonSplitSerializerTest extends PaimonSourceTestBase {
         assertThat(deserialized.dataSplit()).isEqualTo(original.dataSplit());
         assertThat(deserialized.isBucketUnAware()).isEqualTo(original.isBucketUnAware());
         assertThat(deserialized.partition()).isEqualTo(original.partition());
+        return deserialized;
     }
 
     private PaimonSplit createStringPartitionSplit() throws Exception {
