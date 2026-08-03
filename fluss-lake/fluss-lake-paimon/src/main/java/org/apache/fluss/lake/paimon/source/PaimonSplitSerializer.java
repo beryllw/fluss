@@ -39,6 +39,8 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 
+import static org.apache.fluss.utils.Preconditions.checkState;
+
 /** Serializer for paimon split. */
 public class PaimonSplitSerializer implements SimpleVersionedSerializer<PaimonSplit> {
 
@@ -99,7 +101,7 @@ public class PaimonSplitSerializer implements SimpleVersionedSerializer<PaimonSp
     }
 
     private PaimonSplit deserializeLegacy(int version, byte[] serialized) throws IOException {
-        LOG.info("Restoring PaimonSplit from legacy state format (version {}).", version);
+        LOG.debug("Restoring PaimonSplit from legacy state format (version {}).", version);
         ByteArrayInputStream in = new ByteArrayInputStream(serialized);
         DataSplit dataSplit;
         try {
@@ -162,7 +164,11 @@ public class PaimonSplitSerializer implements SimpleVersionedSerializer<PaimonSp
 
         static {
             String cls = DataSplit.class.getName();
-            ACTUAL_PREFIX = cls.substring(0, cls.length() - "table.source.DataSplit".length());
+            // relocation only rewrites the package prefix, so the trailing part is stable; fail
+            // loudly instead of computing a wrong prefix silently
+            String suffix = "table.source.DataSplit";
+            checkState(cls.endsWith(suffix), "Unexpected DataSplit class name: %s", cls);
+            ACTUAL_PREFIX = cls.substring(0, cls.length() - suffix.length());
         }
 
         private final String originalPrefix;

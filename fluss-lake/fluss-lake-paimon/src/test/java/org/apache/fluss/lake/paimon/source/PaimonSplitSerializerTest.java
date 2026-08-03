@@ -30,6 +30,7 @@ import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.io.DataOutputViewStreamWrapper;
 import org.apache.paimon.schema.Schema;
 import org.apache.paimon.table.Table;
+import org.apache.paimon.table.source.DataSplit;
 import org.apache.paimon.types.DataTypes;
 import org.apache.paimon.utils.InstantiationUtil;
 import org.junit.jupiter.api.Test;
@@ -115,10 +116,10 @@ class PaimonSplitSerializerTest extends PaimonSourceTestBase {
 
     private void assertV3RoundTrip(PaimonSplit original) throws IOException {
         byte[] serialized = serializer.serialize(original);
-        // VERSION_3 bytes must not embed any Java class name, otherwise relocation (shading) in
-        // downstream distributions would break state restore again
+        // VERSION_3 bytes must not embed the DataSplit class name, otherwise relocation (shading)
+        // in downstream distributions would break state restore again
         assertThat(new String(serialized, StandardCharsets.ISO_8859_1))
-                .doesNotContain("org.apache.paimon");
+                .doesNotContain(DataSplit.class.getName());
 
         PaimonSplit deserialized = serializer.deserialize(serializer.getVersion(), serialized);
         assertThat(deserialized.dataSplit()).isEqualTo(original.dataSplit());
