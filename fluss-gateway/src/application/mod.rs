@@ -20,16 +20,20 @@
 //! Protocol adapters translate their wire types into the models in this module and call
 //! [`GatewayService`]. No HTTP, Axum, JSON, or OpenAPI type belongs in this layer.
 //!
-//! [`GatewayService`] is defined in [`service`] and extended by one inherent `impl` block per domain, starting
-//! with [`ddl`] for catalog reads and mutations.
+//! [`GatewayService`] is defined in [`service`] and extended by one inherent `impl` block per domain: [`ddl`]
+//! for catalog reads and mutations, [`mod@write`] for the records endpoint, and [`lookup`] for the two lookup
+//! endpoints.
 
 pub mod context;
 pub mod ddl;
 pub mod input;
 pub mod input_decode;
+pub mod lookup;
 pub mod metadata_cache;
+pub mod pagination;
 pub mod service;
 pub mod types;
+pub mod write;
 
 pub use context::{CancellationSignal, RequestContext};
 pub use ddl::{
@@ -44,8 +48,10 @@ pub use input_decode::{
 pub use metadata_cache::{
     DEFAULT_METADATA_CACHE_MAX_ENTRIES, DEFAULT_METADATA_CACHE_TTL, TableMetadataCache,
 };
+pub use pagination::{PAGE_TOKEN_VERSION, PageScope, decode_page_token, encode_page_token};
 pub use service::GatewayService;
 pub use types::{ClusterId, DataType, RowField};
+pub use write::{WriteEntry, WriteOperation, WriteRequest};
 
 // The backend models are the shared vocabulary of both layers. Re-exporting them here lets protocol adapters
 // depend on the application boundary alone.

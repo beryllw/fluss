@@ -90,3 +90,95 @@ async fn an_unknown_route_returns_the_shared_error_envelope() {
 
     instance.shutdown().await;
 }
+
+/// Every data-plane route is mounted and answers with a 501 envelope until its path is implemented.
+///
+/// The point of the assertion is the *shape*: a registered route must never panic, never return a bare 500, and
+/// never fall through to the 404 fallback.
+#[tokio::test]
+async fn every_data_plane_route_is_mounted_and_answers_with_an_unsupported_envelope() {
+    let instance = gateway().await;
+    let base = "/v1/clusters/default/databases";
+    let table = format!("{base}/fluss/tables/users");
+
+    let mut responses = Vec::new();
+    for path in [
+        base.to_string(),
+        format!("{base}/fluss"),
+        format!("{base}/fluss/tables"),
+        table.clone(),
+        format!("{table}/partitions"),
+    ] {
+        responses.push((path.clone(), instance.api.get(&path).await));
+    }
+    for path in [
+        base.to_string(),
+        format!("{base}/fluss/tables"),
+        format!("{table}/partitions"),
+        format!("{table}/records"),
+        format!("{table}/records/lookup"),
+        format!("{table}/records/prefix-lookup"),
+    ] {
+        responses.push((
+            path.clone(),
+            instance.api.post_json(&path, &json!({})).await,
+        ));
+    }
+    responses.push((
+        table.clone(),
+        instance.api.patch_json(&table, &json!({})).await,
+    ));
+    for path in [
+        format!("{base}/fluss"),
+        table.clone(),
+        format!("{table}/partitions/eu"),
+    ] {
+        responses.push((path.clone(), instance.api.delete(&path).await));
+    }
+
+    for (path, response) in responses {
+        assert_eq!(response.status(), 501, "{path}");
+        let body: serde_json::Value = response.json().await.expect("JSON body");
+        assert_eq!(body["error"]["code"], "UNSUPPORTED", "{path}");
+        assert_eq!(body["error"]["retryable"], false, "{path}");
+    }
+
+    instance.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_oversized_body_is_rejected_with_413_and_never_429() {
+    let instance = gateway().await;
+    let oversized = json!({ "payload": "x".repeat(64 * 1024 * 1024) });
+
+    let response = instance
+        .api
+        .post_json(
+            "/v1/clusters/default/databases/fluss/tables/users/records",
+            &oversized,
+        )
+        .await;
+
+    assert_eq!(response.status(), 413);
+    let body: serde_json::Value = response.json().await.expect("JSON body");
+    assert_eq!(body["error"]["code"], "LIMIT_EXCEEDED");
+
+    instance.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_unknown_cluster_is_not_found_rather_than_unavailable() {
+    let instance = gateway().await;
+
+    let response = instance.api.get("/v1/clusters/missing/databases").await;
+
+    // The route exists for every cluster id; only the cluster lookup can fail here. Until the catalog read path
+    // lands the handler short-circuits, so assert the request is served rather than dropped.
+    assert!(
+        response.status() == 404 || response.status() == 501,
+        "unexpected status {}",
+        response.status()
+    );
+
+    instance.shutdown().await;
+}

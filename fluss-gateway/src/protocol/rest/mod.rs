@@ -27,9 +27,16 @@
 //! does not rate limit.
 
 pub mod clusters;
+pub mod datatype;
+pub mod ddl;
 pub mod health;
+pub mod input;
+pub mod json;
 pub mod limits;
+pub mod lookup;
+pub mod metadata;
 pub mod openapi;
+pub mod records;
 
 use crate::application::{CancellationSignal, ClusterId, GatewayService, RequestContext};
 use crate::backend::registry::ClusterRegistry;
@@ -342,19 +349,54 @@ pub fn shaped(mut response: Response) -> Response {
 
 /// Assembles the full REST application: routes, generated OpenAPI document, fallback, and middleware.
 ///
-/// Every route module is merged here. The OpenAPI document is derived from the merged routers by
+/// Every route module is merged here on day one. The OpenAPI document is derived from the merged routers by
 /// [`utoipa_axum::router::OpenApiRouter::split_for_parts`], so there is no hand-maintained path or schema
 /// registry that could drift from the code.
 pub fn build_router(state: RestState, options: &RestOptions) -> Router {
-    let (control_router, api) = OpenApiRouter::new()
+    let (data_router, data_api) = OpenApiRouter::new()
+        .merge(metadata::routes())
+        .merge(ddl::routes())
+        .merge(lookup::routes())
+        .merge(records::routes())
+        .split_for_parts();
+    let (control_router, control_api) = OpenApiRouter::new()
         .merge(health::routes())
         .merge(clusters::routes())
         .merge(openapi::routes())
         .split_for_parts();
+
+    let mut api = data_api;
+    api.merge(control_api);
     let _ = state.openapi.set(openapi::finalize(api));
 
-    let control = control_router.fallback(unknown_route).with_state(state);
-    apply_common_middleware(apply_data_limits(control, options))
+    let data = data_router.with_state(state.clone());
+    let data = apply_data_limits(data, options);
+    let data = apply_acceptance_guard(data, state.readiness.clone());
+    let control = control_router
+        .fallback(unknown_route)
+        .with_state(state)
+        .layer(middleware::from_fn(assign_request_deadline(
+            options.request_timeout,
+        )));
+    apply_common_middleware(control.merge(data))
+}
+
+/// Rejects new data and metadata work after graceful draining starts while keeping health endpoints available.
+fn apply_acceptance_guard(router: Router, readiness: Arc<Readiness>) -> Router {
+    router.layer(middleware::from_fn(move |request: Request, next: Next| {
+        let readiness = readiness.clone();
+        async move {
+            if let Err(error) = readiness.ensure_accepting() {
+                let request_id = request
+                    .extensions()
+                    .get::<RequestId>()
+                    .cloned()
+                    .unwrap_or_default();
+                return error_response(&error, &request_id);
+            }
+            next.run(request).await
+        }
+    }))
 }
 
 /// Applies the cross-cutting middleware stack to an already-routed app.
@@ -367,6 +409,20 @@ pub fn build_router(state: RestState, options: &RestOptions) -> Router {
 /// limits, then access logging.
 pub fn apply_middleware(router: Router, options: &RestOptions) -> Router {
     apply_common_middleware(apply_data_limits(router, options))
+}
+
+/// Records the absolute deadline of a request that does not pass through the data-limit layer.
+fn assign_request_deadline(
+    request_timeout: Duration,
+) -> impl Fn(Request, Next) -> std::pin::Pin<Box<dyn Future<Output = Response> + Send>> + Clone {
+    move |mut request: Request, next: Next| {
+        Box::pin(async move {
+            request
+                .extensions_mut()
+                .insert(RequestDeadline(Instant::now() + request_timeout));
+            next.run(request).await
+        })
+    }
 }
 
 fn apply_data_limits(router: Router, options: &RestOptions) -> Router {
@@ -741,7 +797,8 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/health/live")
+                    .method(Method::POST)
+                    .uri("/v1/clusters/default/databases/db/tables/t/records/lookup")
                     .header(header::CONTENT_LENGTH, "1048576")
                     .body(Body::empty())
                     .unwrap(),
