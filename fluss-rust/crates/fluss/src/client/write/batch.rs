@@ -27,6 +27,7 @@ use bytes::Bytes;
 use std::cmp::max;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::time::{Duration, Instant};
 
 pub struct InnerWriteBatch {
     batch_id: i64,
@@ -38,6 +39,7 @@ pub struct InnerWriteBatch {
     drained_ms: i64,
     batch_sequence: i32,
     writer_id: i64,
+    delivery_deadline: Option<Instant>,
 }
 
 impl InnerWriteBatch {
@@ -52,6 +54,7 @@ impl InnerWriteBatch {
             drained_ms: -1,
             batch_sequence: NO_BATCH_SEQUENCE,
             writer_id: NO_WRITER_ID,
+            delivery_deadline: None,
         }
     }
 
@@ -109,6 +112,21 @@ impl InnerWriteBatch {
 
     fn is_done(&self) -> bool {
         self.completed.load(Ordering::Acquire)
+    }
+
+    /// Keeps the strictest deadline seen so far; a batch is only as patient as its most
+    /// urgent record.
+    fn retain_earliest_deadline(&mut self, delivery_deadline: Option<Instant>) {
+        if let Some(deadline) = delivery_deadline {
+            self.delivery_deadline = Some(match self.delivery_deadline {
+                Some(current) => current.min(deadline),
+                None => deadline,
+            });
+        }
+    }
+
+    fn delivery_deadline(&self) -> Option<Instant> {
+        self.delivery_deadline
     }
 }
 
@@ -234,6 +252,20 @@ impl WriteBatch {
             WriteBatch::Kv(batch) => batch.set_writer_state(writer_id, batch_base_sequence),
         }
     }
+
+    pub fn delivery_deadline(&self) -> Option<Instant> {
+        self.inner_batch().delivery_deadline()
+    }
+
+    pub fn delivery_deadline_expired(&self) -> bool {
+        self.delivery_deadline()
+            .is_some_and(|deadline| deadline <= Instant::now())
+    }
+
+    pub fn remaining_delivery_time(&self) -> Option<Duration> {
+        self.delivery_deadline()
+            .and_then(|deadline| deadline.checked_duration_since(Instant::now()))
+    }
 }
 
 pub struct ArrowLogWriteBatch {
@@ -280,6 +312,8 @@ impl ArrowLogWriteBatch {
         } else {
             // append successfully
             if self.arrow_builder.append(write_record)? {
+                self.write_batch
+                    .retain_earliest_deadline(write_record.delivery_deadline());
                 Ok(Some(ResultHandle::new(self.write_batch.results.receiver())))
             } else {
                 // append fail
@@ -398,6 +432,8 @@ impl KvWriteBatch {
                     message: "Failed to append row to KvWriteBatch".to_string(),
                     source: Some(Box::new(e)),
                 })?;
+            self.write_batch
+                .retain_earliest_deadline(write_record.delivery_deadline());
             Ok(Some(ResultHandle::new(self.write_batch.results.receiver())))
         }
     }
@@ -451,6 +487,27 @@ mod tests {
         let batch = InnerWriteBatch::new(1, Arc::new(physical_path), 0);
         assert!(batch.complete(Ok(())));
         assert!(!batch.complete(Err(crate::client::broadcast::Error::Dropped)));
+    }
+
+    #[tokio::test]
+    async fn delivery_timeout_remains_terminal_after_late_completion() {
+        let table_path = TablePath::new("db".to_string(), "tbl".to_string());
+        let physical_path = PhysicalTablePath::of(Arc::new(table_path));
+        let batch = InnerWriteBatch::new(1, Arc::new(physical_path), 0);
+        let handle = ResultHandle::new(batch.results.receiver());
+
+        assert!(
+            batch.complete(Err(crate::client::broadcast::Error::WriteFailed {
+                code: crate::error::FlussError::RequestTimeOut.code(),
+                message: "Write delivery deadline exceeded".to_string(),
+            }))
+        );
+        assert!(!batch.complete(Ok(())), "late success must be ignored");
+        assert!(matches!(
+            handle.wait().await.unwrap(),
+            Err(crate::client::broadcast::Error::WriteFailed { code, .. })
+                if code == crate::error::FlussError::RequestTimeOut.code()
+        ));
     }
 
     #[test]

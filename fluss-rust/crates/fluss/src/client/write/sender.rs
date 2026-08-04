@@ -196,6 +196,7 @@ impl Sender {
             self.maybe_abort_batches(&e);
             return Ok((vec![], None));
         }
+        self.expire_accumulated_batches();
         let (futures, delay, unknown_leaders) = self.drain_ready_sends()?;
         if !unknown_leaders.is_empty() {
             if let Err(e) = self.refresh_unknown_leaders(&unknown_leaders).await {
@@ -213,14 +214,12 @@ impl Sender {
         let cluster = self.metadata.get_cluster();
         let ready_check_result = self.accumulator.ready(&cluster)?;
 
+        let next_ready_check_delay_ms = ready_check_result.next_ready_check_delay_ms as u64;
+
         let unknown_leaders = ready_check_result.unknown_leader_tables;
 
         if ready_check_result.ready_nodes.is_empty() {
-            return Ok((
-                vec![],
-                Some(ready_check_result.next_ready_check_delay_ms as u64),
-                unknown_leaders,
-            ));
+            return Ok((vec![], Some(next_ready_check_delay_ms), unknown_leaders));
         }
 
         let batches = self.accumulator.drain(
@@ -240,7 +239,7 @@ impl Sender {
             }
         }
 
-        Ok((futures, None, unknown_leaders))
+        Ok((futures, Some(next_ready_check_delay_ms), unknown_leaders))
     }
 
     /// Refresh metadata for buckets with unknown leaders. Runs as a concurrent
@@ -280,7 +279,9 @@ impl Sender {
     /// Blocking version of drain + send, used during shutdown drain.
     async fn run_once(&self) -> Result<()> {
         let (futures, delay) = self.prepare_sends().await?;
-        if let Some(ms) = delay {
+        if futures.is_empty()
+            && let Some(ms) = delay
+        {
             tokio::time::sleep(Duration::from_millis(ms)).await;
             return Ok(());
         }
@@ -311,6 +312,24 @@ impl Sender {
         if batches.is_empty() {
             return Ok(());
         }
+
+        let mut sendable_batches = Vec::with_capacity(batches.len());
+        for batch in batches {
+            if batch.write_batch.delivery_deadline_expired() {
+                self.expire_batch(batch, true);
+            } else {
+                sendable_batches.push(batch);
+            }
+        }
+        if sendable_batches.is_empty() {
+            return Ok(());
+        }
+        let batches = sendable_batches;
+
+        // The connect phase is shared by every batch below, so it is bounded by the strictest
+        // deadline in the whole drained set.
+        let send_started = Instant::now();
+        let overall_timeout = self.request_timeout(&batches);
 
         // Record attempted-send per-batch metrics for the whole drained set
         // up front, before any early return (unknown leader, connection
@@ -346,15 +365,33 @@ impl Sender {
                 return Ok(());
             }
         };
-        let connection = match self.metadata.get_connection(destination_node).await {
-            Ok(connection) => connection,
-            Err(e) => {
+        let connect_timeout = overall_timeout.saturating_sub(send_started.elapsed());
+        if connect_timeout.is_zero() {
+            for batch in records_by_bucket.into_values() {
+                self.expire_batch(batch, true);
+            }
+            return Ok(());
+        }
+        let connection = match tokio::time::timeout(
+            connect_timeout,
+            self.metadata.get_connection(destination_node),
+        )
+        .await
+        {
+            Ok(Ok(connection)) => connection,
+            Ok(Err(e)) => {
                 self.handle_batches_with_error(
                     records_by_bucket.into_values().collect(),
                     FlussError::NetworkException,
                     format!("Failed to connect destination node {destination}: {e}"),
                 )
                 .await?;
+                return Ok(());
+            }
+            Err(_) => {
+                for batch in records_by_bucket.into_values() {
+                    self.expire_batch(batch, true);
+                }
                 return Ok(());
             }
         };
@@ -369,10 +406,23 @@ impl Sender {
                 continue;
             }
 
+            // Re-check right before building: the connect phase may have consumed the
+            // remaining delivery time of this table's batches.
+            let request_timeout = self.request_timeout(&request_batches);
+            if request_timeout.is_zero() {
+                for batch in request_batches {
+                    self.expire_batch(batch, true);
+                }
+                continue;
+            }
+            let request_timeout_ms = i32::try_from(request_timeout.as_millis().max(1))
+                .unwrap_or(i32::MAX)
+                .min(self.max_request_timeout_ms);
+
             let write_request = match Self::build_write_request(
                 table_id,
                 acks,
-                self.max_request_timeout_ms,
+                request_timeout_ms,
                 &mut request_batches,
             ) {
                 Ok(req) => req,
@@ -384,6 +434,15 @@ impl Sender {
                     continue;
                 }
             };
+
+            // Re-check once more before the wire send.
+            let request_timeout = self.request_timeout(&request_batches);
+            if request_timeout.is_zero() {
+                for batch in request_batches {
+                    self.expire_batch(batch, true);
+                }
+                continue;
+            }
 
             // Put batches back into records_by_bucket since response handling
             // will use them.
@@ -397,6 +456,7 @@ impl Sender {
                 table_id,
                 &table_buckets,
                 &mut records_by_bucket,
+                request_timeout,
             )
             .await?;
         }
@@ -460,17 +520,19 @@ impl Sender {
         table_id: TableId,
         table_buckets: &[TableBucket],
         records_by_bucket: &mut HashMap<TableBucket, ReadyWriteBatch>,
+        request_timeout: Duration,
     ) -> Result<()> {
         macro_rules! send {
             ($request:expr) => {{
                 // Record send latency for the request round trip regardless of
                 // outcome, so it is captured before the success/error branch.
                 let send_start = Instant::now();
-                let response_result = connection.request($request).await;
+                let response_result =
+                    tokio::time::timeout(request_timeout, connection.request($request)).await;
                 self.metrics
                     .record_send_latency_ms(send_start.elapsed().as_secs_f64() * 1000.0);
                 match response_result {
-                    Ok(response) => {
+                    Ok(Ok(response)) => {
                         self.handle_write_response(
                             table_id,
                             table_buckets,
@@ -479,7 +541,7 @@ impl Sender {
                         )
                         .await
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         self.handle_batches_with_error(
                             table_buckets
                                 .iter()
@@ -489,6 +551,15 @@ impl Sender {
                             format!("Failed to send write request: {e}"),
                         )
                         .await
+                    }
+                    Err(_) => {
+                        for batch in table_buckets
+                            .iter()
+                            .filter_map(|b| records_by_bucket.remove(b))
+                        {
+                            self.expire_batch(batch, false);
+                        }
+                        Ok(())
                     }
                 }
             }};
@@ -575,6 +646,36 @@ impl Sender {
         self.finish_batch(ready_write_batch, Ok(()));
     }
 
+    /// The effective timeout for one request: the configured maximum, tightened by the
+    /// remaining delivery time of every batch in the request.
+    fn request_timeout(&self, batches: &[ReadyWriteBatch]) -> Duration {
+        let configured = Duration::from_millis(self.max_request_timeout_ms.max(1) as u64);
+        batches
+            .iter()
+            .filter_map(|batch| batch.write_batch.delivery_deadline())
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            .fold(configured, Duration::min)
+    }
+
+    fn expire_batch(&self, ready_write_batch: ReadyWriteBatch, adjust_sequences: bool) {
+        self.fail_batch(
+            ready_write_batch,
+            broadcast::Error::WriteFailed {
+                code: FlussError::RequestTimeOut.code(),
+                message: "Write delivery deadline exceeded".to_string(),
+            },
+            None,
+            adjust_sequences,
+        );
+    }
+
+    fn expire_accumulated_batches(&self) {
+        for batch in self.accumulator.drain_expired_delivery_deadlines() {
+            let adjust_sequences = !batch.write_batch.has_batch_sequence();
+            self.expire_batch(batch, adjust_sequences);
+        }
+    }
+
     fn fail_batch(
         &self,
         ready_write_batch: ReadyWriteBatch,
@@ -654,6 +755,13 @@ impl Sender {
         message: String,
     ) -> Result<Option<Arc<PhysicalTablePath>>> {
         let physical_table_path = Arc::clone(ready_write_batch.write_batch.physical_table_path());
+
+        // Expiry is terminal: a retry must not be able to resurrect a batch whose delivery
+        // deadline has already passed.
+        if ready_write_batch.write_batch.delivery_deadline_expired() {
+            self.expire_batch(ready_write_batch, false);
+            return Ok(Self::is_invalid_metadata_error(error).then_some(physical_table_path));
+        }
 
         if error == FlussError::DuplicateSequenceException {
             warn!(
@@ -868,9 +976,9 @@ impl Sender {
     /// - Each iteration either performs a sync drain tick (if flagged) or blocks
     ///   in a single `tokio::select!`.
     /// - `accumulator.notified()` is always listened to (producer wakeups).
-    /// - The idle timer is only armed when truly idle (no futures in any pool).
-    /// - When writer_id isn't ready, a drain tick is a no-op but the loop stays
-    ///   responsive (notified/init/meta can still wake it).
+    /// - The timer stays armed while other work is in flight so queued delivery deadlines remain
+    ///   enforceable.
+    /// - When writer_id isn't ready, a drain tick still expires overdue batches but does not send.
     pub async fn run_with_shutdown(&self, mut shutdown_rx: mpsc::Receiver<()>) -> Result<()> {
         let mut pending: FuturesUnordered<SendFuture<'_>> = FuturesUnordered::new();
         let mut init_futs: FuturesUnordered<SendFuture<'_>> = FuturesUnordered::new();
@@ -914,6 +1022,8 @@ impl Sender {
             if need_drain {
                 need_drain = false;
 
+                self.expire_accumulated_batches();
+
                 if !self.idempotence_manager.is_enabled()
                     || self.idempotence_manager.has_writer_id()
                 {
@@ -931,10 +1041,17 @@ impl Sender {
                             warn!("Error in drain cycle: {e}");
                         }
                     }
+                } else {
+                    match self.accumulator.ready(&self.metadata.get_cluster()) {
+                        Ok(ready) => {
+                            next_delay_ms = ready.next_ready_check_delay_ms as u64;
+                            pending_unknown.extend(ready.unknown_leader_tables);
+                        }
+                        Err(e) => warn!("Error checking queued write deadlines: {e}"),
+                    }
                 }
             }
 
-            let truly_idle = pending.is_empty() && init_futs.is_empty() && meta_futs.is_empty();
             debug_assert!(next_delay_ms >= 1);
 
             // One select to rule them all.
@@ -973,8 +1090,8 @@ impl Sender {
                     need_drain = true;
                 }
 
-                // Idle timer: batch timeout / linger expiry.
-                _ = tokio::time::sleep(Duration::from_millis(next_delay_ms)), if truly_idle => {
+                // Timer: batch linger or the earliest queued delivery deadline.
+                _ = tokio::time::sleep(Duration::from_millis(next_delay_ms)) => {
                     need_drain = true;
                 }
             }
@@ -1068,7 +1185,7 @@ impl WriteResponse for PutKvResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::WriteRecord;
+    use crate::client::{WriteOptions, WriteRecord};
     use crate::cluster::{Cluster, ServerType};
     use crate::config::Config;
     use crate::metadata::{PhysicalTablePath, TablePath};
@@ -1152,6 +1269,60 @@ mod tests {
         let mut drained = batches.remove(&1).expect("drained batches");
         let batch = drained.pop().expect("batch");
         assert_eq!(batch.write_batch.attempts(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expired_batch_is_not_reenqueued() -> Result<()> {
+        let table_path = Arc::new(TablePath::new("db".to_string(), "tbl".to_string()));
+        let cluster = build_cluster_arc(table_path.as_ref(), 1, 1);
+        let metadata = Arc::new(Metadata::new_for_test(cluster.clone()));
+        let idempotence = disabled_idempotence();
+        let accumulator = Arc::new(RecordAccumulator::new(
+            Config::default(),
+            Arc::clone(&idempotence),
+        ));
+        let sender = Sender::new(
+            metadata,
+            Arc::clone(&accumulator),
+            1024 * 1024,
+            1000,
+            1,
+            10,
+            idempotence,
+            Arc::new(crate::metrics::WriterMetrics::new()),
+        );
+        let table_info = Arc::new(build_table_info(table_path.as_ref().clone(), 1, 1));
+        let physical_path = Arc::new(PhysicalTablePath::of(Arc::clone(&table_path)));
+        let row = GenericRow {
+            values: vec![Datum::Int32(1)],
+        };
+        let record = WriteRecord::for_append(table_info, physical_path, 1, &row).with_options(
+            WriteOptions::new(Instant::now() + Duration::from_millis(100)),
+        );
+        let result = accumulator.append(&record, 0, &cluster, false)?;
+        let handle = result.result_handle.expect("result handle");
+        let server = cluster.get_tablet_server(1).expect("server");
+        let nodes = HashSet::from([server.clone()]);
+        let mut batches = accumulator.drain(cluster, &nodes, 1024 * 1024)?;
+        let batch = batches.remove(&1).unwrap().pop().unwrap();
+        let request_timeout = sender.request_timeout(std::slice::from_ref(&batch));
+        assert!(request_timeout > Duration::ZERO);
+        assert!(request_timeout <= Duration::from_millis(100));
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        sender.handle_write_batch_error(
+            batch,
+            FlussError::RequestTimeOut,
+            "request timed out".to_string(),
+        )?;
+
+        assert!(matches!(
+            handle.wait().await?,
+            Err(broadcast::Error::WriteFailed { code, .. })
+                if code == FlussError::RequestTimeOut.code()
+        ));
+        assert!(!accumulator.has_incomplete());
         Ok(())
     }
 

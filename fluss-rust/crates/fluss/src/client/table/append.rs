@@ -17,7 +17,7 @@
 
 use crate::bucketing::BucketingFunction;
 use crate::client::table::partition_getter::{PartitionGetter, get_physical_path};
-use crate::client::{WriteRecord, WriteResultFuture, WriterClient};
+use crate::client::{WriteOptions, WriteRecord, WriteResultFuture, WriterClient};
 use crate::error::Error::{IllegalArgument, UnexpectedError};
 use crate::error::Result;
 use crate::metadata::{PhysicalTablePath, TableInfo, TablePath};
@@ -136,6 +136,23 @@ impl AppendWriter {
     /// A [`WriteResultFuture`] that can be awaited to wait for server acknowledgment,
     /// or dropped for fire-and-forget behavior (use `flush()` to ensure delivery).
     pub fn append<R: InternalRow>(&self, row: &R) -> Result<WriteResultFuture> {
+        self.append_inner(row, None)
+    }
+
+    /// Appends a row using an absolute delivery deadline.
+    pub fn append_with_options<R: InternalRow>(
+        &self,
+        row: &R,
+        options: WriteOptions,
+    ) -> Result<WriteResultFuture> {
+        self.append_inner(row, Some(options))
+    }
+
+    fn append_inner<R: InternalRow>(
+        &self,
+        row: &R,
+        options: Option<WriteOptions>,
+    ) -> Result<WriteResultFuture> {
         self.check_field_count(row)?;
         let physical_table_path = Arc::new(get_physical_path(
             &self.table_path,
@@ -146,13 +163,16 @@ impl AppendWriter {
             Some(router) => Some(router.encode_key(row)?),
             None => None,
         };
-        let record = WriteRecord::for_append(
+        let mut record = WriteRecord::for_append(
             Arc::clone(&self.table_info),
             physical_table_path,
             self.table_info.schema_id,
             row,
         )
         .with_bucket_key(bucket_key);
+        if let Some(options) = options {
+            record = record.with_options(options);
+        }
         let result_handle = self.writer_client.send(&record)?;
         Ok(WriteResultFuture::new(result_handle))
     }

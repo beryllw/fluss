@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::client::{RowBytes, WriteFormat, WriteRecord, WriteResultFuture, WriterClient};
+use crate::client::{
+    RowBytes, WriteFormat, WriteOptions, WriteRecord, WriteResultFuture, WriterClient,
+};
 use crate::error::Error::IllegalArgument;
 use crate::error::Result;
 use crate::metadata::{RowType, TableInfo, TablePath};
@@ -347,6 +349,23 @@ impl UpsertWriter {
     /// A [`WriteResultFuture`] that can be awaited to wait for server acknowledgment,
     /// or dropped for fire-and-forget behavior (use `flush()` to ensure delivery).
     pub fn upsert<R: InternalRow>(&self, row: &R) -> Result<WriteResultFuture> {
+        self.upsert_inner(row, None)
+    }
+
+    /// Upserts a row using an absolute delivery deadline.
+    pub fn upsert_with_options<R: InternalRow>(
+        &self,
+        row: &R,
+        options: WriteOptions,
+    ) -> Result<WriteResultFuture> {
+        self.upsert_inner(row, Some(options))
+    }
+
+    fn upsert_inner<R: InternalRow>(
+        &self,
+        row: &R,
+        options: Option<WriteOptions>,
+    ) -> Result<WriteResultFuture> {
         self.check_field_count(row)?;
 
         let (key, bucket_key) = self.get_keys(row)?;
@@ -356,7 +375,7 @@ impl UpsertWriter {
             None => RowBytes::Owned(self.encode_row(row)?),
         };
 
-        let write_record = WriteRecord::for_upsert(
+        let mut write_record = WriteRecord::for_upsert(
             Arc::clone(&self.table_info),
             Arc::new(get_physical_path(
                 &self.table_path,
@@ -370,6 +389,9 @@ impl UpsertWriter {
             self.target_columns.clone(),
             Some(row_bytes),
         );
+        if let Some(options) = options {
+            write_record = write_record.with_options(options);
+        }
 
         let result_handle = self.writer_client.send(&write_record)?;
         Ok(WriteResultFuture::new(result_handle))
@@ -388,11 +410,28 @@ impl UpsertWriter {
     /// A [`WriteResultFuture`] that can be awaited to wait for server acknowledgment,
     /// or dropped for fire-and-forget behavior (use `flush()` to ensure delivery).
     pub fn delete<R: InternalRow>(&self, row: &R) -> Result<WriteResultFuture> {
+        self.delete_inner(row, None)
+    }
+
+    /// Deletes a row using an absolute delivery deadline.
+    pub fn delete_with_options<R: InternalRow>(
+        &self,
+        row: &R,
+        options: WriteOptions,
+    ) -> Result<WriteResultFuture> {
+        self.delete_inner(row, Some(options))
+    }
+
+    fn delete_inner<R: InternalRow>(
+        &self,
+        row: &R,
+        options: Option<WriteOptions>,
+    ) -> Result<WriteResultFuture> {
         self.check_field_count(row)?;
 
         let (key, bucket_key) = self.get_keys(row)?;
 
-        let write_record = WriteRecord::for_upsert(
+        let mut write_record = WriteRecord::for_upsert(
             Arc::clone(&self.table_info),
             Arc::new(get_physical_path(
                 &self.table_path,
@@ -406,6 +445,9 @@ impl UpsertWriter {
             self.target_columns.clone(),
             None,
         );
+        if let Some(options) = options {
+            write_record = write_record.with_options(options);
+        }
 
         let result_handle = self.writer_client.send(&write_record)?;
         Ok(WriteResultFuture::new(result_handle))

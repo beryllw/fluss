@@ -24,7 +24,7 @@ use crate::client::{LogWriteRecord, Record, ResultHandle, WriteRecord};
 use crate::cluster::{BucketLocation, Cluster, ServerNode};
 use crate::compression::ArrowCompressionRatioEstimator;
 use crate::config::Config;
-use crate::error::{Error, Result};
+use crate::error::{Error, FlussError, Result};
 use crate::metadata::{PhysicalTablePath, TableBucket};
 use crate::record::{NO_BATCH_SEQUENCE, NO_WRITER_ID};
 use crate::util::current_time_ms;
@@ -70,7 +70,19 @@ impl MemoryLimiter {
     /// Try to acquire `size` bytes. Blocks until memory is available,
     /// the timeout expires, or the limiter is closed.
     /// Returns a `MemoryPermit` on success.
+    #[cfg(test)]
     pub fn acquire(self: &Arc<Self>, size: usize) -> Result<MemoryPermit> {
+        self.acquire_until(size, None)
+    }
+
+    /// Same as [`acquire`](Self::acquire), but additionally bounded by an absolute delivery
+    /// deadline. When the deadline is the binding constraint the returned error is a delivery
+    /// timeout rather than `BufferExhausted`, so the caller can report it as such.
+    fn acquire_until(
+        self: &Arc<Self>,
+        size: usize,
+        delivery_deadline: Option<Instant>,
+    ) -> Result<MemoryPermit> {
         if self.closed.load(Ordering::Acquire) {
             return Err(Error::WriterClosed {
                 message: "Memory limiter is closed".to_string(),
@@ -87,7 +99,10 @@ impl MemoryLimiter {
         }
 
         let mut used = self.state.lock();
-        let deadline = Instant::now() + self.wait_timeout;
+        let buffer_deadline = Instant::now() + self.wait_timeout;
+        let deadline = delivery_deadline
+            .map(|delivery_deadline| delivery_deadline.min(buffer_deadline))
+            .unwrap_or(buffer_deadline);
         while *used + size > self.max_memory {
             self.waiting_count.fetch_add(1, Ordering::Relaxed);
             let result = self.cond.wait_until(&mut used, deadline);
@@ -99,6 +114,11 @@ impl MemoryLimiter {
                 });
             }
             if result.timed_out() && *used + size > self.max_memory {
+                if delivery_deadline
+                    .is_some_and(|delivery_deadline| delivery_deadline <= Instant::now())
+                {
+                    return Err(delivery_timeout_error());
+                }
                 return Err(Error::BufferExhausted {
                     message: format!(
                         "Failed to allocate {} bytes for write batch within {}ms. \
@@ -327,6 +347,12 @@ impl RecordAccumulator {
         cluster: &Cluster,
         abort_if_batch_full: bool,
     ) -> Result<RecordAppendResult> {
+        if record
+            .delivery_deadline()
+            .is_some_and(|deadline| deadline <= Instant::now())
+        {
+            return Err(delivery_timeout_error());
+        }
         let physical_table_path = &record.physical_table_path;
         let table_path = physical_table_path.get_table_path();
         let table_info = cluster.get_table(table_path)?;
@@ -369,6 +395,9 @@ impl RecordAccumulator {
 
         let mut dq_guard = dq.lock();
         if let Some(append_result) = self.try_append(record, &mut dq_guard)? {
+            if record.delivery_deadline().is_some() {
+                self.wakeup_sender();
+            }
             return Ok(append_result);
         }
 
@@ -385,13 +414,25 @@ impl RecordAccumulator {
         let batch_size = dynamic_target.unwrap_or(self.config.writer_batch_size as usize);
         let record_size = record.estimated_record_size();
         let alloc_size = batch_size.max(record_size);
-        let permit = self.memory_limiter.acquire(alloc_size)?;
+        let permit = self
+            .memory_limiter
+            .acquire_until(alloc_size, record.delivery_deadline())?;
 
         // Re-acquire dq lock after memory is available
         let mut dq_guard = dq.lock();
         // Re-try: another thread may have created a batch while we waited
         if let Some(append_result) = self.try_append(record, &mut dq_guard)? {
+            if record.delivery_deadline().is_some() {
+                self.wakeup_sender();
+            }
             return Ok(append_result); // permit drops here, memory released
+        }
+
+        if record
+            .delivery_deadline()
+            .is_some_and(|deadline| deadline <= Instant::now())
+        {
+            return Err(delivery_timeout_error());
         }
 
         self.append_new_batch(
@@ -493,6 +534,10 @@ impl RecordAccumulator {
 
             let batch = batch_guard.front().unwrap();
             let waited_time_ms = batch.waited_time_ms(current_time_ms());
+            let delivery_expired = batch.delivery_deadline_expired();
+            let delivery_time_left_ms = batch
+                .remaining_delivery_time()
+                .map(|remaining| i64::try_from(remaining.as_millis().max(1)).unwrap_or(i64::MAX));
             let deque_size = batch_guard.len();
             let full = deque_size > 1 || batch.is_closed();
             let table_bucket = cluster.get_table_bucket(physical_table_path, bucket_id)?;
@@ -500,12 +545,15 @@ impl RecordAccumulator {
                 next_delay = self.batch_ready(
                     leader,
                     waited_time_ms,
-                    full,
-                    exhausted,
+                    full || exhausted || delivery_expired,
+                    delivery_time_left_ms,
                     ready_nodes,
                     next_delay,
                 );
             } else {
+                if let Some(delivery_delay) = delivery_time_left_ms {
+                    next_delay = next_delay.min(delivery_delay);
+                }
                 unknown_leader_tables.insert(Arc::clone(physical_table_path));
             }
         }
@@ -516,16 +564,15 @@ impl RecordAccumulator {
         &self,
         leader: &ServerNode,
         waited_time_ms: i64,
-        full: bool,
-        exhausted: bool,
+        send_immediately: bool,
+        delivery_time_left_ms: Option<i64>,
         ready_nodes: &mut HashSet<ServerNode>,
         next_ready_check_delay_ms: i64,
     ) -> i64 {
         if !ready_nodes.contains(leader) {
             let expired = waited_time_ms >= self.batch_timeout_ms;
-            let sendable = full
+            let sendable = send_immediately
                 || expired
-                || exhausted
                 || self.closed.load(Ordering::Acquire)
                 || self.flush_in_progress();
 
@@ -533,7 +580,10 @@ impl RecordAccumulator {
                 ready_nodes.insert(leader.clone());
             } else {
                 let time_left_ms = self.batch_timeout_ms.saturating_sub(waited_time_ms);
-                return next_ready_check_delay_ms.min(time_left_ms);
+                let next_delay = next_ready_check_delay_ms.min(time_left_ms);
+                return delivery_time_left_ms
+                    .map(|delivery_delay| next_delay.min(delivery_delay))
+                    .unwrap_or(next_delay);
             }
         }
         next_ready_check_delay_ms
@@ -557,6 +607,52 @@ impl RecordAccumulator {
         }
 
         Ok(batches)
+    }
+
+    /// Removes batches whose delivery deadline has expired before they could be sent.
+    pub fn drain_expired_delivery_deadlines(&self) -> Vec<ReadyWriteBatch> {
+        let entries: Vec<(TableId, Option<PartitionId>, BucketBatches)> = self
+            .write_batches
+            .iter()
+            .map(|entry| {
+                let bucket_batches = entry
+                    .value()
+                    .batches
+                    .iter()
+                    .map(|(bucket_id, batches)| (*bucket_id, Arc::clone(batches)))
+                    .collect();
+                (
+                    entry.value().table_id,
+                    entry.value().partition_id,
+                    bucket_batches,
+                )
+            })
+            .collect();
+        let mut expired = Vec::new();
+        for (table_id, partition_id, bucket_batches) in entries {
+            for (bucket_id, batches) in bucket_batches {
+                let mut batches = batches.lock();
+                let mut index = 0;
+                while index < batches.len() {
+                    if batches[index].delivery_deadline_expired() {
+                        let write_batch = batches
+                            .remove(index)
+                            .expect("expired batch index must exist");
+                        expired.push(ReadyWriteBatch {
+                            table_bucket: TableBucket::new_with_partition(
+                                table_id,
+                                partition_id,
+                                bucket_id,
+                            ),
+                            write_batch,
+                        });
+                    } else {
+                        index += 1;
+                    }
+                }
+            }
+        }
+        expired
     }
 
     /// Matches Java's `shouldStopDrainBatchesForBucket`. Returns true if
@@ -983,6 +1079,13 @@ impl RecordAccumulator {
     }
 }
 
+fn delivery_timeout_error() -> Error {
+    Error::FlussAPIError {
+        api_error: FlussError::RequestTimeOut
+            .to_api_error(Some("Write delivery deadline exceeded".to_string())),
+    }
+}
+
 pub struct ReadyWriteBatch {
     pub table_bucket: TableBucket,
     pub write_batch: WriteBatch,
@@ -1090,7 +1193,7 @@ impl ReadyCheckResult {
 mod tests {
     use super::*;
     use crate::client::write::write_format::WriteFormat;
-    use crate::client::write::{RowBytes, WriteRecord};
+    use crate::client::write::{RowBytes, WriteOptions, WriteRecord};
     use crate::metadata::TablePath;
     use crate::row::{Datum, GenericRow};
     use crate::test_utils::{build_cluster, build_table_info};
@@ -1516,6 +1619,21 @@ mod tests {
     }
 
     #[test]
+    fn test_memory_limiter_full_buffer_honors_delivery_deadline() {
+        let limiter = Arc::new(MemoryLimiter::new(1024, Duration::from_secs(60)));
+        let _permit = limiter.acquire(1024).unwrap();
+
+        let start = Instant::now();
+        let result = limiter.acquire_until(512, Some(Instant::now() + Duration::from_millis(25)));
+
+        assert_eq!(
+            result.unwrap_err().api_error(),
+            Some(FlussError::RequestTimeOut)
+        );
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
     fn test_memory_limiter_close_fails_immediately() {
         let limiter = Arc::new(MemoryLimiter::new(1024, Duration::from_secs(60)));
 
@@ -1788,5 +1906,79 @@ mod tests {
             let batch = batches.pop().expect("batch");
             accumulator.remove_incomplete_batches(batch.write_batch.batch_id());
         }
+    }
+
+    #[test]
+    fn batch_retains_earliest_delivery_deadline() {
+        let accumulator = RecordAccumulator::new(Config::default(), disabled_idempotence());
+        let table_path = TablePath::new("db".to_string(), "tbl".to_string());
+        let table_info = Arc::new(build_table_info(table_path.clone(), 1, 1));
+        let physical_path = Arc::new(PhysicalTablePath::of(Arc::new(table_path.clone())));
+        let cluster = Arc::new(build_cluster(&table_path, 1, 1));
+        let row = GenericRow {
+            values: vec![Datum::Int32(1)],
+        };
+        let early = Instant::now() + Duration::from_secs(2);
+        let late = early + Duration::from_secs(2);
+        let late_record =
+            WriteRecord::for_append(Arc::clone(&table_info), Arc::clone(&physical_path), 1, &row)
+                .with_options(WriteOptions::new(late));
+        let early_record = WriteRecord::for_append(table_info, Arc::clone(&physical_path), 1, &row)
+            .with_options(WriteOptions::new(early));
+
+        accumulator
+            .append(&late_record, 0, &cluster, false)
+            .unwrap();
+        accumulator
+            .append(&early_record, 0, &cluster, false)
+            .unwrap();
+
+        let batches = accumulator.write_batches.get(&physical_path).unwrap();
+        let queue = batches.batches.get(&0).unwrap().lock();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.front().unwrap().delivery_deadline(), Some(early));
+    }
+
+    #[test]
+    fn expired_queued_batch_is_drained_without_sending() {
+        let accumulator = RecordAccumulator::new(Config::default(), disabled_idempotence());
+        let table_path = TablePath::new("db".to_string(), "tbl".to_string());
+        let table_info = Arc::new(build_table_info(table_path.clone(), 1, 1));
+        let physical_path = Arc::new(PhysicalTablePath::of(Arc::new(table_path.clone())));
+        let cluster = Arc::new(build_cluster(&table_path, 1, 1));
+        let row = GenericRow {
+            values: vec![Datum::Int32(1)],
+        };
+        let record = WriteRecord::for_append(table_info, physical_path, 1, &row).with_options(
+            WriteOptions::new(Instant::now() + Duration::from_millis(10)),
+        );
+        accumulator.append(&record, 0, &cluster, false).unwrap();
+
+        std::thread::sleep(Duration::from_millis(20));
+        let expired = accumulator.drain_expired_delivery_deadlines();
+        assert_eq!(expired.len(), 1);
+        assert!(expired[0].write_batch.delivery_deadline_expired());
+        assert!(!accumulator.has_undrained());
+    }
+
+    #[test]
+    fn expired_record_is_rejected_before_enqueue() {
+        let accumulator = RecordAccumulator::new(Config::default(), disabled_idempotence());
+        let table_path = TablePath::new("db".to_string(), "tbl".to_string());
+        let table_info = Arc::new(build_table_info(table_path.clone(), 1, 1));
+        let physical_path = Arc::new(PhysicalTablePath::of(Arc::new(table_path.clone())));
+        let cluster = Arc::new(build_cluster(&table_path, 1, 1));
+        let row = GenericRow {
+            values: vec![Datum::Int32(1)],
+        };
+        let record = WriteRecord::for_append(table_info, physical_path, 1, &row)
+            .with_options(WriteOptions::new(Instant::now()));
+
+        let error = match accumulator.append(&record, 0, &cluster, false) {
+            Err(error) => error,
+            Ok(_) => panic!("expired record was accepted"),
+        };
+        assert_eq!(error.api_error(), Some(FlussError::RequestTimeOut));
+        assert!(!accumulator.has_undrained());
     }
 }

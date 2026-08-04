@@ -32,6 +32,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Instant;
 
 pub(crate) mod broadcast;
 mod bucket_assigner;
@@ -44,6 +45,22 @@ pub(crate) use idempotence::IdempotenceManager;
 pub use write_format::WriteFormat;
 pub(crate) use writer_client::WriterClient;
 
+/// Per-write delivery controls.
+///
+/// The deadline is absolute and covers time in the accumulator, every RPC attempt, and retries.
+/// If it expires after the writer has accepted the record, the returned completion state is
+/// unknown because the server may already have committed the batch.
+#[derive(Debug, Clone, Copy)]
+pub struct WriteOptions {
+    pub delivery_deadline: Instant,
+}
+
+impl WriteOptions {
+    pub fn new(delivery_deadline: Instant) -> Self {
+        Self { delivery_deadline }
+    }
+}
+
 #[allow(dead_code)]
 pub struct WriteRecord<'a> {
     record: Record<'a>,
@@ -52,6 +69,7 @@ pub struct WriteRecord<'a> {
     schema_id: i32,
     write_format: WriteFormat,
     table_info: Arc<TableInfo>,
+    delivery_deadline: Option<Instant>,
 }
 
 impl<'a> WriteRecord<'a> {
@@ -77,6 +95,15 @@ impl<'a> WriteRecord<'a> {
             }
             Record::Log(_) => 0, // Arrow batches use record count, not byte size
         }
+    }
+
+    pub(crate) fn delivery_deadline(&self) -> Option<Instant> {
+        self.delivery_deadline
+    }
+
+    pub(crate) fn with_options(mut self, options: WriteOptions) -> Self {
+        self.delivery_deadline = Some(options.delivery_deadline);
+        self
     }
 }
 
@@ -143,6 +170,7 @@ impl<'a> WriteRecord<'a> {
             bucket_key: None,
             schema_id,
             write_format: WriteFormat::ArrowLog,
+            delivery_deadline: None,
         }
     }
 
@@ -159,6 +187,7 @@ impl<'a> WriteRecord<'a> {
             bucket_key: None,
             schema_id,
             write_format: WriteFormat::ArrowLog,
+            delivery_deadline: None,
         }
     }
 
@@ -186,6 +215,7 @@ impl<'a> WriteRecord<'a> {
             bucket_key,
             schema_id,
             write_format,
+            delivery_deadline: None,
         }
     }
 }
