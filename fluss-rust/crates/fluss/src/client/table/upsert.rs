@@ -277,12 +277,12 @@ impl UpsertWriterFactory {
         // check the columns not in targetColumns should be nullable
         for i in 0..field_count {
             // column not in primary key and not in auto increment column
-            if !pk_column_set[i] && !auto_increment_column_set[i] {
+            if !target_column_set[i] && !pk_column_set[i] && !auto_increment_column_set[i] {
                 // the column should be nullable
                 if !row_type.fields().get(i).unwrap().data_type.is_nullable() {
                     return Err(IllegalArgument {
                         message: format!(
-                            "Partial Update requires all columns except primary key to be nullable, but column {} is NOT NULL.",
+                            "Partial Update requires omitted columns except primary key and auto increment columns to be nullable, but omitted column {} is NOT NULL.",
                             row_type.fields().get(i).unwrap().name()
                         ),
                     });
@@ -576,8 +576,18 @@ mod tests {
         );
 
         assert!(result.unwrap_err().to_string().contains(
-            "Partial Update requires all columns except primary key to be nullable, but column required_field is NOT NULL."
+            "Partial Update requires omitted columns except primary key and auto increment columns to be nullable, but omitted column required_field is NOT NULL."
         ));
+
+        // A selected non-nullable column is supplied and is therefore valid.
+        let target_columns = Some(Arc::new(vec![0usize, 1]));
+        UpsertWriterFactory::sanity_check(
+            &row_type,
+            &primary_keys,
+            &auto_increment_col_names,
+            &target_columns,
+        )
+        .expect("selected non-nullable column should be allowed");
     }
 }
 
