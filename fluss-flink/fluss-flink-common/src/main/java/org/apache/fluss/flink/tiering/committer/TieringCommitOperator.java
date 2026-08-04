@@ -205,6 +205,8 @@ public class TieringCommitOperator<WriteResult, Committable>
                     "Commit tiering write results is empty for table {}, table path {}",
                     tableId,
                     tablePath);
+            // still run partition mark-done maintenance for the empty round
+            maybeCommitMarkDoneMaintenance(tableId, tablePath);
             return new CommitResult(null, null);
         }
 
@@ -272,6 +274,46 @@ public class TieringCommitOperator<WriteResult, Committable>
                     logMaxTieredTimestamps);
             return new CommitResult(committable, lakeCommitResult.getTieringStats());
         }
+    }
+
+    /**
+     * Runs partition mark-done maintenance for an empty tiering round, and commits the resulting
+     * properties-only lake snapshot (if any) to Fluss.
+     */
+    private void maybeCommitMarkDoneMaintenance(long tableId, TablePath tablePath)
+            throws Exception {
+        TableInfo tableInfo = admin.getTableInfo(tablePath).get();
+        if (tableInfo.getTableId() != tableId || !isPartitionMarkDoneEnabled(tableInfo)) {
+            return;
+        }
+        try (LakeCommitter<WriteResult, Committable> lakeCommitter =
+                lakeTieringFactory.createLakeCommitter(
+                        new TieringCommitterInitContext(
+                                tablePath, tableInfo, lakeTieringConfig, flussConfig))) {
+            CommittedLakeSnapshot maintenanceSnapshot = lakeCommitter.commitMarkDoneMaintenance();
+            if (maintenanceSnapshot != null) {
+                flussTableLakeSnapshotCommitter.commit(
+                        tableId,
+                        maintenanceSnapshot.getLakeSnapshotId(),
+                        maintenanceSnapshot
+                                .getSnapshotProperties()
+                                .get(FLUSS_LAKE_SNAP_BUCKET_OFFSET_PROPERTY),
+                        null,
+                        // no data was written in this round
+                        Collections.emptyMap(),
+                        Collections.emptyMap(),
+                        LakeCommitResult.KEEP_ALL_PREVIOUS);
+            }
+        }
+    }
+
+    /** Enabled iff the table is partitioned and sets Paimon's partition.idle-time-to-done. */
+    public static boolean isPartitionMarkDoneEnabled(TableInfo tableInfo) {
+        return tableInfo.isPartitioned()
+                && tableInfo
+                        .getCustomProperties()
+                        .toMap()
+                        .containsKey("paimon.partition.idle-time-to-done");
     }
 
     @Nullable
