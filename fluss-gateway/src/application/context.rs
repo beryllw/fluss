@@ -1,0 +1,154 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Request-scoped application metadata, deadlines, and cancellation.
+
+use crate::application::types::ClusterId;
+use crate::error::GatewayError;
+use std::time::Instant;
+use tokio_util::sync::{CancellationToken, DropGuard};
+
+/// Cloneable cooperative cancellation signal shared by an adapter and the application service.
+#[derive(Debug, Clone, Default)]
+pub struct CancellationSignal(CancellationToken);
+
+impl CancellationSignal {
+    /// Marks the signal cancelled. Calling this more than once has no additional effect.
+    pub fn cancel(&self) {
+        self.0.cancel();
+    }
+
+    /// Returns whether cancellation has already been requested.
+    pub fn is_cancelled(&self) -> bool {
+        self.0.is_cancelled()
+    }
+
+    /// Waits until cancellation is requested.
+    pub async fn cancelled(&self) {
+        self.0.cancelled().await;
+    }
+
+    /// Creates an RAII guard that cancels this signal when an adapter request is dropped.
+    #[allow(dead_code)] // Used by the REST request context once endpoints call the application layer.
+    pub(crate) fn drop_guard(&self) -> DropGuard {
+        self.0.clone().drop_guard()
+    }
+}
+
+/// Metadata and lifecycle controls shared by all operations in one external request.
+#[derive(Debug, Clone)]
+pub struct RequestContext {
+    request_id: String,
+    protocol: String,
+    cluster_id: ClusterId,
+    deadline: Instant,
+    cancellation: CancellationSignal,
+}
+
+impl RequestContext {
+    /// Creates a request context with an absolute monotonic deadline.
+    pub fn new(
+        request_id: impl Into<String>,
+        protocol: impl Into<String>,
+        cluster_id: ClusterId,
+        deadline: Instant,
+        cancellation: CancellationSignal,
+    ) -> Self {
+        Self {
+            request_id: request_id.into(),
+            protocol: protocol.into(),
+            cluster_id,
+            deadline,
+            cancellation,
+        }
+    }
+
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
+    pub fn protocol(&self) -> &str {
+        &self.protocol
+    }
+
+    pub fn cluster_id(&self) -> &ClusterId {
+        &self.cluster_id
+    }
+
+    pub fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    pub fn cancellation(&self) -> &CancellationSignal {
+        &self.cancellation
+    }
+
+    /// Rejects work that has already been cancelled or has no time remaining.
+    pub fn ensure_active(&self) -> Result<(), GatewayError> {
+        if self.cancellation.is_cancelled() {
+            return Err(GatewayError::cancelled("request was cancelled"));
+        }
+        if Instant::now() >= self.deadline {
+            return Err(GatewayError::deadline_exceeded("request deadline exceeded"));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn cluster_id() -> ClusterId {
+        ClusterId::try_from("default").unwrap()
+    }
+
+    #[test]
+    fn rejects_cancelled_request() {
+        let cancellation = CancellationSignal::default();
+        let context = RequestContext::new(
+            "request-1",
+            "rest",
+            cluster_id(),
+            Instant::now() + Duration::from_secs(1),
+            cancellation.clone(),
+        );
+        cancellation.cancel();
+
+        assert_eq!(
+            context.ensure_active().unwrap_err().kind(),
+            crate::error::ErrorKind::Cancelled
+        );
+    }
+
+    #[test]
+    fn rejects_expired_request() {
+        let context = RequestContext::new(
+            "request-1",
+            "rest",
+            cluster_id(),
+            Instant::now(),
+            CancellationSignal::default(),
+        );
+
+        assert_eq!(
+            context.ensure_active().unwrap_err().kind(),
+            crate::error::ErrorKind::DeadlineExceeded
+        );
+    }
+}

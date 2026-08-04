@@ -1,0 +1,98 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# The gateway is its own Cargo workspace. It depends on the Rust client by
+# path but deliberately stays out of the workspace rooted at ../fluss-rust so
+# that gateway dependencies never touch that workspace's lock file or its
+# generated dependency inventories.
+[workspace]
+resolver = "2"
+
+[package]
+name = "fluss-gateway"
+edition = "2024"
+version = "1.0.0"
+license = "Apache-2.0"
+rust-version = "1.85"
+authors = ["Apache Fluss <dev@fluss.apache.org>"]
+repository = "https://github.com/apache/fluss"
+publish = false
+description = "Stateless REST gateway for Apache Fluss"
+
+[[bin]]
+name = "fluss-gateway"
+path = "src/main.rs"
+
+[lib]
+name = "fluss_gateway"
+
+[features]
+# Compiles the fixture-backed `TestBackend` for out-of-crate integration
+# tests. This is not a default feature or a shippable runtime mode. The
+# self dev-dependency below turns it on for every test build, so a plain
+# `cargo test` exercises the tests that need it.
+test-backend = []
+# Compiles the end-to-end suite in tests/e2e_cluster.rs, which starts a
+# dockerized Fluss cluster. Mirrors the `integration_tests` feature of the
+# fluss-rs crate and is never enabled by default.
+integration_tests = []
+
+[dependencies]
+fluss = { package = "fluss-rs", version = "1.0.0", path = "../fluss-rust/crates/fluss" }
+arrow = { version = "59.0.0", features = ["ipc_compression", "ffi"] }
+async-trait = "0.1"
+axum = { version = "0.8", default-features = false, features = ["http1", "matched-path", "tokio"] }
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+clap = { version = "4.5.37", features = ["derive"] }
+toml = "0.8"
+futures = "0.3"
+log = "0.4"
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.17", default-features = false }
+parking_lot = "0.12"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_urlencoded = "0.7"
+tokio = { version = "1.44.2", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+utoipa = { version = "5", features = ["axum_extras"] }
+utoipa-axum = "0.2"
+uuid = { version = "1.10", features = ["v4"] }
+
+[dev-dependencies]
+fluss-gateway = { path = ".", features = ["test-backend"] }
+fluss-test-cluster = { path = "../fluss-rust/crates/fluss-test-cluster" }
+http-body-util = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+tempfile = "3"
+tokio = { version = "1.44.2", features = ["full", "test-util"] }
+tower = { version = "0.5", features = ["util"] }
+
+# Every integration test target is declared explicitly so a later phase never
+# has to add one. None of them carry `required-features`: a test that cannot
+# compile must fail the gate loudly instead of being skipped silently.
+# `tests/e2e_cluster.rs` guards its own body with `#![cfg(feature =
+# "integration_tests")]`, so it compiles to an empty binary by default.
+[[test]]
+name = "http_api"
+
+[[test]]
+name = "statelessness"
+
+[[test]]
+name = "e2e_cluster"
