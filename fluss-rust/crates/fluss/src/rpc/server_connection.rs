@@ -23,6 +23,7 @@ use crate::metrics::{
     api_key_label,
 };
 use crate::proto::PbApiVersion;
+use crate::rpc::FlussError;
 use crate::rpc::api_key::ApiKey;
 use crate::rpc::api_version::ApiVersion;
 use crate::rpc::error::RpcError;
@@ -182,6 +183,7 @@ pub struct RpcClient {
     connections: RwLock<HashMap<String, ServerConnection>>,
     client_id: Arc<str>,
     timeout: Option<Duration>,
+    request_timeout: Option<Duration>,
     max_message_size: usize,
     sasl_config: Option<SaslConfig>,
 }
@@ -192,9 +194,17 @@ impl RpcClient {
             connections: Default::default(),
             client_id: Arc::from(""),
             timeout: None,
+            request_timeout: None,
             max_message_size: usize::MAX,
             sasl_config: None,
         }
+    }
+
+    /// Bounds how long a single request may take from send to response. Without it a request waits
+    /// for the server indefinitely.
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = Some(timeout);
+        self
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
@@ -244,10 +254,11 @@ impl RpcClient {
             .await
             .map_err(|error| ConnectionError(error.to_string()))?;
 
-        let messenger = ServerConnectionInner::new(
+        let messenger = ServerConnectionInner::new_with_request_timeout(
             BufStream::new(transport),
             self.max_message_size,
             self.client_id.clone(),
+            self.request_timeout,
         );
         let connection = ServerConnection::new(messenger);
 
@@ -451,6 +462,8 @@ pub struct ServerConnectionInner<RW> {
 
     state: Arc<Mutex<ConnectionState>>,
 
+    request_timeout: Option<Duration>,
+
     /// Negotiated API versions for this connection.
     /// `None` until the ApiVersions handshake completes.
     api_versions: Mutex<Option<ServerApiVersions>>,
@@ -463,6 +476,17 @@ where
     RW: AsyncRead + AsyncWrite + Send + 'static,
 {
     pub fn new(stream: RW, max_message_size: usize, client_id: Arc<str>) -> Self {
+        Self::new_with_request_timeout(stream, max_message_size, client_id, None)
+    }
+
+    /// Same as [`new`](Self::new), but bounds how long each request waits for its response.
+    /// `None` waits forever.
+    fn new_with_request_timeout(
+        stream: RW,
+        max_message_size: usize,
+        client_id: Arc<str>,
+        request_timeout: Option<Duration>,
+    ) -> Self {
         let (stream_read, stream_write) = tokio::io::split(stream);
         let state = Arc::new(Mutex::new(ConnectionState::RequestMap(HashMap::default())));
         let state_captured = Arc::clone(&state);
@@ -523,6 +547,7 @@ where
             client_id,
             request_id: AtomicI32::new(0),
             state,
+            request_timeout,
             api_versions: Mutex::new(None),
             join_handle,
         }
@@ -562,8 +587,7 @@ where
 
         let (tx, rx) = channel();
 
-        // to prevent stale data in inner state, ensure that we would remove the request again if we are cancelled while
-        // sending the request
+        // Keep the request map cancellation-safe for the full request lifecycle.
         let _cleanup_on_cancel =
             CleanupRequestStateOnCancel::new(Arc::clone(&self.state), request_id);
 
@@ -578,18 +602,30 @@ where
         let request_body_bytes = buf.len().saturating_sub(REQUEST_HEADER_LENGTH) as u64;
         let mut request_metrics = RequestMetricsLifecycle::begin(R::API_KEY, request_body_bytes);
 
-        self.send_message(buf)
-            .await
-            .inspect_err(|_| request_metrics.complete(0))?;
-        _cleanup_on_cancel.message_sent();
-        let mut response = rx
-            .await
-            .map_err(|e| Error::UnexpectedError {
-                message: "Receive error: response channel closed".to_string(),
-                source: Some(Box::new(e)),
-            })
-            .and_then(|r| r.map_err(Error::from))
-            .inspect_err(|_| request_metrics.complete(0))?;
+        let request = async {
+            self.send_message(buf).await.map_err(Error::from)?;
+            rx.await
+                .map_err(|e| Error::UnexpectedError {
+                    message: "Receive error: response channel closed".to_string(),
+                    source: Some(Box::new(e)),
+                })?
+                .map_err(Error::from)
+        };
+        let response = if let Some(timeout) = self.request_timeout {
+            match tokio::time::timeout(timeout, request).await {
+                Ok(response) => response,
+                Err(_) => Err(Error::FlussAPIError {
+                    api_error: FlussError::RequestTimeOut.to_api_error(Some(format!(
+                        "RPC request {request_id} for {:?} timed out after {} milliseconds",
+                        R::API_KEY,
+                        timeout.as_millis()
+                    ))),
+                }),
+            }
+        } else {
+            request.await
+        };
+        let mut response = response.inspect_err(|_| request_metrics.complete(0))?;
 
         // count only the API message body, excluding the response header.
         let response_bytes =
@@ -729,37 +765,29 @@ where
     }
 }
 
-/// Helper that ensures that a request is removed when a request is cancelled before it was actually sent out.
+/// Removes a request from the connection request map when the request future is dropped.
+///
+/// This applies to *every* dropped request future, not only ones cancelled before the frame was
+/// written: a request lost to `select!`, aborted by the caller, or cut short by the request
+/// timeout also drops here. The entry is removed unconditionally, because a caller that is gone
+/// would otherwise leave the entry in the map forever. A response that arrives afterwards finds no
+/// entry, is ignored, and does not poison the connection.
 struct CleanupRequestStateOnCancel {
     state: Arc<Mutex<ConnectionState>>,
     request_id: i32,
-    message_sent: bool,
 }
 
 impl CleanupRequestStateOnCancel {
     /// Create new helper.
-    ///
-    /// You must call [`message_sent`](Self::message_sent) when the request was sent.
     fn new(state: Arc<Mutex<ConnectionState>>, request_id: i32) -> Self {
-        Self {
-            state,
-            request_id,
-            message_sent: false,
-        }
-    }
-
-    /// Request was sent. Do NOT clean the state any longer.
-    fn message_sent(mut self) {
-        self.message_sent = true;
+        Self { state, request_id }
     }
 }
 
 impl Drop for CleanupRequestStateOnCancel {
     fn drop(&mut self) {
-        if !self.message_sent {
-            if let ConnectionState::RequestMap(map) = self.state.lock().deref_mut() {
-                map.remove(&self.request_id);
-            }
+        if let ConnectionState::RequestMap(map) = self.state.lock().deref_mut() {
+            map.remove(&self.request_id);
         }
     }
 }
@@ -888,6 +916,42 @@ mod tests {
             let resp_len = (resp.len() as i32).to_be_bytes();
             if stream.write_all(&resp_len).await.is_err()
                 || stream.write_all(&resp).await.is_err()
+                || stream.flush().await.is_err()
+            {
+                return;
+            }
+        }
+    }
+
+    /// Delays only the first response, then echoes subsequent responses immediately.
+    async fn mock_delayed_first_response_server(
+        mut stream: tokio::io::DuplexStream,
+        first_delay: Duration,
+    ) {
+        let mut first = true;
+        loop {
+            let mut len_buf = [0u8; 4];
+            if stream.read_exact(&mut len_buf).await.is_err() {
+                return;
+            }
+            let len = i32::from_be_bytes(len_buf) as usize;
+            let mut payload = vec![0u8; len];
+            if stream.read_exact(&mut payload).await.is_err() {
+                return;
+            }
+            let request_id = i32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+
+            if first {
+                first = false;
+                tokio::time::sleep(first_delay).await;
+            }
+
+            let mut response = Vec::with_capacity(5);
+            response.push(0u8);
+            response.extend_from_slice(&request_id.to_be_bytes());
+            let response_len = (response.len() as i32).to_be_bytes();
+            if stream.write_all(&response_len).await.is_err()
+                || stream.write_all(&response).await.is_err()
                 || stream.flush().await.is_err()
             {
                 return;
@@ -1175,6 +1239,110 @@ mod tests {
             inflight_after, 0.0,
             "in-flight gauge must return to zero after API error"
         );
+    }
+
+    #[tokio::test]
+    async fn request_timeout_removes_state_and_late_response_is_safe() {
+        let _test_guard = test_lock().lock().await;
+        let (client, server) = tokio::io::duplex(4096);
+        tokio::spawn(mock_delayed_first_response_server(
+            server,
+            Duration::from_millis(30),
+        ));
+
+        let conn = ServerConnectionInner::new_with_request_timeout(
+            BufStream::new(client),
+            usize::MAX,
+            Arc::from("t"),
+            Some(Duration::from_millis(5)),
+        );
+        *conn.api_versions.lock() = Some(ServerApiVersions::new(&[PbApiVersion {
+            api_key: 1012,
+            min_version: 0,
+            max_version: 0,
+        }]));
+
+        let result = conn.request(TestMetadataRequest).await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("delayed request did not time out"),
+        };
+        assert_eq!(error.api_error(), Some(FlussError::RequestTimeOut));
+        assert!(matches!(
+            &*conn.state.lock(),
+            ConnectionState::RequestMap(map) if map.is_empty()
+        ));
+
+        // Let the delayed response arrive. It has no active waiter and must not
+        // poison the connection or interfere with the next request.
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        conn.request(TestMetadataRequest).await.unwrap();
+        assert!(!conn.is_poisoned());
+        assert!(matches!(
+            &*conn.state.lock(),
+            ConnectionState::RequestMap(map) if map.is_empty()
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancelled_request_removes_state_after_send() {
+        let _test_guard = test_lock().lock().await;
+        let (client, mut server) = tokio::io::duplex(4096);
+        let request_read = Arc::new(tokio::sync::Notify::new());
+        let send_response = Arc::new(tokio::sync::Notify::new());
+        let finish_server = Arc::new(tokio::sync::Notify::new());
+        let server_request_read = Arc::clone(&request_read);
+        let server_send_response = Arc::clone(&send_response);
+        let server_finish = Arc::clone(&finish_server);
+        tokio::spawn(async move {
+            let mut len_buf = [0u8; 4];
+            server.read_exact(&mut len_buf).await.unwrap();
+            let len = i32::from_be_bytes(len_buf) as usize;
+            let mut payload = vec![0u8; len];
+            server.read_exact(&mut payload).await.unwrap();
+            let request_id = i32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+            server_request_read.notify_one();
+            server_send_response.notified().await;
+            let mut response = vec![0u8];
+            response.extend_from_slice(&request_id.to_be_bytes());
+            server
+                .write_all(&(response.len() as i32).to_be_bytes())
+                .await
+                .unwrap();
+            server.write_all(&response).await.unwrap();
+            server.flush().await.unwrap();
+            server_finish.notified().await;
+        });
+
+        let conn = Arc::new(ServerConnectionInner::new(
+            BufStream::new(client),
+            usize::MAX,
+            Arc::from("t"),
+        ));
+        *conn.api_versions.lock() = Some(ServerApiVersions::new(&[PbApiVersion {
+            api_key: 1012,
+            min_version: 0,
+            max_version: 0,
+        }]));
+        let task = tokio::spawn({
+            let conn = Arc::clone(&conn);
+            async move { conn.request(TestMetadataRequest).await }
+        });
+        request_read.notified().await;
+        task.abort();
+        match task.await {
+            Err(error) => assert!(error.is_cancelled()),
+            Ok(_) => panic!("request task should have been cancelled"),
+        }
+        assert!(matches!(
+            &*conn.state.lock(),
+            ConnectionState::RequestMap(map) if map.is_empty()
+        ));
+
+        send_response.notify_one();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert!(!conn.is_poisoned());
+        finish_server.notify_one();
     }
 
     #[tokio::test]

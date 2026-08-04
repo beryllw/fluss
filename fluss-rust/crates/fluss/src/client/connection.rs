@@ -42,6 +42,15 @@ pub struct FlussConnection {
 
 impl FlussConnection {
     pub async fn new(arg: Config) -> Result<Self> {
+        Self::new_inner(arg, None).await
+    }
+
+    /// Creates a connection whose individual RPCs are bounded by `request_timeout`.
+    pub async fn new_with_request_timeout(arg: Config, request_timeout: Duration) -> Result<Self> {
+        Self::new_inner(arg, Some(request_timeout)).await
+    }
+
+    async fn new_inner(arg: Config, request_timeout: Option<Duration>) -> Result<Self> {
         arg.validate_security()
             .map_err(|msg| Error::IllegalArgument { message: msg })?;
         arg.validate_scanner()
@@ -52,17 +61,18 @@ impl FlussConnection {
         let timeout = Duration::from_millis(arg.connect_timeout_ms);
         // connect_timeout_ms: no lower-bound validation to match Java behavior.
         // Java allows 0 — tracked in https://github.com/apache/fluss/issues/3068
+        let rpc_client = RpcClient::new().with_timeout(timeout);
+        let rpc_client = match request_timeout {
+            Some(timeout) => rpc_client.with_request_timeout(timeout),
+            None => rpc_client,
+        };
         let connections = if arg.is_sasl_enabled() {
-            Arc::new(
-                RpcClient::new()
-                    .with_sasl(
-                        arg.security_sasl_username.clone(),
-                        arg.security_sasl_password.clone(),
-                    )
-                    .with_timeout(timeout),
-            )
+            Arc::new(rpc_client.with_sasl(
+                arg.security_sasl_username.clone(),
+                arg.security_sasl_password.clone(),
+            ))
         } else {
-            Arc::new(RpcClient::new().with_timeout(timeout))
+            Arc::new(rpc_client)
         };
         let metadata = Metadata::new(arg.bootstrap_servers.as_str(), connections.clone()).await?;
 
