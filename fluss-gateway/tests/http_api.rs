@@ -91,30 +91,18 @@ async fn an_unknown_route_returns_the_shared_error_envelope() {
     instance.shutdown().await;
 }
 
-/// Every data-plane route is mounted and answers with a 501 envelope until its path is implemented.
+/// The write and lookup routes are mounted and answer with a 501 envelope until their path is implemented.
 ///
 /// The point of the assertion is the *shape*: a registered route must never panic, never return a bare 500, and
-/// never fall through to the 404 fallback.
+/// never fall through to the 404 fallback. The metadata and DDL routes are no longer listed here — they are
+/// implemented, so their real behaviour is covered by the journey test below and by their handler tests.
 #[tokio::test]
 async fn every_data_plane_route_is_mounted_and_answers_with_an_unsupported_envelope() {
     let instance = gateway().await;
-    let base = "/v1/clusters/default/databases";
-    let table = format!("{base}/fluss/tables/users");
+    let table = "/v1/clusters/default/databases/fluss/tables/users";
 
     let mut responses = Vec::new();
     for path in [
-        base.to_string(),
-        format!("{base}/fluss"),
-        format!("{base}/fluss/tables"),
-        table.clone(),
-        format!("{table}/partitions"),
-    ] {
-        responses.push((path.clone(), instance.api.get(&path).await));
-    }
-    for path in [
-        base.to_string(),
-        format!("{base}/fluss/tables"),
-        format!("{table}/partitions"),
         format!("{table}/records"),
         format!("{table}/records/lookup"),
         format!("{table}/records/prefix-lookup"),
@@ -124,17 +112,6 @@ async fn every_data_plane_route_is_mounted_and_answers_with_an_unsupported_envel
             instance.api.post_json(&path, &json!({})).await,
         ));
     }
-    responses.push((
-        table.clone(),
-        instance.api.patch_json(&table, &json!({})).await,
-    ));
-    for path in [
-        format!("{base}/fluss"),
-        table.clone(),
-        format!("{table}/partitions/eu"),
-    ] {
-        responses.push((path.clone(), instance.api.delete(&path).await));
-    }
 
     for (path, response) in responses {
         assert_eq!(response.status(), 501, "{path}");
@@ -142,6 +119,50 @@ async fn every_data_plane_route_is_mounted_and_answers_with_an_unsupported_envel
         assert_eq!(body["error"]["code"], "UNSUPPORTED", "{path}");
         assert_eq!(body["error"]["retryable"], false, "{path}");
     }
+
+    instance.shutdown().await;
+}
+
+/// The catalog is readable and mutable end to end over the real listener, and paging is stateless.
+#[tokio::test]
+async fn the_catalog_can_be_read_and_mutated_over_the_real_listener() {
+    let instance = gateway().await;
+    let base = "/v1/clusters/default/databases";
+
+    let created = instance
+        .api
+        .post_json(base, &json!({"name": "analytics"}))
+        .await;
+    assert_eq!(created.status(), 201);
+    assert_eq!(
+        created.headers()["location"],
+        "/v1/clusters/default/databases/analytics"
+    );
+
+    // A one-entry page carries a token; the page after it is derived from the token alone, with nothing retained
+    // between the two requests.
+    let first = instance.api.get_ok(&format!("{base}?max_results=1")).await;
+    assert_eq!(first["databases"], json!(["analytics"]));
+    let token = first["next_page_token"].as_str().expect("token");
+    let second = instance
+        .api
+        .get_ok(&format!("{base}?page_token={token}"))
+        .await;
+    assert_eq!(second["databases"], json!(["fluss"]));
+    assert!(
+        second.get("next_page_token").is_none(),
+        "last page: {second}"
+    );
+
+    let table = instance
+        .api
+        .get_ok(&format!("{base}/fluss/tables/users"))
+        .await;
+    assert_eq!(table["kind"], "PRIMARY_KEY");
+    assert!(table["table_id"].is_string(), "64-bit-safe table id");
+
+    let dropped = instance.api.delete(&format!("{base}/analytics")).await;
+    assert_eq!(dropped.status(), 204);
 
     instance.shutdown().await;
 }
@@ -172,13 +193,12 @@ async fn an_unknown_cluster_is_not_found_rather_than_unavailable() {
 
     let response = instance.api.get("/v1/clusters/missing/databases").await;
 
-    // The route exists for every cluster id; only the cluster lookup can fail here. Until the catalog read path
-    // lands the handler short-circuits, so assert the request is served rather than dropped.
-    assert!(
-        response.status() == 404 || response.status() == 501,
-        "unexpected status {}",
-        response.status()
-    );
+    // The route exists for every cluster id, so the only thing that can fail here is the cluster lookup itself:
+    // an unconfigured cluster is a missing resource, never a transient backend outage.
+    assert_eq!(response.status(), 404);
+    let body: serde_json::Value = response.json().await.expect("JSON body");
+    assert_eq!(body["error"]["code"], "NOT_FOUND");
+    assert_eq!(body["error"]["details"]["resource_kind"], "cluster");
 
     instance.shutdown().await;
 }
