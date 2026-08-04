@@ -89,8 +89,16 @@ pub struct ColumnDescription {
 pub struct TableCapabilities {
     /// Exact primary-key lookup is available (PK table whose KV format/key encoder the native client can encode).
     pub exact_lookup_supported: bool,
-    /// Bounded prefix lookup is available: a PK table whose bucket keys are a strict prefix of the physical
-    /// primary key, so a prefix that covers the bucket keys routes to a single bucket.
+    /// Bounded prefix lookup is plausible: a PK table with non-empty bucket keys that are a (not necessarily
+    /// strict) prefix of the physical primary key, so a prefix covering the bucket keys routes to one bucket.
+    ///
+    /// This is an advisory hint mirroring part of the client's own `validate_prefix_lookup`, not a decision
+    /// procedure. The client applies further rules that depend on the requested prefix columns rather than on
+    /// table metadata alone — notably that the columns must equal the bucket keys in order once partition keys
+    /// are removed, and that a prefix equal to the whole primary key is rejected in favour of a point lookup.
+    /// Callers must therefore attempt lookuper construction and surface the client's `IllegalArgument` message
+    /// as a 400; refusing a request on this flag alone would reject prefix lookups that in fact work (a
+    /// partitioned table whose bucket keys equal its physical primary key is the motivating case).
     pub prefix_lookup_supported: bool,
 }
 
