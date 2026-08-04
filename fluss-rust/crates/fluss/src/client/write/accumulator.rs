@@ -291,11 +291,17 @@ impl RecordAccumulator {
     ) -> Result<RecordAppendResult> {
         let physical_table_path = &record.physical_table_path;
         let table_path = physical_table_path.get_table_path();
-        let table_info = cluster.get_table(table_path)?;
-        let arrow_compression_info = table_info.get_table_config().get_arrow_compression_info()?;
-        let row_type = &table_info.row_type;
+        // Validate the table is known to the cluster, but build the batch from the record's own
+        // table info and schema id: a batch must describe the record that will start it, not
+        // whatever the cluster cache happens to hold.
+        cluster.get_table(table_path)?;
+        let arrow_compression_info = record
+            .table_info
+            .get_table_config()
+            .get_arrow_compression_info()?;
+        let row_type = &record.table_info.row_type;
 
-        let schema_id = table_info.schema_id;
+        let schema_id = record.schema_id;
 
         let mut batch: WriteBatch = match record.record() {
             Record::Log(_) => ArrowLog(ArrowLogWriteBatch::new(
@@ -1980,5 +1986,76 @@ mod tests {
         };
         assert_eq!(error.api_error(), Some(FlussError::RequestTimeOut));
         assert!(!accumulator.has_undrained());
+    }
+
+    #[test]
+    fn incompatible_schema_and_target_columns_roll_over_batches() {
+        let accumulator = RecordAccumulator::new(Config::default(), disabled_idempotence());
+        let table_path = TablePath::new("db".to_string(), "tbl".to_string());
+        let table_info = Arc::new(build_table_info(table_path.clone(), 1, 1));
+        let physical_path = Arc::new(PhysicalTablePath::of(Arc::new(table_path.clone())));
+        let cluster = Arc::new(build_cluster(&table_path, 1, 1));
+        let row = GenericRow {
+            values: vec![Datum::Int32(1)],
+        };
+        let schema_one =
+            WriteRecord::for_append(Arc::clone(&table_info), Arc::clone(&physical_path), 1, &row);
+        let schema_two =
+            WriteRecord::for_append(Arc::clone(&table_info), Arc::clone(&physical_path), 2, &row);
+        accumulator.append(&schema_one, 0, &cluster, false).unwrap();
+        accumulator.append(&schema_two, 0, &cluster, false).unwrap();
+        assert_eq!(
+            accumulator
+                .write_batches
+                .get(&physical_path)
+                .unwrap()
+                .batches
+                .get(&0)
+                .unwrap()
+                .lock()
+                .len(),
+            2
+        );
+
+        let kv_accumulator = RecordAccumulator::new(Config::default(), disabled_idempotence());
+        let other_path = Arc::new(PhysicalTablePath::of(Arc::new(table_path)));
+        let first_target = WriteRecord::for_upsert(
+            Arc::clone(&table_info),
+            Arc::clone(&other_path),
+            1,
+            Bytes::from_static(b"key-1"),
+            None,
+            WriteFormat::CompactedKv,
+            Some(Arc::new(vec![0])),
+            Some(RowBytes::Owned(Bytes::from_static(b"value-1"))),
+        );
+        let second_target = WriteRecord::for_upsert(
+            table_info,
+            Arc::clone(&other_path),
+            1,
+            Bytes::from_static(b"key-2"),
+            None,
+            WriteFormat::CompactedKv,
+            Some(Arc::new(vec![0, 1])),
+            Some(RowBytes::Owned(Bytes::from_static(b"value-2"))),
+        );
+        kv_accumulator
+            .append(&first_target, 0, &cluster, false)
+            .unwrap();
+        kv_accumulator
+            .append(&second_target, 0, &cluster, false)
+            .unwrap();
+        assert_eq!(
+            kv_accumulator
+                .write_batches
+                .get(&other_path)
+                .unwrap()
+                .batches
+                .get(&0)
+                .unwrap()
+                .lock()
+                .len(),
+            2
+        );
     }
 }

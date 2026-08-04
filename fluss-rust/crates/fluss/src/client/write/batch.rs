@@ -272,6 +272,8 @@ pub struct ArrowLogWriteBatch {
     pub write_batch: InnerWriteBatch,
     pub arrow_builder: MemoryLogRecordsArrowBuilder,
     built_records: Option<Bytes>,
+    schema_id: i32,
+    accepts_record_batch: bool,
 }
 
 impl ArrowLogWriteBatch {
@@ -299,6 +301,8 @@ impl ArrowLogWriteBatch {
                 compression_ratio_estimator,
             )?,
             built_records: None,
+            schema_id,
+            accepts_record_batch: to_append_record_batch,
         })
     }
 
@@ -307,6 +311,21 @@ impl ArrowLogWriteBatch {
     }
 
     pub fn try_append(&mut self, write_record: &WriteRecord) -> Result<Option<ResultHandle>> {
+        // A record this batch cannot encode is not an error: close the batch and report "no
+        // room", so the caller rolls over to a fresh batch built for that record.
+        if !matches!(write_record.record(), Record::Log(_)) {
+            self.close();
+            return Ok(None);
+        }
+        let is_record_batch = matches!(
+            write_record.record(),
+            Record::Log(crate::client::LogWriteRecord::RecordBatch(_))
+        );
+        if self.schema_id != write_record.schema_id || self.accepts_record_batch != is_record_batch
+        {
+            self.close();
+            return Ok(None);
+        }
         if self.arrow_builder.is_closed() || self.arrow_builder.is_full() {
             Ok(None)
         } else {
@@ -388,36 +407,26 @@ impl KvWriteBatch {
     }
 
     pub fn try_append(&mut self, write_record: &WriteRecord) -> Result<Option<ResultHandle>> {
+        // A record this batch cannot encode is not an error: close the batch and report "no
+        // room", so the caller rolls over to a fresh batch built for that record.
         let kv_write_record = match &write_record.record {
             Record::Kv(record) => record,
             _ => {
-                return Err(Error::UnsupportedOperation {
-                    message: "Only KvRecord to append to KvWriteBatch ".to_string(),
-                });
+                self.close()?;
+                return Ok(None);
             }
         };
 
         let key = kv_write_record.key.as_ref();
 
         if self.schema_id != write_record.schema_id {
-            return Err(Error::UnexpectedError {
-                message: format!(
-                    "schema id {} of the write record to append is not the same as the current schema id {} in the batch.",
-                    write_record.schema_id, self.schema_id
-                ),
-                source: None,
-            });
+            self.close()?;
+            return Ok(None);
         };
 
         if self.target_columns != kv_write_record.target_columns {
-            return Err(Error::UnexpectedError {
-                message: format!(
-                    "target columns {:?} of the write record to append are not the same as the current target columns {:?} in the batch.",
-                    kv_write_record.target_columns,
-                    self.target_columns.as_deref()
-                ),
-                source: None,
-            });
+            self.close()?;
+            return Ok(None);
         }
 
         let row_bytes = kv_write_record.row_bytes();

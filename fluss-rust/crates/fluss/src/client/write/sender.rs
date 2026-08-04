@@ -20,6 +20,7 @@ use crate::client::metadata::Metadata;
 use crate::client::write::IdempotenceManager;
 use crate::client::write::batch::WriteBatch;
 use crate::client::{ReadyWriteBatch, RecordAccumulator};
+use crate::cluster::ServerNode;
 use crate::error::Error::UnexpectedError;
 use crate::error::{FlussError, Result};
 use crate::metadata::{PhysicalTablePath, TableBucket, TablePath};
@@ -326,11 +327,6 @@ impl Sender {
         }
         let batches = sendable_batches;
 
-        // The connect phase is shared by every batch below, so it is bounded by the strictest
-        // deadline in the whole drained set.
-        let send_started = Instant::now();
-        let overall_timeout = self.request_timeout(&batches);
-
         // Record attempted-send per-batch metrics for the whole drained set
         // up front, before any early return (unknown leader, connection
         // failure) can drop batches. So a leader/connection failure
@@ -339,16 +335,17 @@ impl Sender {
         // send attempt.
         self.record_request_batch_metrics(&batches);
 
-        let mut records_by_bucket = HashMap::new();
-        let mut write_batch_by_table: HashMap<TableId, Vec<TableBucket>> = HashMap::new();
+        // One wire request can only carry batches the request shape can describe, so batches
+        // are grouped by table plus the properties that are fixed for the whole request.
+        let mut compatible_batches: HashMap<(TableId, WriteRequestKey), Vec<ReadyWriteBatch>> =
+            HashMap::new();
 
         for batch in batches {
-            let table_bucket = batch.table_bucket.clone();
-            write_batch_by_table
-                .entry(table_bucket.table_id())
+            let request_key = WriteRequestKey::for_batch(&batch.write_batch);
+            compatible_batches
+                .entry((batch.table_bucket.table_id(), request_key))
                 .or_default()
-                .push(table_bucket.clone());
-            records_by_bucket.insert(table_bucket, batch);
+                .push(batch);
         }
 
         let cluster = self.metadata.get_cluster();
@@ -357,31 +354,110 @@ impl Sender {
             Some(node) => node,
             None => {
                 self.handle_batches_with_error(
-                    records_by_bucket.into_values().collect(),
+                    compatible_batches.into_values().flatten().collect(),
                     FlussError::LeaderNotAvailableException,
                     format!("Destination node not found in metadata cache {destination}."),
                 )
                 .await?;
                 return Ok(());
             }
+        }
+        .clone();
+
+        let groups = compatible_batches
+            .into_iter()
+            .map(|((table_id, _), batches)| (table_id, batches))
+            .collect();
+        self.send_compatible_groups(destination_node, destination, acks, groups)
+            .await
+    }
+
+    /// Runs every compatible group concurrently so one group's deadline never bounds another's.
+    async fn send_compatible_groups(
+        &self,
+        destination_node: ServerNode,
+        destination: i32,
+        acks: i16,
+        groups: Vec<(TableId, Vec<ReadyWriteBatch>)>,
+    ) -> Result<()> {
+        let mut sends = FuturesUnordered::new();
+        for (table_id, request_batches) in groups {
+            sends.push(self.send_compatible_group(
+                destination_node.clone(),
+                destination,
+                table_id,
+                acks,
+                request_batches,
+            ));
+        }
+        while let Some(result) = sends.next().await {
+            result?;
+        }
+        Ok(())
+    }
+
+    async fn send_compatible_group(
+        &self,
+        destination_node: ServerNode,
+        destination: i32,
+        table_id: TableId,
+        acks: i16,
+        mut request_batches: Vec<ReadyWriteBatch>,
+    ) -> Result<()> {
+        if request_batches.is_empty() {
+            return Ok(());
+        }
+
+        let table_buckets: Vec<TableBucket> = request_batches
+            .iter()
+            .map(|batch| batch.table_bucket.clone())
+            .collect();
+        let mut records_by_bucket = HashMap::new();
+
+        let request_started = Instant::now();
+        let request_timeout = self.request_timeout(&request_batches);
+        if request_timeout.is_zero() {
+            for batch in request_batches {
+                self.expire_batch(batch, true);
+            }
+            return Ok(());
+        }
+        let request_timeout_ms = i32::try_from(request_timeout.as_millis().max(1))
+            .unwrap_or(i32::MAX)
+            .min(self.max_request_timeout_ms);
+
+        let write_request = match Self::build_write_request(
+            table_id,
+            acks,
+            request_timeout_ms,
+            &mut request_batches,
+        ) {
+            Ok(req) => req,
+            Err(e) => {
+                self.handle_batches_with_local_error(
+                    request_batches,
+                    format!("Failed to build write request: {e}"),
+                )?;
+                return Ok(());
+            }
         };
-        let connect_timeout = overall_timeout.saturating_sub(send_started.elapsed());
+        let connect_timeout = request_timeout.saturating_sub(request_started.elapsed());
         if connect_timeout.is_zero() {
-            for batch in records_by_bucket.into_values() {
+            for batch in request_batches {
                 self.expire_batch(batch, true);
             }
             return Ok(());
         }
         let connection = match tokio::time::timeout(
             connect_timeout,
-            self.metadata.get_connection(destination_node),
+            self.metadata.get_connection(&destination_node),
         )
         .await
         {
             Ok(Ok(connection)) => connection,
             Ok(Err(e)) => {
                 self.handle_batches_with_error(
-                    records_by_bucket.into_values().collect(),
+                    request_batches,
                     FlussError::NetworkException,
                     format!("Failed to connect destination node {destination}: {e}"),
                 )
@@ -389,79 +465,34 @@ impl Sender {
                 return Ok(());
             }
             Err(_) => {
-                for batch in records_by_bucket.into_values() {
+                for batch in request_batches {
                     self.expire_batch(batch, true);
                 }
                 return Ok(());
             }
         };
-
-        for (table_id, table_buckets) in write_batch_by_table {
-            let mut request_batches: Vec<ReadyWriteBatch> = table_buckets
-                .iter()
-                .filter_map(|bucket| records_by_bucket.remove(bucket))
-                .collect();
-
-            if request_batches.is_empty() {
-                continue;
+        let request_timeout = request_timeout.saturating_sub(request_started.elapsed());
+        if request_timeout.is_zero() {
+            for batch in request_batches {
+                self.expire_batch(batch, true);
             }
-
-            // Re-check right before building: the connect phase may have consumed the
-            // remaining delivery time of this table's batches.
-            let request_timeout = self.request_timeout(&request_batches);
-            if request_timeout.is_zero() {
-                for batch in request_batches {
-                    self.expire_batch(batch, true);
-                }
-                continue;
-            }
-            let request_timeout_ms = i32::try_from(request_timeout.as_millis().max(1))
-                .unwrap_or(i32::MAX)
-                .min(self.max_request_timeout_ms);
-
-            let write_request = match Self::build_write_request(
-                table_id,
-                acks,
-                request_timeout_ms,
-                &mut request_batches,
-            ) {
-                Ok(req) => req,
-                Err(e) => {
-                    self.handle_batches_with_local_error(
-                        request_batches,
-                        format!("Failed to build write request: {e}"),
-                    )?;
-                    continue;
-                }
-            };
-
-            // Re-check once more before the wire send.
-            let request_timeout = self.request_timeout(&request_batches);
-            if request_timeout.is_zero() {
-                for batch in request_batches {
-                    self.expire_batch(batch, true);
-                }
-                continue;
-            }
-
-            // Put batches back into records_by_bucket since response handling
-            // will use them.
-            for request_batch in request_batches {
-                records_by_bucket.insert(request_batch.table_bucket.clone(), request_batch);
-            }
-
-            self.send_and_handle_response(
-                &connection,
-                write_request,
-                table_id,
-                &table_buckets,
-                &mut records_by_bucket,
-                request_timeout,
-            )
-            .await?;
+            return Ok(());
         }
 
-        Ok(())
+        // Put batches back into records_by_bucket since response handling will use them.
+        for request_batch in request_batches {
+            records_by_bucket.insert(request_batch.table_bucket.clone(), request_batch);
+        }
+
+        self.send_and_handle_response(
+            &connection,
+            write_request,
+            table_id,
+            &table_buckets,
+            &mut records_by_bucket,
+            request_timeout,
+        )
+        .await
     }
 
     fn build_write_request(
@@ -1123,6 +1154,27 @@ enum WriteRequest {
     PutKv(PutKvRequest),
 }
 
+/// Properties that a single wire request fixes for all the batches it carries. Batches that
+/// disagree on any of them must go into separate requests.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum WriteRequestKey {
+    ArrowLog,
+    Kv(Option<Vec<usize>>),
+}
+
+impl WriteRequestKey {
+    fn for_batch(batch: &WriteBatch) -> Self {
+        match batch {
+            WriteBatch::ArrowLog(_) => Self::ArrowLog,
+            WriteBatch::Kv(batch) => Self::Kv(
+                batch
+                    .target_columns()
+                    .map(|columns| columns.as_ref().clone()),
+            ),
+        }
+    }
+}
+
 trait BucketResponse {
     fn bucket_id(&self) -> BucketId;
     fn error_code(&self) -> Option<i32>;
@@ -1185,7 +1237,7 @@ impl WriteResponse for PutKvResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::{WriteOptions, WriteRecord};
+    use crate::client::{RowBytes, WriteFormat, WriteOptions, WriteRecord};
     use crate::cluster::{Cluster, ServerType};
     use crate::config::Config;
     use crate::metadata::{PhysicalTablePath, TablePath};
@@ -1323,6 +1375,187 @@ mod tests {
                 if code == FlussError::RequestTimeOut.code()
         ));
         assert!(!accumulator.has_incomplete());
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn compatible_groups_enforce_deadlines_independently() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock server");
+        let port = listener.local_addr().expect("listener addr").port();
+        let (both_requests_tx, mut both_requests_rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut len_buf = [0u8; 4];
+            stream
+                .read_exact(&mut len_buf)
+                .await
+                .expect("read ApiVersions frame length");
+            let len = i32::from_be_bytes(len_buf) as usize;
+            let mut payload = vec![0u8; len];
+            stream
+                .read_exact(&mut payload)
+                .await
+                .expect("read ApiVersions frame");
+            let request_id = i32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+            let mut body = Vec::new();
+            ApiVersionsResponse {
+                api_versions: vec![
+                    PbApiVersion {
+                        api_key: 1000,
+                        min_version: 0,
+                        max_version: 0,
+                    },
+                    PbApiVersion {
+                        api_key: 1016,
+                        min_version: 0,
+                        max_version: 0,
+                    },
+                ],
+                server_type: Some(ServerType::TabletServer.to_type_id()),
+            }
+            .encode(&mut body)
+            .expect("encode ApiVersions response");
+            let mut response = Vec::with_capacity(5 + body.len());
+            response.push(0);
+            response.extend_from_slice(&request_id.to_be_bytes());
+            response.extend_from_slice(&body);
+            stream
+                .write_all(&(response.len() as i32).to_be_bytes())
+                .await
+                .expect("write ApiVersions frame length");
+            stream
+                .write_all(&response)
+                .await
+                .expect("write ApiVersions frame");
+            stream.flush().await.expect("flush ApiVersions response");
+
+            for _ in 0..2 {
+                stream
+                    .read_exact(&mut len_buf)
+                    .await
+                    .expect("read PutKv frame length");
+                let len = i32::from_be_bytes(len_buf) as usize;
+                let mut request = vec![0u8; len];
+                stream
+                    .read_exact(&mut request)
+                    .await
+                    .expect("read PutKv frame");
+            }
+            let _ = both_requests_tx.send(());
+            std::future::pending::<()>().await;
+        });
+
+        let table_path = Arc::new(TablePath::new("db".to_string(), "tbl".to_string()));
+        let cluster = build_cluster_arc_with_port(table_path.as_ref(), 1, 2, port as u32);
+        let metadata = Arc::new(Metadata::new_for_test(cluster.clone()));
+        let destination_node = cluster.get_tablet_server(1).expect("server").clone();
+        metadata.get_connection(&destination_node).await?;
+
+        let idempotence = disabled_idempotence();
+        let accumulator = Arc::new(RecordAccumulator::new(
+            Config::default(),
+            Arc::clone(&idempotence),
+        ));
+        let sender = Arc::new(Sender::new(
+            metadata,
+            Arc::clone(&accumulator),
+            1024 * 1024,
+            120_000,
+            1,
+            0,
+            idempotence,
+            Arc::new(crate::metrics::WriterMetrics::new()),
+        ));
+        let table_info = Arc::new(build_table_info(table_path.as_ref().clone(), 1, 2));
+        let physical_path = Arc::new(PhysicalTablePath::of(table_path));
+        let long_record = WriteRecord::for_upsert(
+            Arc::clone(&table_info),
+            Arc::clone(&physical_path),
+            1,
+            bytes::Bytes::from_static(b"long"),
+            None,
+            WriteFormat::CompactedKv,
+            None,
+            Some(RowBytes::Owned(bytes::Bytes::from_static(b"long-value"))),
+        )
+        .with_options(WriteOptions::new(Instant::now() + Duration::from_secs(100)));
+        let short_record = WriteRecord::for_upsert(
+            table_info,
+            physical_path,
+            1,
+            bytes::Bytes::from_static(b"short"),
+            None,
+            WriteFormat::CompactedKv,
+            Some(Arc::new(vec![0])),
+            Some(RowBytes::Owned(bytes::Bytes::from_static(b"short-value"))),
+        )
+        .with_options(WriteOptions::new(Instant::now() + Duration::from_secs(5)));
+        let long_handle = accumulator
+            .append(&long_record, 0, &cluster, false)?
+            .result_handle
+            .expect("long result handle");
+        let short_handle = accumulator
+            .append(&short_record, 1, &cluster, false)?
+            .result_handle
+            .expect("short result handle");
+        let nodes = HashSet::from([destination_node.clone()]);
+        let mut drained = accumulator.drain(cluster, &nodes, 1024 * 1024)?;
+        let batches = drained.remove(&1).expect("drained batches");
+        let mut long_batch = None;
+        let mut short_batch = None;
+        for batch in batches {
+            if batch.table_bucket.bucket_id() == 0 {
+                long_batch = Some(batch);
+            } else {
+                short_batch = Some(batch);
+            }
+        }
+        let groups = vec![
+            (1, vec![long_batch.expect("long batch")]),
+            (1, vec![short_batch.expect("short batch")]),
+        ];
+        let send_task = {
+            let sender = Arc::clone(&sender);
+            tokio::spawn(async move {
+                sender
+                    .send_compatible_groups(destination_node, 1, 1, groups)
+                    .await
+            })
+        };
+
+        let mut both_sent = false;
+        for _ in 0..100 {
+            match both_requests_rx.try_recv() {
+                Ok(()) => {
+                    both_sent = true;
+                    break;
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                    tokio::task::yield_now().await;
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    panic!("request observer closed before receiving both requests");
+                }
+            }
+        }
+        assert!(
+            both_sent,
+            "both compatible groups should be sent concurrently"
+        );
+        tokio::time::advance(Duration::from_secs(6)).await;
+        tokio::task::yield_now().await;
+
+        assert!(matches!(
+            short_handle.wait().await?,
+            Err(broadcast::Error::WriteFailed { code, .. })
+                if code == FlussError::RequestTimeOut.code()
+        ));
+        assert!(long_handle.receiver.peek().is_none());
+
+        send_task.abort();
+        server_task.abort();
         Ok(())
     }
 
