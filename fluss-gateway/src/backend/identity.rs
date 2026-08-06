@@ -153,7 +153,9 @@ impl IdentityPool {
     }
 
     /// The number of pooled connections, for tests and diagnostics.
-    pub fn active(&self) -> usize {
+    /// Live connection count observation for the pool tests.
+    #[cfg(test)]
+    fn active(&self) -> usize {
         self.entries.lock().len()
     }
 }

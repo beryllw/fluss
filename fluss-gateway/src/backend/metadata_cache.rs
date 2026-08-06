@@ -17,7 +17,7 @@
 
 //! Bounded, per-cluster table metadata cache with coalesced refreshes.
 
-use crate::backend::model::TableRef;
+use crate::backend::model::{TableDescription, TableRef};
 use crate::backend::types::ClusterId;
 use crate::error::GatewayError;
 use std::collections::{HashMap, VecDeque};
@@ -27,9 +27,6 @@ use std::time::Duration;
 use tokio::sync::{Mutex, watch};
 use tokio::time::Instant;
 
-pub const DEFAULT_METADATA_CACHE_MAX_ENTRIES: usize = 1_024;
-pub const DEFAULT_METADATA_CACHE_TTL: Duration = Duration::from_secs(60);
-
 const CACHE_LOOKUP: &str = "lookup";
 const CACHE_REFRESH: &str = "refresh";
 const CACHE_INVALIDATE_TABLE: &str = "invalidate_table";
@@ -37,37 +34,26 @@ const CACHE_INVALIDATE_DATABASE: &str = "invalidate_database";
 const CACHE_INVALIDATE_PARTITION: &str = "invalidate_partition";
 const CACHE_CLEAR: &str = "clear";
 
-struct CacheEntry<T> {
-    value: Arc<T>,
+struct CacheEntry {
+    value: Arc<TableDescription>,
     loaded_at: Instant,
 }
 
-type RefreshResult<T> = Result<Arc<T>, GatewayError>;
-type RefreshSender<T> = watch::Sender<Option<RefreshResult<T>>>;
+type RefreshResult = Result<Arc<TableDescription>, GatewayError>;
+type RefreshSender = watch::Sender<Option<RefreshResult>>;
 
-struct InFlightRefresh<T> {
+struct InFlightRefresh {
     id: u64,
-    sender: RefreshSender<T>,
+    sender: RefreshSender,
 }
 
-struct CacheState<T> {
-    entries: HashMap<TableRef, CacheEntry<T>>,
+#[derive(Default)]
+struct CacheState {
+    entries: HashMap<TableRef, CacheEntry>,
     least_to_most_recent: VecDeque<TableRef>,
-    in_flight: HashMap<TableRef, InFlightRefresh<T>>,
+    in_flight: HashMap<TableRef, InFlightRefresh>,
     next_refresh_id: u64,
     invalidation_generation: u64,
-}
-
-impl<T> Default for CacheState<T> {
-    fn default() -> Self {
-        Self {
-            entries: HashMap::new(),
-            least_to_most_recent: VecDeque::new(),
-            in_flight: HashMap::new(),
-            next_refresh_id: 0,
-            invalidation_generation: 0,
-        }
-    }
 }
 
 /// Cancellation guard for the caller elected to run a coalesced refresh.
@@ -75,28 +61,22 @@ impl<T> Default for CacheState<T> {
 /// Aborting that caller drops this guard. It synchronously wakes existing waiters with a transient error and removes
 /// the abandoned single-flight slot asynchronously. A refresh ID prevents delayed cleanup from deleting a newer
 /// leader for the same table.
-struct RefreshLeaderGuard<T>
-where
-    T: Send + Sync + 'static,
-{
-    state: Arc<Mutex<CacheState<T>>>,
+struct RefreshLeaderGuard {
+    state: Arc<Mutex<CacheState>>,
     table: TableRef,
     cluster: String,
     refresh_id: u64,
-    sender: RefreshSender<T>,
+    sender: RefreshSender,
     armed: bool,
 }
 
-impl<T> RefreshLeaderGuard<T>
-where
-    T: Send + Sync + 'static,
-{
+impl RefreshLeaderGuard {
     fn new(
-        state: Arc<Mutex<CacheState<T>>>,
+        state: Arc<Mutex<CacheState>>,
         table: TableRef,
         cluster: String,
         refresh_id: u64,
-        sender: RefreshSender<T>,
+        sender: RefreshSender,
     ) -> Self {
         Self {
             state,
@@ -113,10 +93,7 @@ where
     }
 }
 
-impl<T> Drop for RefreshLeaderGuard<T>
-where
-    T: Send + Sync + 'static,
-{
+impl Drop for RefreshLeaderGuard {
     fn drop(&mut self) {
         if !self.armed {
             return;
@@ -148,26 +125,14 @@ where
 /// Missing tables and loader failures are never cached. A refresh for one table is shared by all
 /// concurrent callers. Invalidations also prevent an older in-flight refresh from repopulating the
 /// cache after a successful DDL operation.
-pub struct TableMetadataCache<T> {
+pub struct TableMetadataCache {
     cluster: ClusterId,
     max_entries: usize,
     ttl: Duration,
-    state: Arc<Mutex<CacheState<T>>>,
+    state: Arc<Mutex<CacheState>>,
 }
 
-impl<T> TableMetadataCache<T>
-where
-    T: Send + Sync + 'static,
-{
-    pub fn with_defaults(cluster: ClusterId) -> Self {
-        Self {
-            cluster,
-            max_entries: DEFAULT_METADATA_CACHE_MAX_ENTRIES,
-            ttl: DEFAULT_METADATA_CACHE_TTL,
-            state: Arc::new(Mutex::new(CacheState::default())),
-        }
-    }
-
+impl TableMetadataCache {
     pub fn new(
         cluster: ClusterId,
         max_entries: usize,
@@ -191,23 +156,11 @@ where
         })
     }
 
-    pub fn cluster(&self) -> &ClusterId {
-        &self.cluster
-    }
-
-    pub fn max_entries(&self) -> usize {
-        self.max_entries
-    }
-
-    pub fn ttl(&self) -> Duration {
-        self.ttl
-    }
-
     /// Returns fresh metadata or coalesces one authoritative load for this table.
-    pub async fn get_or_load<F, Fut>(&self, table: &TableRef, loader: F) -> RefreshResult<T>
+    pub async fn get_or_load<F, Fut>(&self, table: &TableRef, loader: F) -> RefreshResult
     where
         F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<T, GatewayError>>,
+        Fut: Future<Output = Result<TableDescription, GatewayError>>,
     {
         self.load(table, false, loader).await
     }
@@ -217,23 +170,23 @@ where
     /// This is the hook used by write preflight after a schema mismatch against the cached table
     /// shape. The caller decides whether to repeat preflight, and must call it at most once per
     /// request.
-    pub async fn refresh<F, Fut>(&self, table: &TableRef, loader: F) -> RefreshResult<T>
+    pub async fn refresh<F, Fut>(&self, table: &TableRef, loader: F) -> RefreshResult
     where
         F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<T, GatewayError>>,
+        Fut: Future<Output = Result<TableDescription, GatewayError>>,
     {
         self.load(table, true, loader).await
     }
 
-    async fn load<F, Fut>(&self, table: &TableRef, force: bool, loader: F) -> RefreshResult<T>
+    async fn load<F, Fut>(&self, table: &TableRef, force: bool, loader: F) -> RefreshResult
     where
         F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<T, GatewayError>>,
+        Fut: Future<Output = Result<TableDescription, GatewayError>>,
     {
-        enum Action<T> {
-            Wait(watch::Receiver<Option<RefreshResult<T>>>),
+        enum Action {
+            Wait(watch::Receiver<Option<RefreshResult>>),
             Load {
-                sender: RefreshSender<T>,
+                sender: RefreshSender,
                 generation: u64,
                 refresh_id: u64,
             },
@@ -391,11 +344,14 @@ where
         record_cache_entries(self.cluster.as_str(), 0);
     }
 
-    pub async fn len(&self) -> usize {
+    /// Entry count observation for the eviction and invalidation tests.
+    #[cfg(test)]
+    async fn len(&self) -> usize {
         self.state.lock().await.entries.len()
     }
 
-    pub async fn is_empty(&self) -> bool {
+    #[cfg(test)]
+    async fn is_empty(&self) -> bool {
         self.len().await == 0
     }
 }
@@ -408,7 +364,7 @@ fn record_cache_entries(cluster: &str, entries: usize) {
     crate::observability::metadata_cache_entries(cluster, entries);
 }
 
-fn remove_in_flight_if_current<T>(state: &mut CacheState<T>, table: &TableRef, refresh_id: u64) {
+fn remove_in_flight_if_current(state: &mut CacheState, table: &TableRef, refresh_id: u64) {
     if state
         .in_flight
         .get(table)
@@ -418,9 +374,7 @@ fn remove_in_flight_if_current<T>(state: &mut CacheState<T>, table: &TableRef, r
     }
 }
 
-async fn wait_for_refresh<T>(
-    mut receiver: watch::Receiver<Option<RefreshResult<T>>>,
-) -> RefreshResult<T> {
+async fn wait_for_refresh(mut receiver: watch::Receiver<Option<RefreshResult>>) -> RefreshResult {
     loop {
         if let Some(result) = receiver.borrow().clone() {
             return result;
@@ -431,7 +385,12 @@ async fn wait_for_refresh<T>(
     }
 }
 
-fn insert_entry<T>(state: &mut CacheState<T>, table: TableRef, value: Arc<T>, max_entries: usize) {
+fn insert_entry(
+    state: &mut CacheState,
+    table: TableRef,
+    value: Arc<TableDescription>,
+    max_entries: usize,
+) {
     remove_entry(state, &table);
     state.entries.insert(
         table.clone(),
@@ -448,7 +407,7 @@ fn insert_entry<T>(state: &mut CacheState<T>, table: TableRef, value: Arc<T>, ma
     }
 }
 
-fn remove_entry<T>(state: &mut CacheState<T>, table: &TableRef) {
+fn remove_entry(state: &mut CacheState, table: &TableRef) {
     state.entries.remove(table);
     if let Some(index) = state
         .least_to_most_recent
@@ -468,7 +427,7 @@ fn touch(recency: &mut VecDeque<TableRef>, table: &TableRef) {
 
 /// Reads table metadata through the per-cluster cache, loading it from the backend on a miss.
 pub(crate) async fn load_table(
-    cache: &TableMetadataCache<crate::backend::model::TableDescription>,
+    cache: &TableMetadataCache,
     backend: &std::sync::Arc<dyn crate::backend::GatewayBackend>,
     table: &TableRef,
 ) -> Result<std::sync::Arc<crate::backend::model::TableDescription>, GatewayError> {
@@ -481,7 +440,7 @@ pub(crate) async fn load_table(
 
 /// Publishes a freshly read description into the cache and returns the cached instance.
 pub(crate) async fn cache_table(
-    cache: &TableMetadataCache<crate::backend::model::TableDescription>,
+    cache: &TableMetadataCache,
     table: &TableRef,
     description: std::sync::Arc<crate::backend::model::TableDescription>,
 ) -> Result<std::sync::Arc<crate::backend::model::TableDescription>, GatewayError> {
@@ -500,17 +459,40 @@ mod tests {
         ClusterId::try_from("local").unwrap()
     }
 
-    fn metadata(version: i32) -> String {
-        format!("v{version}")
+    /// A minimal description whose `schema_id` carries the observable version.
+    fn metadata(version: i32) -> TableDescription {
+        use crate::backend::model::{TableCapabilities, TableKind};
+        TableDescription {
+            table: TableRef::new("db", "table"),
+            table_id: 1,
+            schema_id: version,
+            kind: TableKind::Log,
+            columns: Vec::new(),
+            primary_keys: Vec::new(),
+            physical_primary_keys: Vec::new(),
+            bucket_keys: Vec::new(),
+            partition_keys: Vec::new(),
+            auto_increment_columns: Vec::new(),
+            num_buckets: 1,
+            log_format: Some("ARROW".to_string()),
+            kv_format: None,
+            comment: None,
+            properties: HashMap::new(),
+            custom_properties: HashMap::new(),
+            created_time: 0,
+            modified_time: 0,
+            capabilities: TableCapabilities {
+                exact_lookup_supported: false,
+                prefix_lookup_supported: false,
+            },
+            arrow_schema: Arc::new(arrow::datatypes::Schema::empty()),
+        }
     }
 
     #[tokio::test]
     async fn validates_limits() {
-        assert!(TableMetadataCache::<String>::new(cluster(), 0, Duration::from_secs(1)).is_err());
-        assert!(TableMetadataCache::<String>::new(cluster(), 1, Duration::ZERO).is_err());
-        let cache = TableMetadataCache::<String>::with_defaults(cluster());
-        assert_eq!(cache.max_entries(), DEFAULT_METADATA_CACHE_MAX_ENTRIES);
-        assert_eq!(cache.ttl(), DEFAULT_METADATA_CACHE_TTL);
+        assert!(TableMetadataCache::new(cluster(), 0, Duration::from_secs(1)).is_err());
+        assert!(TableMetadataCache::new(cluster(), 1, Duration::ZERO).is_err());
     }
 
     #[tokio::test]
@@ -540,7 +522,7 @@ mod tests {
         }
         for task in tasks {
             let value = task.await.unwrap();
-            assert_eq!(*value, "v7");
+            assert_eq!(value.schema_id, 7);
         }
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
@@ -567,7 +549,7 @@ mod tests {
             .get_or_load(&table, || async { Ok(metadata(2)) })
             .await
             .unwrap();
-        assert_eq!(*refreshed, "v2");
+        assert_eq!(refreshed.schema_id, 2);
     }
 
     #[tokio::test]
@@ -636,7 +618,7 @@ mod tests {
         started.wait().await;
         cache.invalidate_table(&table).await;
         release.wait().await;
-        assert_eq!(*task.await.unwrap(), "v1");
+        assert_eq!(task.await.unwrap().schema_id, 1);
         assert!(cache.is_empty().await);
     }
 
@@ -653,7 +635,7 @@ mod tests {
                 cache
                     .get_or_load(&table, || async move {
                         let _ = started_tx.send(());
-                        std::future::pending::<Result<String, GatewayError>>().await
+                        std::future::pending::<Result<TableDescription, GatewayError>>().await
                     })
                     .await
             })
@@ -688,7 +670,7 @@ mod tests {
             .get_or_load(&table, || async { Ok(metadata(2)) })
             .await
             .unwrap();
-        assert_eq!(*recovered, "v2");
+        assert_eq!(recovered.schema_id, 2);
     }
 
     #[tokio::test]
@@ -704,7 +686,7 @@ mod tests {
                 cache
                     .get_or_load(&table, || async move {
                         let _ = started_tx.send(());
-                        std::future::pending::<Result<String, GatewayError>>().await
+                        std::future::pending::<Result<TableDescription, GatewayError>>().await
                     })
                     .await
             })
@@ -722,7 +704,7 @@ mod tests {
             .get_or_load(&table, || async { Ok(metadata(3)) })
             .await
             .unwrap();
-        assert_eq!(*recovered, "v3");
+        assert_eq!(recovered.schema_id, 3);
     }
 
     #[tokio::test]
@@ -760,7 +742,7 @@ mod tests {
         assert!(!output.contains("table="));
     }
 
-    async fn wait_for_waiter(cache: &TableMetadataCache<String>, table: &TableRef) {
+    async fn wait_for_waiter(cache: &TableMetadataCache, table: &TableRef) {
         for _ in 0..100 {
             let receiver_count = cache
                 .state
@@ -778,7 +760,7 @@ mod tests {
         panic!("waiter did not subscribe to the in-flight refresh");
     }
 
-    async fn wait_for_no_in_flight(cache: &TableMetadataCache<String>) {
+    async fn wait_for_no_in_flight(cache: &TableMetadataCache) {
         for _ in 0..100 {
             if cache.state.lock().await.in_flight.is_empty() {
                 return;

@@ -101,7 +101,6 @@ pub struct RestState {
 ///
 /// Every endpoint that emits a per-cluster metric goes through this, which is what keeps a caller-supplied
 /// cluster id out of the label set.
-#[allow(dead_code)] // Consumed by the endpoint modules as they are implemented.
 pub(crate) fn metric_cluster(state: &RestState, requested: &str) -> String {
     state
         .clusters
@@ -196,7 +195,6 @@ impl RequestDeadline {
 }
 
 /// Builds the protocol-neutral context shared by every REST application call.
-#[allow(dead_code)] // Consumed by the endpoint modules as they are implemented.
 pub(crate) fn application_context(
     request_id: &RequestId,
     deadline: RequestDeadline,
@@ -225,7 +223,6 @@ pub(crate) fn application_context(
 ///
 /// The inner context stays protocol neutral. Future adapters can provide their own lifecycle guard
 /// without teaching the application layer about HTTP handler cancellation.
-#[allow(dead_code)] // Consumed by the endpoint modules as they are implemented.
 pub(crate) struct RestRequestContext {
     context: RequestContext,
     _cancellation_guard: DropGuard,
@@ -340,7 +337,6 @@ pub(crate) fn validate_json_content_type(headers: &HeaderMap) -> Result<(), Gate
 }
 
 /// Rejects any query string on endpoints that define no query parameters.
-#[allow(dead_code)] // Consumed by the endpoint modules as they are implemented.
 pub(crate) fn ensure_no_query(uri: &Uri) -> Result<(), GatewayError> {
     if uri.query().is_some() {
         return Err(GatewayError::invalid_argument(

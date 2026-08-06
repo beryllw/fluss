@@ -44,7 +44,6 @@ impl CancellationSignal {
     }
 
     /// Creates an RAII guard that cancels this signal when an adapter request is dropped.
-    #[allow(dead_code)] // Used by the REST request context once endpoints call the application layer.
     pub(crate) fn drop_guard(&self) -> DropGuard {
         self.0.clone().drop_guard()
     }

@@ -97,7 +97,6 @@ pub struct RowDecodeError {
 
 impl RowDecodeError {
     /// Marks a failure that a forced metadata refresh plus one preflight retry may resolve.
-    #[allow(dead_code)] // Raised by the decoding matrix; kept allowed for callers outside this module.
     pub(crate) fn schema_mismatch(error: GatewayError) -> Self {
         Self {
             schema_mismatch: true,
@@ -145,7 +144,6 @@ pub struct DecodedRow(GenericRow<'static>);
 
 impl DecodedRow {
     /// Wraps a fully decoded native row. Only the decoder produces these.
-    #[allow(dead_code)] // Produced by the decoding matrix; kept allowed for callers outside this module.
     pub(crate) fn from_native(row: GenericRow<'static>) -> Self {
         Self(row)
     }
@@ -154,7 +152,6 @@ impl DecodedRow {
         self.0.values.len()
     }
 
-    #[allow(dead_code)] // Read by the native write backend once the write path lands.
     pub(crate) fn as_native(&self) -> &GenericRow<'static> {
         &self.0
     }
@@ -336,7 +333,6 @@ fn is_complex(data_type: &DataType) -> bool {
 pub struct SchemaDecoder {
     columns: Vec<InputColumn>,
     /// Column name to position, used by sparse decoding to reject required columns that are not in the schema.
-    #[allow(dead_code)]
     column_indexes: HashMap<String, usize>,
     /// Native type per column, positionally aligned with `columns`.
     ///

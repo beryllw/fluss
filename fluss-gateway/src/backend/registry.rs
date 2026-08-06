@@ -22,7 +22,6 @@ use crate::backend::identity::{IdentityConnector, IdentityPool};
 use crate::backend::metadata_cache::TableMetadataCache;
 #[cfg(any(test, feature = "test-backend"))]
 use crate::backend::model::ClusterHealthReport;
-use crate::backend::model::TableDescription;
 use crate::backend::resilient::{
     BackendHealth, BackendHealthSnapshot, ClusterSupervisor, ResilientBackend, SupervisorConfig,
 };
@@ -72,7 +71,7 @@ pub struct ClusterSnapshot {
 pub struct ClusterRuntime {
     id: ClusterId,
     backend: Arc<ResilientBackend>,
-    table_cache: Arc<TableMetadataCache<TableDescription>>,
+    table_cache: Arc<TableMetadataCache>,
     /// Per-user act-as connections; present exactly under `connection.identity-mode: user`.
     identity_pool: Option<Arc<IdentityPool>>,
 }
@@ -193,10 +192,7 @@ impl ClusterRegistry {
     }
 
     /// Returns the table-metadata cache isolated to one configured cluster.
-    pub fn table_cache(
-        &self,
-        id: &str,
-    ) -> Result<Arc<TableMetadataCache<TableDescription>>, GatewayError> {
+    pub fn table_cache(&self, id: &str) -> Result<Arc<TableMetadataCache>, GatewayError> {
         let cluster_id = ClusterId::try_from(id).map_err(|_| unknown_cluster(id))?;
         self.runtimes
             .get(&cluster_id)
