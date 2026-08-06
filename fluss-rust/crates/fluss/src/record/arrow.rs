@@ -593,12 +593,23 @@ fn estimate_arrow_ipc_overhead(
     // Create a 1-row batch of nulls. Null arrays have minimal, predictable
     // data: no validity bitmap, no variable-length data, just fixed-width
     // zero buffers. This lets us compute raw data size exactly.
-    let null_arrays: Vec<ArrayRef> = schema
+    //
+    // The probe is built against an all-nullable copy of the schema: nullability does not
+    // change the IPC framing being measured, and the real schema would reject the synthetic
+    // nulls for its NOT NULL columns.
+    let probe_schema: SchemaRef = Arc::new(arrow_schema::Schema::new(
+        schema
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone().with_nullable(true))
+            .collect::<Vec<_>>(),
+    ));
+    let null_arrays: Vec<ArrayRef> = probe_schema
         .fields()
         .iter()
         .map(|field| new_null_array(field.data_type(), 1))
         .collect();
-    let batch = RecordBatch::try_new(schema.clone(), null_arrays)?;
+    let batch = RecordBatch::try_new(probe_schema.clone(), null_arrays)?;
 
     // Sum the raw buffer sizes — this is what buffer_size() would report.
     let raw_data: usize = batch
@@ -621,7 +632,7 @@ fn estimate_arrow_ipc_overhead(
     let mut buf = vec![];
     let write_option =
         IpcWriteOptions::try_with_compression(IpcWriteOptions::default(), compression);
-    let mut writer = StreamWriter::try_new_with_options(&mut buf, schema, write_option?)?;
+    let mut writer = StreamWriter::try_new_with_options(&mut buf, &probe_schema, write_option?)?;
     let header_len = writer.get_ref().len();
     writer.write(&batch)?;
     let total_len = writer.get_ref().len();
@@ -2550,6 +2561,54 @@ mod tests {
         assert!(batch.size_in_bytes() > 0);
         assert_eq!(batch.record_count(), 2);
 
+        Ok(())
+    }
+
+    /// A log table with NOT NULL columns must be writable end to end: the IPC overhead
+    /// probe sizes the schema with a synthetic all-null batch, which must not be rejected
+    /// by the schema's real nullability.
+    #[test]
+    fn builder_accepts_a_schema_with_non_nullable_columns() -> Result<()> {
+        use crate::client::WriteRecord;
+        use crate::compression::{
+            ArrowCompressionInfo, ArrowCompressionType, DEFAULT_NON_ZSTD_COMPRESSION_LEVEL,
+        };
+        use crate::metadata::{PhysicalTablePath, TablePath};
+        use crate::row::GenericRow;
+
+        let row_type = RowType::new(vec![
+            DataField::new("ts", DataTypes::bigint().as_non_nullable(), None),
+            DataField::new("message", DataTypes::string(), None),
+        ]);
+        let table_path = TablePath::new("db".to_string(), "tbl".to_string());
+        let table_info = Arc::new(build_table_info(table_path.clone(), 1, 1));
+        let physical_table_path = Arc::new(PhysicalTablePath::of(Arc::new(table_path)));
+
+        let mut builder = MemoryLogRecordsArrowBuilder::new(
+            1,
+            &row_type,
+            false,
+            ArrowCompressionInfo {
+                compression_type: ArrowCompressionType::None,
+                compression_level: DEFAULT_NON_ZSTD_COMPRESSION_LEVEL,
+            },
+            usize::MAX,
+            Arc::new(ArrowCompressionRatioEstimator::default()),
+        )?;
+
+        let mut row = GenericRow::new(2);
+        row.set_field(0, 1_700_000_000_000_i64);
+        row.set_field(1, "hello");
+        let record = WriteRecord::for_append(
+            Arc::clone(&table_info),
+            physical_table_path.clone(),
+            1,
+            &row,
+        );
+        builder.append(&record)?;
+
+        let data = builder.build()?;
+        assert!(!data.is_empty());
         Ok(())
     }
 
