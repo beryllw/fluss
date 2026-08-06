@@ -113,6 +113,55 @@ async fn expect_status(response: reqwest::Response, expected: u16, label: &str) 
     serde_json::from_str(&body).unwrap_or(Value::Null)
 }
 
+/// The append path of a log table with a NOT NULL column, which the primary-key journeys never
+/// touch. This is the journey that exposed the client's IPC overhead probe rejecting synthetic
+/// nulls against a non-nullable schema, failing every append to such a table.
+#[tokio::test]
+async fn log_table_append_journey_accepts_non_nullable_columns() {
+    let bootstrap = CLUSTER.plaintext_bootstrap_servers().to_string();
+    let (gateway, api) = start_gateway(gateway_config(&bootstrap)).await;
+    wait_until_available(&api, None).await;
+
+    let tables = "/v1/clusters/default/databases/fluss/tables";
+    let created = api
+        .post_json(
+            tables,
+            &json!({
+                "table_name": "e2e_events",
+                "columns": [
+                    {"name": "ts", "data_type": {"type": "BIGINT", "nullable": false}},
+                    {"name": "message", "data_type": {"type": "STRING", "nullable": true}}
+                ]
+            }),
+        )
+        .await;
+    assert_eq!(created.status(), 201, "create log table");
+
+    let written = expect_status(
+        api.post_json(
+            &format!("{tables}/e2e_events/records"),
+            &json!({"entries": [
+                {"id": "e1", "append": {"ts": "1700000000000", "message": "hello"}},
+                {"id": "e2", "append": {"ts": "1700000000001", "message": null}}
+            ]}),
+        )
+        .await,
+        200,
+        "append batch",
+    )
+    .await;
+    assert_eq!(written["success_count"], 2, "{written}");
+    assert_eq!(written["failures"], json!([]), "{written}");
+
+    expect_status(
+        api.delete(&format!("{tables}/e2e_events")).await,
+        204,
+        "drop log table",
+    )
+    .await;
+    gateway.shutdown().await.expect("clean shutdown");
+}
+
 /// The whole data plane over a real cluster: DDL round trip, a mixed write batch with per-entry
 /// outcomes, key and prefix lookups against real data, upsert convergence, and the drop.
 #[tokio::test]
