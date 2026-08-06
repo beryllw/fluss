@@ -1,0 +1,93 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+# FIP-49 quickstart: a single-tablet Fluss cluster plus the REST gateway.
+# Build the gateway image first (from the repository root):
+#
+#   docker build -t apache/fluss-gateway -f docker/fluss-gateway/Dockerfile .
+#
+# then:
+#
+#   docker compose -f docker/fluss-gateway/docker-compose.yml up -d
+#   curl http://localhost:8080/health/live
+
+services:
+  coordinator-server:
+    image: apache/fluss:0.9.1-incubating
+    command: coordinatorServer
+    depends_on:
+      - zookeeper
+    environment:
+      - |
+        FLUSS_PROPERTIES=
+        zookeeper.address: zookeeper:2181
+        bind.listeners: INTERNAL://coordinator-server:0, CLIENT://coordinator-server:9123
+        advertised.listeners: CLIENT://coordinator-server:9123
+        internal.listener.name: INTERNAL
+        remote.data.dir: /tmp/fluss/remote-data
+    ports:
+      - "9123:9123"
+
+  tablet-server:
+    image: apache/fluss:0.9.1-incubating
+    command: tabletServer
+    depends_on:
+      - coordinator-server
+    environment:
+      - |
+        FLUSS_PROPERTIES=
+        zookeeper.address: zookeeper:2181
+        bind.listeners: INTERNAL://tablet-server:0, CLIENT://tablet-server:9123
+        advertised.listeners: CLIENT://tablet-server:9123
+        internal.listener.name: INTERNAL
+        tablet-server.id: 0
+        kv.snapshot.interval: 0s
+        data.dir: /tmp/fluss/data
+        remote.data.dir: /tmp/fluss/remote-data
+    ports:
+      - "9124:9123"
+    volumes:
+      - shared-tmpfs:/tmp/fluss
+
+  gateway:
+    # Use the prebuilt gateway image (do not build from source here).
+    image: apache/fluss-gateway:latest
+    pull_policy: never
+    depends_on:
+      - coordinator-server
+      - tablet-server
+    environment:
+      # Trust mode by default: no credentials required. For password mode,
+      # mount a gateway.yaml instead (see gateway.security.example.yaml) and
+      # add: command: ["--config", "/etc/fluss-gateway/gateway.yaml"].
+      - FLUSS_GATEWAY__CLUSTERS__DEFAULT__BOOTSTRAP_SERVERS=coordinator-server:9123
+      - RUST_LOG=info
+    ports:
+      - "8080:8080"
+      - "9095:9095"
+
+  zookeeper:
+    restart: always
+    image: zookeeper:3.9.2
+
+volumes:
+  shared-tmpfs:
+    driver: local
+    driver_opts:
+      type: "tmpfs"
+      device: "tmpfs"

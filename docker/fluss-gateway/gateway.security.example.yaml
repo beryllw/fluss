@@ -1,0 +1,36 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Example gateway.yaml enforcing password authentication (FIP-49).
+# Mount it into the container and point the binary at it:
+#
+#   docker run -v $(pwd)/gateway.security.example.yaml:/etc/fluss-gateway/gateway.yaml:ro \
+#       apache/fluss-gateway --config /etc/fluss-gateway/gateway.yaml
+#
+# The file is YAML with flat dotted keys; FLUSS_GATEWAY__* environment
+# variables still override any key in it.
+
+gateway.clusters: default
+gateway.cluster.default.bootstrap.servers: coordinator-server:9123
+
+gateway.rest.listen: 0.0.0.0:8080
+gateway.metrics.exporter.prometheus.listen: 0.0.0.0:9095
+
+# Password mode: every request needs HTTP Basic credentials from this table.
+# Secrets are either plaintext or `bcrypt:<hash>` (htpasswd -B compatible;
+# bob's hash below is for `secret456`).
+gateway.security.authentication: password
+gateway.security.users: "alice:secret123,bob:bcrypt:$2y$05$ZuVetpn1qbVVplOClQQW3eOlQAmzsQ4btwjFl8kcOxELaLPdqJOOW"

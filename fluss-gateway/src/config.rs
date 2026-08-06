@@ -1193,6 +1193,26 @@ mod tests {
         load(Some(file.path()), &no_env(), &CliOverrides::default())
     }
 
+    /// The example configuration shipped with the Docker quickstart stays parseable and
+    /// enforces password authentication, so the documentation cannot drift from the loader.
+    #[test]
+    fn docker_security_example_config_parses() {
+        let config = load_file(include_str!(
+            "../../docker/fluss-gateway/gateway.security.example.yaml"
+        ))
+        .unwrap();
+        assert_eq!(config.security.authentication, AuthenticationMode::Password);
+        assert_eq!(
+            config.server.rest.bind_address,
+            "0.0.0.0:8080".parse().unwrap()
+        );
+        assert_eq!(
+            cluster(&config, "default").bootstrap_servers,
+            vec!["coordinator-server:9123"]
+        );
+        config.security.build_authenticator().unwrap();
+    }
+
     fn cluster<'a>(config: &'a GatewayConfig, id: &str) -> &'a ClusterConfig {
         config
             .clusters
