@@ -91,13 +91,13 @@ async fn an_unknown_route_returns_the_shared_error_envelope() {
     instance.shutdown().await;
 }
 
-/// The write and lookup routes are mounted and answer with a 501 envelope until their path is implemented.
+/// The write and lookup routes are mounted and reject an empty body with a 400 envelope.
 ///
 /// The point of the assertion is the *shape*: a registered route must never panic, never return a bare 500, and
-/// never fall through to the 404 fallback. The metadata and DDL routes are no longer listed here — they are
-/// implemented, so their real behaviour is covered by the journey test below and by their handler tests.
+/// never fall through to the 404 fallback. All data-plane routes are now implemented, so an empty JSON body
+/// fails request validation; their real behaviour is covered by their handler tests.
 #[tokio::test]
-async fn every_data_plane_route_is_mounted_and_answers_with_an_unsupported_envelope() {
+async fn every_data_plane_route_is_mounted_and_answers_with_an_error_envelope() {
     let instance = gateway().await;
     let table = "/v1/clusters/default/databases/fluss/tables/users";
 
@@ -114,9 +114,9 @@ async fn every_data_plane_route_is_mounted_and_answers_with_an_unsupported_envel
     }
 
     for (path, response) in responses {
-        assert_eq!(response.status(), 501, "{path}");
+        assert_eq!(response.status(), 400, "{path}");
         let body: serde_json::Value = response.json().await.expect("JSON body");
-        assert_eq!(body["error"]["code"], "UNSUPPORTED", "{path}");
+        assert_eq!(body["error"]["code"], "INVALID_ARGUMENT", "{path}");
         assert_eq!(body["error"]["retryable"], false, "{path}");
     }
 
