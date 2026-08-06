@@ -802,7 +802,25 @@ impl Sender {
         // Expiry is terminal: a retry must not be able to resurrect a batch whose delivery
         // deadline has already passed.
         if ready_write_batch.write_batch.delivery_deadline_expired() {
-            self.expire_batch(ready_write_batch, false);
+            // A batch that spent its delivery budget being rejected by storage backpressure
+            // surfaces the typed retriable error instead of a generic timeout, so callers know
+            // to retry exactly the affected entries once pressure drains (FIP-49
+            // `storage_backpressure`).
+            if error == FlussError::StorageBackpressureException {
+                self.fail_batch(
+                    ready_write_batch,
+                    broadcast::Error::WriteFailed {
+                        code: FlussError::StorageBackpressureException.code(),
+                        message: format!(
+                            "Write delivery budget exhausted under storage backpressure: {message}"
+                        ),
+                    },
+                    Some(error),
+                    false,
+                );
+            } else {
+                self.expire_batch(ready_write_batch, false);
+            }
             return Ok(Self::is_invalid_metadata_error(error).then_some(physical_table_path));
         }
 
@@ -997,6 +1015,7 @@ impl Sender {
                 | FlussError::NotEnoughReplicasException
                 | FlussError::CorruptMessage
                 | FlussError::CorruptRecordException
+                | FlussError::StorageBackpressureException
         )
     }
 
@@ -1397,6 +1416,107 @@ mod tests {
             handle.wait().await?,
             Err(broadcast::Error::WriteFailed { code, .. })
                 if code == FlussError::RequestTimeOut.code()
+        ));
+        assert!(!accumulator.has_incomplete());
+        Ok(())
+    }
+
+    /// A storage-backpressure rejection is retried like any transient error while delivery
+    /// budget remains.
+    #[tokio::test]
+    async fn storage_backpressure_rejection_is_reenqueued_within_the_budget() -> Result<()> {
+        let table_path = Arc::new(TablePath::new("db".to_string(), "tbl".to_string()));
+        let cluster = build_cluster_arc(table_path.as_ref(), 1, 1);
+        let metadata = Arc::new(Metadata::new_for_test(cluster.clone()));
+        let idempotence = disabled_idempotence();
+        let accumulator = Arc::new(RecordAccumulator::new(
+            Config::default(),
+            Arc::clone(&idempotence),
+        ));
+        let sender = Sender::new(
+            metadata,
+            Arc::clone(&accumulator),
+            1024 * 1024,
+            1000,
+            1,
+            10,
+            idempotence,
+            Arc::new(crate::metrics::WriterMetrics::new()),
+            Duration::from_secs(3),
+        );
+
+        let (batch, _handle) =
+            build_ready_batch(accumulator.as_ref(), cluster.clone(), table_path)?;
+        sender.handle_write_batch_error(
+            batch,
+            FlussError::StorageBackpressureException,
+            "write-pressure threshold reached".to_string(),
+        )?;
+
+        // The batch went back to the accumulator with one recorded attempt.
+        let server = cluster.get_tablet_server(1).expect("server");
+        let nodes = HashSet::from([server.clone()]);
+        let mut batches = accumulator.drain(cluster, &nodes, 1024 * 1024)?;
+        let batch = batches
+            .remove(&1)
+            .expect("drained batches")
+            .pop()
+            .expect("batch");
+        assert_eq!(batch.write_batch.attempts(), 1);
+        Ok(())
+    }
+
+    /// Once the delivery budget is exhausted under backpressure, the batch fails with the typed
+    /// storage-backpressure code rather than a generic timeout, so callers can retry exactly the
+    /// affected entries (FIP-49 `storage_backpressure`).
+    #[tokio::test]
+    async fn exhausted_budget_under_backpressure_surfaces_the_typed_error() -> Result<()> {
+        let table_path = Arc::new(TablePath::new("db".to_string(), "tbl".to_string()));
+        let cluster = build_cluster_arc(table_path.as_ref(), 1, 1);
+        let metadata = Arc::new(Metadata::new_for_test(cluster.clone()));
+        let idempotence = disabled_idempotence();
+        let accumulator = Arc::new(RecordAccumulator::new(
+            Config::default(),
+            Arc::clone(&idempotence),
+        ));
+        let sender = Sender::new(
+            metadata,
+            Arc::clone(&accumulator),
+            1024 * 1024,
+            1000,
+            1,
+            10,
+            idempotence,
+            Arc::new(crate::metrics::WriterMetrics::new()),
+            Duration::from_secs(3),
+        );
+        let table_info = Arc::new(build_table_info(table_path.as_ref().clone(), 1, 1));
+        let physical_path = Arc::new(PhysicalTablePath::of(Arc::clone(&table_path)));
+        let row = GenericRow {
+            values: vec![Datum::Int32(1)],
+        };
+        let record = WriteRecord::for_append(table_info, physical_path, 1, &row).with_options(
+            WriteOptions::new(Instant::now() + Duration::from_millis(50)),
+        );
+        let result = accumulator.append(&record, 0, &cluster, false)?;
+        let handle = result.result_handle.expect("result handle");
+        let server = cluster.get_tablet_server(1).expect("server");
+        let nodes = HashSet::from([server.clone()]);
+        let mut batches = accumulator.drain(cluster, &nodes, 1024 * 1024)?;
+        let batch = batches.remove(&1).unwrap().pop().unwrap();
+
+        tokio::time::sleep(Duration::from_millis(70)).await;
+        sender.handle_write_batch_error(
+            batch,
+            FlussError::StorageBackpressureException,
+            "write-pressure threshold reached".to_string(),
+        )?;
+
+        assert!(matches!(
+            handle.wait().await?,
+            Err(broadcast::Error::WriteFailed { code, ref message })
+                if code == FlussError::StorageBackpressureException.code()
+                    && message.contains("storage backpressure")
         ));
         assert!(!accumulator.has_incomplete());
         Ok(())

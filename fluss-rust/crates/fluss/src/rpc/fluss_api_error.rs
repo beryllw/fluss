@@ -171,6 +171,9 @@ pub enum FlussError {
     InvalidAlterTableException = 56,
     /// Deletion operations are disabled on this table.
     DeletionDisabledException = 57,
+    /// The tablet server rejected the write because the KV storage engine reached its
+    /// write-pressure threshold. Retriable: pressure drains as compaction catches up.
+    StorageBackpressureException = 72,
 }
 
 impl FlussError {
@@ -195,6 +198,7 @@ impl FlussError {
                 | FlussError::NotEnoughReplicasAfterAppendException
                 | FlussError::NotEnoughReplicasException
                 | FlussError::LeaderNotAvailableException
+                | FlussError::StorageBackpressureException
         )
     }
 
@@ -298,6 +302,9 @@ impl FlussError {
             FlussError::DeletionDisabledException => {
                 "Deletion operations are disabled on this table."
             }
+            FlussError::StorageBackpressureException => {
+                "The tablet server has rejected the write because the KV storage engine has reached its write-pressure threshold."
+            }
         }
     }
 
@@ -372,6 +379,7 @@ impl FlussError {
             55 => FlussError::IneligibleReplicaException,
             56 => FlussError::InvalidAlterTableException,
             57 => FlussError::DeletionDisabledException,
+            72 => FlussError::StorageBackpressureException,
             _ => FlussError::UnknownServerError,
         }
     }
