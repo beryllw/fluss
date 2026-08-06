@@ -114,24 +114,24 @@ impl ErrorKind {
         }
     }
 
-    /// Stable machine-readable code carried in the error envelope, for example `NOT_FOUND`.
+    /// Stable machine-readable code carried in the error envelope, for example `not_found`.
     pub fn code(self) -> &'static str {
         match self {
-            ErrorKind::InvalidArgument => "INVALID_ARGUMENT",
-            ErrorKind::Unauthenticated => "UNAUTHENTICATED",
-            ErrorKind::Unauthorized => "UNAUTHORIZED",
-            ErrorKind::NotFound => "NOT_FOUND",
-            ErrorKind::AlreadyExists => "ALREADY_EXISTS",
-            ErrorKind::FailedPrecondition => "FAILED_PRECONDITION",
-            ErrorKind::Unsupported => "UNSUPPORTED",
-            ErrorKind::UnsupportedMediaType => "UNSUPPORTED_MEDIA_TYPE",
-            ErrorKind::NotAcceptable => "NOT_ACCEPTABLE",
-            ErrorKind::LimitExceeded => "LIMIT_EXCEEDED",
-            ErrorKind::ResourceExhausted => "RESOURCE_EXHAUSTED",
-            ErrorKind::DeadlineExceeded => "DEADLINE_EXCEEDED",
-            ErrorKind::Cancelled => "CANCELLED",
-            ErrorKind::Unavailable => "UNAVAILABLE",
-            ErrorKind::Internal => "INTERNAL",
+            ErrorKind::InvalidArgument => "invalid_argument",
+            ErrorKind::Unauthenticated => "unauthenticated",
+            ErrorKind::Unauthorized => "unauthorized",
+            ErrorKind::NotFound => "not_found",
+            ErrorKind::AlreadyExists => "already_exists",
+            ErrorKind::FailedPrecondition => "failed_precondition",
+            ErrorKind::Unsupported => "unsupported",
+            ErrorKind::UnsupportedMediaType => "unsupported_media_type",
+            ErrorKind::NotAcceptable => "not_acceptable",
+            ErrorKind::LimitExceeded => "limit_exceeded",
+            ErrorKind::ResourceExhausted => "resource_exhausted",
+            ErrorKind::DeadlineExceeded => "timeout",
+            ErrorKind::Cancelled => "cancelled",
+            ErrorKind::Unavailable => "unavailable",
+            ErrorKind::Internal => "internal",
         }
     }
 
@@ -398,36 +398,36 @@ mod tests {
 
     /// The frozen taxonomy. Adding a variant breaks [`ErrorKind::ordinal`] first, then this table.
     const CONTRACT: [(ErrorKind, u16, &str, bool); 15] = [
-        (ErrorKind::InvalidArgument, 400, "INVALID_ARGUMENT", false),
-        (ErrorKind::Unauthenticated, 401, "UNAUTHENTICATED", false),
-        (ErrorKind::Unauthorized, 403, "UNAUTHORIZED", false),
-        (ErrorKind::NotFound, 404, "NOT_FOUND", false),
-        (ErrorKind::AlreadyExists, 409, "ALREADY_EXISTS", false),
+        (ErrorKind::InvalidArgument, 400, "invalid_argument", false),
+        (ErrorKind::Unauthenticated, 401, "unauthenticated", false),
+        (ErrorKind::Unauthorized, 403, "unauthorized", false),
+        (ErrorKind::NotFound, 404, "not_found", false),
+        (ErrorKind::AlreadyExists, 409, "already_exists", false),
         (
             ErrorKind::FailedPrecondition,
             409,
-            "FAILED_PRECONDITION",
+            "failed_precondition",
             false,
         ),
-        (ErrorKind::Unsupported, 501, "UNSUPPORTED", false),
+        (ErrorKind::Unsupported, 501, "unsupported", false),
         (
             ErrorKind::UnsupportedMediaType,
             415,
-            "UNSUPPORTED_MEDIA_TYPE",
+            "unsupported_media_type",
             false,
         ),
-        (ErrorKind::NotAcceptable, 406, "NOT_ACCEPTABLE", false),
-        (ErrorKind::LimitExceeded, 413, "LIMIT_EXCEEDED", false),
+        (ErrorKind::NotAcceptable, 406, "not_acceptable", false),
+        (ErrorKind::LimitExceeded, 413, "limit_exceeded", false),
         (
             ErrorKind::ResourceExhausted,
             429,
-            "RESOURCE_EXHAUSTED",
+            "resource_exhausted",
             true,
         ),
-        (ErrorKind::DeadlineExceeded, 504, "DEADLINE_EXCEEDED", true),
-        (ErrorKind::Cancelled, 499, "CANCELLED", false),
-        (ErrorKind::Unavailable, 503, "UNAVAILABLE", true),
-        (ErrorKind::Internal, 500, "INTERNAL", false),
+        (ErrorKind::DeadlineExceeded, 504, "timeout", true),
+        (ErrorKind::Cancelled, 499, "cancelled", false),
+        (ErrorKind::Unavailable, 503, "unavailable", true),
+        (ErrorKind::Internal, 500, "internal", false),
     ];
 
     #[test]
@@ -465,7 +465,7 @@ mod tests {
             json,
             serde_json::json!({
                 "error": {
-                    "code": "NOT_FOUND",
+                    "code": "not_found",
                     "message": "table `db.missing` does not exist",
                     "request_id": "req-123",
                     "retryable": false,
@@ -508,7 +508,7 @@ mod tests {
             serde_json::to_value(ErrorEnvelope::new(&error, "request-7")).unwrap(),
             serde_json::json!({
                 "error": {
-                    "code": "NOT_FOUND",
+                    "code": "not_found",
                     "message": "table does not exist",
                     "request_id": "request-7",
                     "retryable": false,
@@ -524,7 +524,7 @@ mod tests {
     #[test]
     fn framework_failures_get_an_envelope_without_a_gateway_error() {
         let envelope = ErrorEnvelope::from_parts(
-            "METHOD_NOT_ALLOWED",
+            "method_not_allowed",
             "method not allowed",
             "request-9",
             false,
@@ -533,7 +533,7 @@ mod tests {
             serde_json::to_value(&envelope).unwrap(),
             serde_json::json!({
                 "error": {
-                    "code": "METHOD_NOT_ALLOWED",
+                    "code": "method_not_allowed",
                     "message": "method not allowed",
                     "request_id": "request-9",
                     "retryable": false,

@@ -727,7 +727,7 @@ mod tests {
         let response = get("/databases/missing").await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         let json = body_json(response).await;
-        assert_eq!(json["error"]["code"], "NOT_FOUND");
+        assert_eq!(json["error"]["code"], "not_found");
         assert_eq!(json["error"]["details"]["resource_kind"], "database");
         assert_eq!(json["error"]["details"]["resource_name"], "missing");
     }
@@ -737,7 +737,7 @@ mod tests {
         let response = get("/databases/fluss/tables/missing").await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         let json = body_json(response).await;
-        assert_eq!(json["error"]["code"], "NOT_FOUND");
+        assert_eq!(json["error"]["code"], "not_found");
         assert_eq!(json["error"]["details"]["resource_kind"], "table");
         assert_eq!(json["error"]["details"]["resource_name"], "fluss.missing");
     }
@@ -930,7 +930,7 @@ mod tests {
             let response = get(&path).await;
             assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
             let json = body_json(response).await;
-            assert_eq!(json["error"]["code"], "INVALID_ARGUMENT", "{path}");
+            assert_eq!(json["error"]["code"], "invalid_argument", "{path}");
             assert!(
                 json["error"]["message"]
                     .as_str()
@@ -954,7 +954,7 @@ mod tests {
             assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
             assert_eq!(
                 body_json(response).await["error"]["code"],
-                "INVALID_ARGUMENT",
+                "invalid_argument",
                 "{path}"
             );
         }
@@ -975,7 +975,7 @@ mod tests {
             assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
             assert_eq!(
                 body_json(response).await["error"]["code"],
-                "INVALID_ARGUMENT",
+                "invalid_argument",
                 "{path}"
             );
         }
@@ -998,7 +998,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(
             body_json(response).await["error"]["code"],
-            "INVALID_ARGUMENT"
+            "invalid_argument"
         );
     }
 

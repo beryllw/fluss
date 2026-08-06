@@ -303,53 +303,53 @@ fn classify_error(error: &FlussClientError) -> (&'static str, String, bool) {
             | FlussError::InvalidTableException
             | FlussError::InvalidDatabaseException
             | FlussError::NonPrimaryKeyTableException => (
-                "INVALID_ARGUMENT",
+                "invalid_argument",
                 "write is incompatible with the table schema",
             ),
             FlussError::TableNotExist
             | FlussError::DatabaseNotExist
             | FlussError::PartitionNotExists
             | FlussError::UnknownTableOrBucketException => {
-                ("NOT_FOUND", "the write target does not exist")
+                ("not_found", "the write target does not exist")
             }
             FlussError::RecordTooLargeException => {
-                ("LIMIT_EXCEEDED", "the encoded record is too large")
+                ("limit_exceeded", "the encoded record is too large")
             }
-            FlussError::RequestTimeOut => ("DEADLINE_EXCEEDED", "write delivery timed out"),
+            FlussError::RequestTimeOut => ("timeout", "write delivery timed out"),
             FlussError::StorageBackpressureException => (
-                "STORAGE_BACKPRESSURE",
+                "storage_backpressure",
                 "the KV store rejected the write under backpressure; retry the failed entries once pressure drains",
             ),
             _ if api_error.is_retriable() => {
-                ("UNAVAILABLE", "the Fluss write service is unavailable")
+                ("unavailable", "the Fluss write service is unavailable")
             }
-            _ => ("INTERNAL", "the write failed unexpectedly"),
+            _ => ("internal", "the write failed unexpectedly"),
         };
         return (code, message.to_string(), api_error.is_retriable());
     }
 
     match error {
         FlussClientError::BufferExhausted { .. } => (
-            "RESOURCE_EXHAUSTED",
+            "resource_exhausted",
             "write buffer capacity is exhausted".to_string(),
             true,
         ),
         FlussClientError::IllegalArgument { .. }
         | FlussClientError::RowConvertError { .. }
         | FlussClientError::ArrowError { .. } => (
-            "INVALID_ARGUMENT",
+            "invalid_argument",
             "write values are incompatible with the table schema".to_string(),
             false,
         ),
         FlussClientError::WriterClosed { .. }
         | FlussClientError::RpcError { .. }
         | FlussClientError::WakeupError { .. } => (
-            "UNAVAILABLE",
+            "unavailable",
             "the Fluss write service is unavailable".to_string(),
             true,
         ),
         _ => (
-            "INTERNAL",
+            "internal",
             "the write failed unexpectedly".to_string(),
             error.is_retriable(),
         ),
@@ -470,10 +470,10 @@ mod tests {
         let unknown = classify_unknown(delivery_timeout_error());
 
         assert_eq!(rejected.completion, WriteCompletion::Rejected);
-        assert_eq!(rejected.error_code, "DEADLINE_EXCEEDED");
+        assert_eq!(rejected.error_code, "timeout");
         assert_eq!(rejected.message, "write delivery timed out");
         assert_eq!(unknown.completion, WriteCompletion::Unknown);
-        assert_eq!(unknown.error_code, "DEADLINE_EXCEEDED");
+        assert_eq!(unknown.error_code, "timeout");
         assert_eq!(unknown.message, "write completion is unknown");
     }
 
@@ -490,12 +490,12 @@ mod tests {
     #[test]
     fn storage_backpressure_is_a_retriable_rejected_entry_code() {
         let rejected = classify_rejected(backpressure_error());
-        assert_eq!(rejected.error_code, "STORAGE_BACKPRESSURE");
+        assert_eq!(rejected.error_code, "storage_backpressure");
         assert_eq!(rejected.completion, WriteCompletion::Rejected);
         assert!(rejected.retryable);
 
         let post_ownership = classify_unknown(backpressure_error());
-        assert_eq!(post_ownership.error_code, "STORAGE_BACKPRESSURE");
+        assert_eq!(post_ownership.error_code, "storage_backpressure");
         assert_eq!(post_ownership.completion, WriteCompletion::Rejected);
         assert!(post_ownership.retryable);
         assert_eq!(post_ownership.message, rejected.message);
@@ -505,7 +505,7 @@ mod tests {
     fn post_enqueue_semantic_error_stays_completion_unknown() {
         let failure = classify_unknown(FlussClientError::invalid_table("stale schema"));
 
-        assert_eq!(failure.error_code, "INVALID_ARGUMENT");
+        assert_eq!(failure.error_code, "invalid_argument");
         assert_eq!(failure.completion, WriteCompletion::Unknown);
         assert!(!failure.retryable);
     }
@@ -517,21 +517,21 @@ mod tests {
                 FlussClientError::BufferExhausted {
                     message: "full".to_string(),
                 },
-                "RESOURCE_EXHAUSTED",
+                "resource_exhausted",
                 true,
             ),
             (
                 FlussClientError::IllegalArgument {
                     message: "bad".to_string(),
                 },
-                "INVALID_ARGUMENT",
+                "invalid_argument",
                 false,
             ),
             (
                 FlussClientError::WriterClosed {
                     message: "closed".to_string(),
                 },
-                "UNAVAILABLE",
+                "unavailable",
                 true,
             ),
             (
@@ -539,7 +539,7 @@ mod tests {
                     message: "boom".to_string(),
                     source: None,
                 },
-                "INTERNAL",
+                "internal",
                 false,
             ),
         ] {
@@ -675,7 +675,7 @@ mod tests {
             Ok(_) => panic!("full buffer unexpectedly accepted an enqueue past its deadline"),
         };
         let failure = classify_rejected(timed_out);
-        assert_eq!(failure.error_code, "DEADLINE_EXCEEDED");
+        assert_eq!(failure.error_code, "timeout");
         assert_eq!(failure.completion, WriteCompletion::Rejected);
 
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
@@ -698,7 +698,7 @@ mod tests {
             Ok(_) => panic!("closed buffer unexpectedly accepted an enqueue"),
         };
         let failure = classify_rejected(closed);
-        assert_eq!(failure.error_code, "UNAVAILABLE");
+        assert_eq!(failure.error_code, "unavailable");
         assert_eq!(failure.completion, WriteCompletion::Rejected);
         drop(held);
     }

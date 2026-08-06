@@ -95,7 +95,7 @@ async fn an_unknown_route_returns_the_shared_error_envelope() {
     assert_eq!(response.status(), 404);
     assert!(response.headers().contains_key("x-request-id"));
     let body: serde_json::Value = response.json().await.expect("JSON body");
-    assert_eq!(body["error"]["code"], "NOT_FOUND");
+    assert_eq!(body["error"]["code"], "not_found");
     assert_eq!(body["error"]["retryable"], false);
     assert!(body["error"]["request_id"].as_str().is_some());
 
@@ -127,7 +127,7 @@ async fn every_data_plane_route_is_mounted_and_answers_with_an_error_envelope() 
     for (path, response) in responses {
         assert_eq!(response.status(), 400, "{path}");
         let body: serde_json::Value = response.json().await.expect("JSON body");
-        assert_eq!(body["error"]["code"], "INVALID_ARGUMENT", "{path}");
+        assert_eq!(body["error"]["code"], "invalid_argument", "{path}");
         assert_eq!(body["error"]["retryable"], false, "{path}");
     }
 
@@ -180,7 +180,7 @@ async fn password_mode_enforces_credentials_on_data_and_control_planes() {
     );
     assert!(rejected.headers().contains_key("x-request-id"));
     let body: serde_json::Value = rejected.json().await.expect("JSON body");
-    assert_eq!(body["error"]["code"], "UNAUTHENTICATED");
+    assert_eq!(body["error"]["code"], "unauthenticated");
     assert_eq!(body["error"]["retryable"], false);
 
     // Anonymous and malformed credentials are rejected the same way.
@@ -312,7 +312,7 @@ async fn an_oversized_body_is_rejected_with_413_and_never_429() {
         response.starts_with("HTTP/1.1 413"),
         "expected 413, got: {response}"
     );
-    assert!(response.contains("LIMIT_EXCEEDED"), "got: {response}");
+    assert!(response.contains("limit_exceeded"), "got: {response}");
 
     instance.shutdown().await;
 }
@@ -327,7 +327,7 @@ async fn an_unknown_cluster_is_not_found_rather_than_unavailable() {
     // an unconfigured cluster is a missing resource, never a transient backend outage.
     assert_eq!(response.status(), 404);
     let body: serde_json::Value = response.json().await.expect("JSON body");
-    assert_eq!(body["error"]["code"], "NOT_FOUND");
+    assert_eq!(body["error"]["code"], "not_found");
     assert_eq!(body["error"]["details"]["resource_kind"], "cluster");
 
     instance.shutdown().await;

@@ -359,7 +359,7 @@ async fn sasl_service_account_gateway_reaches_the_cluster() {
     let status = refused.status();
     let body: Value = refused.json().await.expect("JSON body");
     assert_eq!(status, 503, "{body}");
-    assert_eq!(body["error"]["code"], "UNAVAILABLE", "{body}");
+    assert_eq!(body["error"]["code"], "unavailable", "{body}");
     gateway.shutdown().await.expect("clean shutdown");
 }
 
@@ -507,7 +507,7 @@ async fn user_identity_mode_acts_as_end_users_end_to_end() {
     let status = refused.status();
     let body: Value = refused.json().await.expect("JSON body");
     assert_eq!(status, 403, "{body}");
-    assert_eq!(body["error"]["code"], "UNAUTHORIZED", "{body}");
+    assert_eq!(body["error"]["code"], "unauthorized", "{body}");
     assert_eq!(body["error"]["retryable"], false, "{body}");
 
     gateway.shutdown().await.expect("clean shutdown");
@@ -644,7 +644,7 @@ async fn storage_backpressure_surfaces_as_entry_level_retriable_failures() {
         assert_eq!(status, 200, "{body}");
         successes += body["success_count"].as_u64().unwrap_or(0) as usize;
         for failure in body["failures"].as_array().into_iter().flatten() {
-            if failure["error_code"] == "STORAGE_BACKPRESSURE" {
+            if failure["error_code"] == "storage_backpressure" {
                 assert_eq!(failure["retryable"], true, "{failure}");
                 assert_eq!(failure["completion"], "rejected", "{failure}");
                 backpressure_failures += 1;
@@ -653,7 +653,7 @@ async fn storage_backpressure_surfaces_as_entry_level_retriable_failures() {
                 // indeterminate timeout — legitimate under overload, but not what this
                 // journey is hunting for.
                 assert_eq!(
-                    failure["error_code"], "DEADLINE_EXCEEDED",
+                    failure["error_code"], "timeout",
                     "unexpected entry failure under backpressure: {failure}"
                 );
             }
@@ -665,7 +665,7 @@ async fn storage_backpressure_surfaces_as_entry_level_retriable_failures() {
 
     assert!(
         backpressure_failures > 0,
-        "the cluster never rejected a write with STORAGE_BACKPRESSURE \
+        "the cluster never rejected a write with storage_backpressure \
          ({successes} rows written in {batch} rounds)"
     );
 

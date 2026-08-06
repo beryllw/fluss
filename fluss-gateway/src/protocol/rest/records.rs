@@ -155,7 +155,7 @@ pub enum WriteCompletionResponse {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct WriteFailureResponse {
     pub id: String,
-    /// A stable request-level error code, plus `STORAGE_BACKPRESSURE` — a KV write rejected by
+    /// A stable request-level error code, plus `storage_backpressure` — a KV write rejected by
     /// storage backpressure after the client retry budget was exhausted. It is retriable and
     /// occurs only at entry level, never as a whole-request HTTP status (FIP-49).
     pub error_code: String,
@@ -601,7 +601,7 @@ mod tests {
             )
             .await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{label}: {json}");
-            assert_eq!(json["error"]["code"], "INVALID_ARGUMENT", "{label}");
+            assert_eq!(json["error"]["code"], "invalid_argument", "{label}");
             assert!(
                 backend.recorded_writes().is_empty(),
                 "{label}: preflight must submit nothing"
@@ -612,7 +612,7 @@ mod tests {
     #[tokio::test]
     async fn an_injected_delivery_failure_is_a_200_with_per_entry_outcomes() {
         let backend = Arc::new(TestBackend::new());
-        backend.inject_write_failure(vec![1], WriteCompletion::Unknown, "UNAVAILABLE", true);
+        backend.inject_write_failure(vec![1], WriteCompletion::Unknown, "unavailable", true);
         let (status, body) = send(
             test_support::app(backend),
             users(
@@ -629,7 +629,7 @@ mod tests {
         assert_eq!(body["successes"][1]["id"], "third");
         assert_eq!(body["failures"][0]["id"], "second");
         assert_eq!(body["failures"][0]["completion"], "unknown");
-        assert_eq!(body["failures"][0]["error_code"], "UNAVAILABLE");
+        assert_eq!(body["failures"][0]["error_code"], "unavailable");
         assert_eq!(body["failures"][0]["retryable"], true);
     }
 
@@ -642,7 +642,7 @@ mod tests {
         backend.inject_write_failure(
             vec![1],
             WriteCompletion::Rejected,
-            "STORAGE_BACKPRESSURE",
+            "storage_backpressure",
             true,
         );
         let (status, body) = send(
@@ -657,7 +657,7 @@ mod tests {
         assert_eq!(body["success_count"], 1);
         assert_eq!(body["error_count"], 1);
         assert_eq!(body["failures"][0]["id"], "second");
-        assert_eq!(body["failures"][0]["error_code"], "STORAGE_BACKPRESSURE");
+        assert_eq!(body["failures"][0]["error_code"], "storage_backpressure");
         assert_eq!(body["failures"][0]["completion"], "rejected");
         assert_eq!(body["failures"][0]["retryable"], true);
         assert!(
@@ -672,7 +672,7 @@ mod tests {
         backend.inject_write_failure(
             vec![0],
             WriteCompletion::Rejected,
-            "RESOURCE_EXHAUSTED",
+            "resource_exhausted",
             true,
         );
         let (status, body) = send(
@@ -700,7 +700,7 @@ mod tests {
         .await;
 
         assert_eq!(status, StatusCode::CONFLICT);
-        assert_eq!(body["error"]["code"], "FAILED_PRECONDITION");
+        assert_eq!(body["error"]["code"], "failed_precondition");
         assert_eq!(body["error"]["details"]["resource_kind"], "table");
         assert!(backend.recorded_writes().is_empty());
     }
@@ -721,7 +721,7 @@ mod tests {
             send(app, post("users", format!(r#"{{"entries":[{entries}]}}"#))).await;
 
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
-        assert_eq!(body["error"]["code"], "LIMIT_EXCEEDED");
+        assert_eq!(body["error"]["code"], "limit_exceeded");
         assert!(backend.recorded_writes().is_empty());
     }
 
@@ -738,7 +738,7 @@ mod tests {
         .await;
 
         assert_eq!(status, StatusCode::NOT_FOUND);
-        assert_eq!(body["error"]["code"], "NOT_FOUND");
+        assert_eq!(body["error"]["code"], "not_found");
         assert_eq!(body["error"]["details"]["resource_kind"], "table");
     }
 
@@ -760,7 +760,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(json(response).await["error"]["code"], "INVALID_ARGUMENT");
+        assert_eq!(json(response).await["error"]["code"], "invalid_argument");
         assert!(backend.recorded_writes().is_empty());
     }
 

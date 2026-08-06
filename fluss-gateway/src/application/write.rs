@@ -458,7 +458,7 @@ impl GatewayService {
         // so the next request re-reads it rather than repeating the same doomed batch.
         if result.entries.iter().any(|entry| {
             entry.failure.as_ref().is_some_and(|failure| {
-                failure.error_code == "INVALID_ARGUMENT" || failure.error_code == "NOT_FOUND"
+                failure.error_code == "invalid_argument" || failure.error_code == "not_found"
             })
         }) {
             cache.invalidate_table(&table).await;
@@ -1103,7 +1103,7 @@ mod tests {
     #[tokio::test]
     async fn delivery_failures_are_reported_per_entry_in_input_order() {
         let backend = Arc::new(TestBackend::new());
-        backend.inject_write_failure(vec![1], WriteCompletion::Unknown, "UNAVAILABLE", true);
+        backend.inject_write_failure(vec![1], WriteCompletion::Unknown, "unavailable", true);
         let service = service_with(backend.clone());
 
         let result = service
@@ -1119,7 +1119,7 @@ mod tests {
                     1,
                     "second".to_string(),
                     WriteFailure {
-                        error_code: "UNAVAILABLE".to_string(),
+                        error_code: "unavailable".to_string(),
                         message: "injected test failure".to_string(),
                         completion: WriteCompletion::Unknown,
                         retryable: true,

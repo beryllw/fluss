@@ -25,7 +25,7 @@
 //! The middleware applies two per-request input-validation bounds — a maximum body size (413) and the
 //! per-request deadline (504) — and no request rate limiting. HTTP 429 appears for exactly one condition:
 //! the per-user act-as connection pool of the user identity mode is at capacity
-//! (`RESOURCE_EXHAUSTED`, always with a `Retry-After` header, per FIP-49).
+//! (`resource_exhausted`, always with a `Retry-After` header, per FIP-49).
 
 pub mod auth;
 pub mod clusters;
@@ -578,26 +578,26 @@ fn normalize_error(response: Response, request_id: &RequestId) -> Response {
     }
 
     let (status, code, message, retryable) = match status.as_u16() {
-        400 | 422 => (400, "INVALID_ARGUMENT", "invalid request", false),
-        404 => (404, "NOT_FOUND", "resource not found", false),
-        405 => (405, "METHOD_NOT_ALLOWED", "method not allowed", false),
-        406 => (406, "NOT_ACCEPTABLE", "unacceptable accept header", false),
-        408 | 504 => (504, "DEADLINE_EXCEEDED", "request deadline exceeded", true),
-        413 => (413, "LIMIT_EXCEEDED", "request body too large", false),
+        400 | 422 => (400, "invalid_argument", "invalid request", false),
+        404 => (404, "not_found", "resource not found", false),
+        405 => (405, "method_not_allowed", "method not allowed", false),
+        406 => (406, "not_acceptable", "unacceptable accept header", false),
+        408 | 504 => (504, "timeout", "request deadline exceeded", true),
+        413 => (413, "limit_exceeded", "request body too large", false),
         415 => (
             415,
-            "UNSUPPORTED_MEDIA_TYPE",
+            "unsupported_media_type",
             "unsupported media type",
             false,
         ),
-        501 => (501, "UNSUPPORTED", "unsupported operation", false),
-        503 => (503, "UNAVAILABLE", "service unavailable", true),
+        501 => (501, "unsupported", "unsupported operation", false),
+        503 => (503, "unavailable", "service unavailable", true),
         other => (
             other,
             if other >= 500 {
-                "INTERNAL"
+                "internal"
             } else {
-                "INVALID_ARGUMENT"
+                "invalid_argument"
             },
             "request failed",
             false,
@@ -870,7 +870,7 @@ mod tests {
             .expect("x-request-id header");
 
         let json = body_json(response).await;
-        assert_eq!(json["error"]["code"], "NOT_FOUND");
+        assert_eq!(json["error"]["code"], "not_found");
         assert_eq!(json["error"]["request_id"], header_id.as_str());
         assert_eq!(json["error"]["retryable"], false);
         assert!(
@@ -896,7 +896,7 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
         let json = body_json(response).await;
-        assert_eq!(json["error"]["code"], "LIMIT_EXCEEDED");
+        assert_eq!(json["error"]["code"], "limit_exceeded");
         assert!(json["error"]["request_id"].as_str().is_some());
     }
 
@@ -919,7 +919,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
         let json = body_json(response).await;
-        assert_eq!(json["error"]["code"], "DEADLINE_EXCEEDED");
+        assert_eq!(json["error"]["code"], "timeout");
         assert_eq!(json["error"]["retryable"], true);
     }
 

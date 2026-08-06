@@ -143,7 +143,7 @@ impl GatewayBackend for NativeGatewayBackend {
         })
     }
 
-    /// Creates the database, never tolerating an existing one, so a conflict surfaces as `ALREADY_EXISTS`.
+    /// Creates the database, never tolerating an existing one, so a conflict surfaces as `already_exists`.
     async fn create_database(&self, request: &CreateDatabaseRequest) -> Result<(), GatewayError> {
         let mut builder =
             DatabaseDescriptor::builder().custom_properties(request.custom_properties.clone());
@@ -162,7 +162,7 @@ impl GatewayBackend for NativeGatewayBackend {
             })
     }
 
-    /// Drops the database without cascade, so a non-empty database is rejected as `FAILED_PRECONDITION` rather
+    /// Drops the database without cascade, so a non-empty database is rejected as `failed_precondition` rather
     /// than silently dropping its tables.
     async fn drop_database(&self, database: &str) -> Result<(), GatewayError> {
         self.admin()?

@@ -77,7 +77,7 @@ pub(crate) struct ErrorBodySchema {
     as = ErrorEnvelope,
     examples(json!({
         "error": {
-            "code": "NOT_FOUND",
+            "code": "not_found",
             "message": "table does not exist",
             "request_id": "8f6c7f4a-f9b8-4c71-91ec-6e5578d7a913",
             "retryable": false,

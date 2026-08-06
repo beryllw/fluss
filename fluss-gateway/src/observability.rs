@@ -113,28 +113,28 @@ pub const METRIC_DEFINITIONS: &[MetricDefinition] = &[
         &["result"],
     ),
     metric(
-        "fluss_gateway_http_requests_total",
+        "fluss_gateway_rest_requests_total",
         MetricKind::Counter,
         None,
         "Completed REST requests.",
         &["method", "route", "status"],
     ),
     metric(
-        "fluss_gateway_http_request_duration_seconds",
+        "fluss_gateway_rest_request_duration_seconds",
         MetricKind::Histogram,
         Some(Unit::Seconds),
         "REST request duration.",
         &["method", "route"],
     ),
     metric(
-        "fluss_gateway_http_inflight_requests",
+        "fluss_gateway_rest_inflight_requests",
         MetricKind::Gauge,
         None,
         "REST requests currently executing.",
         &[],
     ),
     metric(
-        "fluss_gateway_http_rejections_total",
+        "fluss_gateway_rest_rejections_total",
         MetricKind::Counter,
         None,
         "REST requests rejected by an input-validation limit or the request deadline.",
@@ -267,14 +267,14 @@ pub const METRIC_DEFINITIONS: &[MetricDefinition] = &[
         &["cluster", "result"],
     ),
     metric(
-        "fluss_gateway_write_rows_total",
+        "fluss_gateway_backend_write_rows_total",
         MetricKind::Counter,
         None,
         "Write rows accepted for preflight.",
         &["cluster"],
     ),
     metric(
-        "fluss_gateway_write_decoded_bytes_total",
+        "fluss_gateway_backend_write_bytes_total",
         MetricKind::Counter,
         Some(Unit::Bytes),
         "Write request bytes presented to the decoder.",
@@ -396,14 +396,14 @@ pub fn process_stopped(result: &'static str, duration: Duration) {
 /// Records one completed REST request against the matched route template, never the raw URI.
 pub fn http_request(method: &str, route: &str, status: u16, duration: Duration) {
     metrics::counter!(
-        "fluss_gateway_http_requests_total",
+        "fluss_gateway_rest_requests_total",
         "method" => method.to_string(),
         "route" => route.to_string(),
         "status" => status.to_string()
     )
     .increment(1);
     metrics::histogram!(
-        "fluss_gateway_http_request_duration_seconds",
+        "fluss_gateway_rest_request_duration_seconds",
         "method" => method.to_string(),
         "route" => route.to_string()
     )
@@ -412,7 +412,7 @@ pub fn http_request(method: &str, route: &str, status: u16, duration: Duration) 
 
 /// Adjusts the in-flight request gauge by one in either direction.
 pub fn http_inflight(delta: i8) {
-    let gauge = metrics::gauge!("fluss_gateway_http_inflight_requests");
+    let gauge = metrics::gauge!("fluss_gateway_rest_inflight_requests");
     if delta >= 0 {
         gauge.increment(f64::from(delta));
     } else {
@@ -422,7 +422,7 @@ pub fn http_inflight(delta: i8) {
 
 /// Records one request rejected before reaching a handler, such as `body_size` or `timeout`.
 pub fn http_rejection(reason: &'static str) {
-    metrics::counter!("fluss_gateway_http_rejections_total", "reason" => reason).increment(1);
+    metrics::counter!("fluss_gateway_rest_rejections_total", "reason" => reason).increment(1);
 }
 
 /// Records one backend connection attempt for a configured cluster.
@@ -659,12 +659,12 @@ pub fn write_request(cluster: &str, result: &'static str, duration: Duration) {
 /// Records the rows and decoded bytes accepted by write preflight.
 pub fn write_accepted(cluster: &str, rows: usize, decoded_bytes: u64) {
     if rows > 0 {
-        metrics::counter!("fluss_gateway_write_rows_total", "cluster" => cluster.to_string())
+        metrics::counter!("fluss_gateway_backend_write_rows_total", "cluster" => cluster.to_string())
             .increment(rows as u64);
     }
     if decoded_bytes > 0 {
         metrics::counter!(
-            "fluss_gateway_write_decoded_bytes_total",
+            "fluss_gateway_backend_write_bytes_total",
             "cluster" => cluster.to_string()
         )
         .increment(decoded_bytes);
@@ -755,7 +755,7 @@ mod tests {
     fn metric_inventory_covers_every_required_subsystem() {
         for prefix in [
             "fluss_gateway_process_",
-            "fluss_gateway_http_",
+            "fluss_gateway_rest_",
             "fluss_gateway_backend_",
             "fluss_gateway_catalog_",
             "fluss_gateway_lookup_",

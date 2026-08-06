@@ -555,7 +555,7 @@ impl TryFrom<DataTypeResponse> for DataType {
     /// Converts a wire type into the domain type, rejecting invalid precision, scale, and length.
     ///
     /// Validation runs once on the fully built tree, so a nested failure is reported with the same
-    /// `INVALID_ARGUMENT` envelope as a top-level one.
+    /// `invalid_argument` envelope as a top-level one.
     fn try_from(data_type: DataTypeResponse) -> Result<Self, Self::Error> {
         let domain = to_domain(data_type);
         validate_data_type(&domain)?;

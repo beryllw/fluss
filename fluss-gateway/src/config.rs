@@ -927,7 +927,7 @@ const FLAT_FILE_KEYS: &[(&str, &str)] = &[
     ("gateway.rest.lookup.queue-size", "lookup.queue_size"),
     ("gateway.rest.lookup.max-retries", "lookup.max_retries"),
     (
-        "gateway.rest.lookup.max-concurrent",
+        "gateway.rest.lookup.max-concurrent-requests",
         "lookup.max_concurrent",
     ),
     (
@@ -1949,7 +1949,7 @@ gateway.cluster.analytics_eu.bootstrap.servers: file:9123
             "gateway.metadata.default-page-size: 0\ngateway.metadata.max-page-size: 0\n\
              gateway.metadata.cache-max-entries: 0\ngateway.rest.lookup.max-keys: 0\n\
              gateway.rest.prefix-lookup.max-prefixes: 0\ngateway.rest.prefix-lookup.max-rows-per-prefix: 0\n\
-             gateway.rest.lookup.queue-size: 0\ngateway.rest.lookup.max-concurrent: 0\n\
+             gateway.rest.lookup.queue-size: 0\ngateway.rest.lookup.max-concurrent-requests: 0\n\
              gateway.rest.write.max-rows: 0\n",
         )
         .unwrap_err();

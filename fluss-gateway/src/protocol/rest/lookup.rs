@@ -847,7 +847,7 @@ mod tests {
 
         assert_eq!(json["results"][0]["found"], true);
         assert_eq!(json["results"][1]["found"], false);
-        assert_eq!(json["results"][1]["error"]["code"], "UNAVAILABLE");
+        assert_eq!(json["results"][1]["error"]["code"], "unavailable");
         assert_eq!(json["results"][2]["found"], true);
     }
 
@@ -860,7 +860,7 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let json = body_json(response).await;
-        assert_eq!(json["error"]["code"], "UNAVAILABLE");
+        assert_eq!(json["error"]["code"], "unavailable");
         assert!(
             json["error"]["message"].as_str().unwrap().contains("key 1"),
             "{json}"
@@ -889,7 +889,7 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let json = body_json(response).await;
-        assert_eq!(json["error"]["code"], "INVALID_ARGUMENT");
+        assert_eq!(json["error"]["code"], "invalid_argument");
         assert!(
             json["error"]["message"]
                 .as_str()
@@ -905,7 +905,7 @@ mod tests {
         let response = post(ORDERS_LOOKUP, json!({"keys": [{"region": big, "id": 1}]})).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let json = body_json(response).await;
-        assert_eq!(json["error"]["code"], "INVALID_ARGUMENT");
+        assert_eq!(json["error"]["code"], "invalid_argument");
         assert!(
             json["error"]["message"]
                 .as_str()
@@ -1065,7 +1065,7 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let json = body_json(response).await;
-        assert_eq!(json["error"]["code"], "INVALID_ARGUMENT");
+        assert_eq!(json["error"]["code"], "invalid_argument");
         assert!(
             json["error"]["message"]
                 .as_str()
@@ -1092,7 +1092,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let json = body_json(response).await;
         assert_eq!(json["results"][0]["row_count"], 2);
-        assert_eq!(json["results"][1]["error"]["code"], "UNAVAILABLE");
+        assert_eq!(json["results"][1]["error"]["code"], "unavailable");
         assert_eq!(json["results"][1]["row_count"], 0);
     }
 

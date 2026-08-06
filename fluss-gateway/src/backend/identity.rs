@@ -20,7 +20,7 @@
 //! Under `connection.identity-mode: user` every authenticated principal gets its own Fluss
 //! connection: it authenticates with the super-user service account and carries the principal
 //! name as the SASL authorization id, so Fluss authorizes as the impersonated end user. The pool
-//! is keyed by principal name, capped by `connection.max` (exceeded → 429 `RESOURCE_EXHAUSTED`
+//! is keyed by principal name, capped by `connection.max` (exceeded → 429 `resource_exhausted`
 //! with `Retry-After`), and idle entries are reclaimed lazily on access after
 //! `connection.idle-timeout`.
 //!

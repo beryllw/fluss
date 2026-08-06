@@ -827,7 +827,7 @@ mod tests {
             .await;
             assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{broken}");
             let json = response_json(response).await;
-            assert_eq!(json["error"]["code"], "INVALID_ARGUMENT", "{broken}");
+            assert_eq!(json["error"]["code"], "invalid_argument", "{broken}");
         }
     }
 
@@ -874,7 +874,7 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::CONFLICT);
         let body = response_json(response).await;
-        assert_eq!(body["error"]["code"], "ALREADY_EXISTS");
+        assert_eq!(body["error"]["code"], "already_exists");
         assert_eq!(body["error"]["details"]["resource_kind"], "database");
         assert_eq!(body["error"]["details"]["resource_name"], "fluss");
     }
@@ -892,7 +892,7 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::CONFLICT);
         let body = response_json(response).await;
-        assert_eq!(body["error"]["code"], "ALREADY_EXISTS");
+        assert_eq!(body["error"]["code"], "already_exists");
         assert_eq!(body["error"]["details"]["resource_kind"], "table");
         assert_eq!(body["error"]["details"]["resource_name"], "fluss.users");
     }
@@ -1123,7 +1123,7 @@ mod tests {
         assert_eq!(conflict.status(), StatusCode::CONFLICT);
         assert_eq!(
             response_json(conflict).await["error"]["code"],
-            "FAILED_PRECONDITION"
+            "failed_precondition"
         );
 
         for table in ["users", "orders", "events"] {
@@ -1200,7 +1200,7 @@ mod tests {
         assert_eq!(stray.status(), StatusCode::BAD_REQUEST);
         assert_eq!(
             response_json(stray).await["error"]["code"],
-            "INVALID_ARGUMENT"
+            "invalid_argument"
         );
     }
 
@@ -1247,7 +1247,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(
             response_json(response).await["error"]["code"],
-            "INVALID_ARGUMENT"
+            "invalid_argument"
         );
     }
 
