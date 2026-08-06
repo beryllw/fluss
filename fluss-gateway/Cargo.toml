@@ -68,6 +68,8 @@ parking_lot = "0.12"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_urlencoded = "0.7"
+# The gateway.yaml configuration file is YAML with flat dotted keys (FIP-49).
+serde_yaml = "0.9"
 tokio = { version = "1.44.2", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 utoipa = { version = "5", features = ["axum_extras"] }

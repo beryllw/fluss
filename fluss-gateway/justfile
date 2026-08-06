@@ -54,7 +54,7 @@ doc:
 openapi:
     cargo test --lib protocol::rest::openapi::tests::export_checked_in_document -- --ignored --exact
 
-# Run the gateway binary, forwarding any flags, e.g. just run --config gateway.toml
+# Run the gateway binary, forwarding any flags, e.g. just run --config gateway.yaml
 run *flags:
     cargo run -- {{flags}}
 

@@ -25,7 +25,7 @@ use fluss_gateway::{lifecycle, observability};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-/// Command-line arguments. Everything else is configured through the TOML file or the environment.
+/// Command-line arguments. Everything else is configured through the `gateway.yaml` file or the environment.
 #[derive(Debug, Parser)]
 #[command(
     name = "fluss-gateway",
@@ -33,11 +33,11 @@ use std::path::PathBuf;
     version
 )]
 struct Cli {
-    /// Path to the TOML configuration file.
+    /// Path to the `gateway.yaml` configuration file (YAML with flat dotted keys).
     #[arg(long, value_name = "FILE")]
     config: Option<PathBuf>,
 
-    /// Overrides `[server.rest] bind_address` (e.g. `127.0.0.1:8080`).
+    /// Overrides `gateway.rest.listen` (e.g. `127.0.0.1:8080`).
     #[arg(long, value_name = "ADDR")]
     bind_address: Option<String>,
 }

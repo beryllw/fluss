@@ -17,25 +17,36 @@
 
 //! Gateway configuration for the REST service.
 //!
-//! One TOML file plus complete env overrides plus targeted CLI overrides. Precedence: CLI > env > file > defaults.
-//! Parsing is strict: unknown fields (file or env) are rejected, durations must be `<int><ms|s|m|h>`, byte sizes
-//! are plain integers or `<int><B|KB|KiB|MB|MiB|GB|GiB>`, and both reject zero.
+//! One `gateway.yaml` file plus complete env overrides plus targeted CLI overrides. Precedence:
+//! CLI > env > file > defaults. Parsing is strict: unknown keys (file or env) are rejected, durations must be
+//! `<int><ms|s|m|h>`, byte sizes are plain integers or `<int><B|KB|KiB|MB|MiB|GB|GiB>`, and both reject zero.
 //!
 //! # Schema shape
 //!
-//! The FIP-49 plan sketches a flat `[rest]`/`[limits]`/`[metrics]` sample with hyphenated keys. This module
-//! implements the sectioned snake_case schema instead (`[server.rest]`, `[server.metrics]`, `[lookup]`,
-//! `[write]`, …), which supersedes that sample by explicit user decision: it is the schema proven on the
-//! prior-art branch, it maps one-to-one onto the `FLUSS_GATEWAY__*` override convention, and typed sections keep
-//! `deny_unknown_fields` meaningful per subsystem.
+//! The file is YAML whose top level is a mapping of **flat dotted keys**, exactly as documented by FIP-49
+//! §Gateway Configuration and aligned with the Fluss `server.yaml` convention:
 //!
-//! There is deliberately **no `[security]` section and no concurrency-permit key**. The gateway performs no
-//! authentication, authorisation, TLS termination, or rate limiting; the only request bounds are the
-//! input-validation caps in `[server.rest] max_body_bytes`, `[lookup]`, and `[write]`.
+//! ```yaml
+//! gateway.clusters: default
+//! gateway.cluster.default.bootstrap.servers: 127.0.0.1:9123
+//! gateway.rest.listen: 0.0.0.0:8080
+//! gateway.rest.write.max-request-bytes: 32MiB
+//! ```
 //!
-//! Env override convention: `FLUSS_GATEWAY__<SECTION>__<KEY>`, with `__` separating path components. For example,
-//! `FLUSS_GATEWAY__SERVER_REST__BIND_ADDRESS` overrides `[server.rest].bind_address`, while
-//! `FLUSS_GATEWAY__CLUSTERS__ANALYTICS_EU__BOOTSTRAP_SERVERS` overrides
+//! Keys named by the FIP keep their FIP spelling; internal keys the FIP does not cover (health probing,
+//! metadata caching, shutdown draining) follow the same `gateway.<area>.<kebab-key>` style. Each flat key is
+//! translated to a field of the typed sections below before deserialization, so `deny_unknown_fields` stays
+//! meaningful per subsystem and an unrecognised flat key is rejected with the exact name the operator wrote.
+//! This supersedes the earlier sectioned TOML schema by explicit user decision: the REST contract and the
+//! configuration surface should quote one vocabulary, the FIP's.
+//!
+//! There is deliberately **no `gateway.security.*` section and no concurrency-permit key**. The gateway
+//! performs no authentication, authorisation, TLS termination, or rate limiting; the only request bounds are
+//! the input-validation caps under `gateway.rest.*`.
+//!
+//! Env override convention (unchanged): `FLUSS_GATEWAY__<SECTION>__<KEY>`, with `__` separating path
+//! components of the *internal* sections. For example, `FLUSS_GATEWAY__SERVER_REST__BIND_ADDRESS` overrides
+//! the REST listener, while `FLUSS_GATEWAY__CLUSTERS__ANALYTICS_EU__BOOTSTRAP_SERVERS` overrides
 //! `[clusters.analytics_eu].bootstrap_servers`.
 
 use crate::application::types::ClusterId;
@@ -715,6 +726,214 @@ fn attribute(message: String, overrides: &[(String, String, Value)]) -> ConfigEr
     ConfigError::Parse(message)
 }
 
+/// The flat `gateway.*` file vocabulary, mapped to the dotted paths of the typed sections. FIP-named keys keep
+/// their FIP spelling; the remaining internal keys follow the same `gateway.<area>.<kebab-key>` style.
+///
+/// `gateway.rest.write.request-timeout` maps to the shared REST deadline: the gateway runs every request,
+/// not only writes, under that server-side budget, and the write path additionally bounds native delivery
+/// with `gateway.rest.write.max-delivery-time` below it.
+const FLAT_FILE_KEYS: &[(&str, &str)] = &[
+    ("gateway.instance-id", "server.instance_id"),
+    ("gateway.rest.listen", "server.rest.bind_address"),
+    (
+        "gateway.rest.write.request-timeout",
+        "server.rest.request_timeout",
+    ),
+    (
+        "gateway.rest.write.max-request-bytes",
+        "server.rest.max_body_bytes",
+    ),
+    ("gateway.rest.write.max-rows", "write.max_rows"),
+    (
+        "gateway.rest.write.max-delivery-time",
+        "write.max_delivery_time",
+    ),
+    ("gateway.rest.lookup.max-keys", "lookup.max_keys"),
+    ("gateway.rest.lookup.max-key-bytes", "lookup.max_key_bytes"),
+    ("gateway.rest.lookup.queue-size", "lookup.queue_size"),
+    ("gateway.rest.lookup.max-retries", "lookup.max_retries"),
+    (
+        "gateway.rest.lookup.max-concurrent",
+        "lookup.max_concurrent",
+    ),
+    (
+        "gateway.rest.prefix-lookup.max-prefixes",
+        "lookup.max_prefixes",
+    ),
+    (
+        "gateway.rest.prefix-lookup.max-rows-per-prefix",
+        "lookup.max_rows_per_prefix",
+    ),
+    ("gateway.metrics.enabled", "server.metrics.enabled"),
+    (
+        "gateway.metrics.exporter.prometheus.listen",
+        "server.metrics.bind_address",
+    ),
+    ("gateway.health.probe-interval", "health.probe_interval"),
+    ("gateway.health.probe-timeout", "health.probe_timeout"),
+    ("gateway.health.stale-after", "health.stale_after"),
+    (
+        "gateway.health.reconnect-initial-backoff",
+        "health.reconnect_initial_backoff",
+    ),
+    (
+        "gateway.health.reconnect-max-backoff",
+        "health.reconnect_max_backoff",
+    ),
+    (
+        "gateway.health.reconnect-attempt-timeout",
+        "health.reconnect_attempt_timeout",
+    ),
+    (
+        "gateway.metadata.default-page-size",
+        "metadata.default_page_size",
+    ),
+    ("gateway.metadata.max-page-size", "metadata.max_page_size"),
+    (
+        "gateway.metadata.cache-max-entries",
+        "metadata.cache_max_entries",
+    ),
+    ("gateway.metadata.cache-ttl", "metadata.cache_ttl"),
+    ("gateway.shutdown.drain-timeout", "shutdown.drain_timeout"),
+];
+
+/// The per-cluster key suffixes allowed under `gateway.cluster.<id>.`, mapped to [`ClusterConfig`] fields.
+const FLAT_CLUSTER_KEYS: &[(&str, &str)] = &[
+    ("bootstrap.servers", "bootstrap_servers"),
+    ("connect-timeout", "connect_timeout"),
+    ("request-timeout", "request_timeout"),
+];
+
+/// One recognised flat configuration key.
+enum FlatKey {
+    /// The `gateway.clusters` declaration listing every cluster ID the file may configure.
+    ClusterDeclaration,
+    /// Any other vocabulary key, resolved to its dotted struct path.
+    Path(String),
+}
+
+/// Resolves one flat file key against the vocabulary, or rejects it with the exact name the operator wrote.
+fn resolve_flat_key(key: &str) -> Result<FlatKey, ConfigError> {
+    if key == "gateway.clusters" {
+        return Ok(FlatKey::ClusterDeclaration);
+    }
+    if let Some((_, path)) = FLAT_FILE_KEYS.iter().find(|(flat, _)| *flat == key) {
+        return Ok(FlatKey::Path((*path).to_string()));
+    }
+    if let Some(cluster_key) = key.strip_prefix("gateway.cluster.")
+        && let Some((id, suffix)) = cluster_key.split_once('.')
+    {
+        if let Some((_, field)) = FLAT_CLUSTER_KEYS.iter().find(|(flat, _)| *flat == suffix) {
+            return Ok(FlatKey::Path(format!("clusters.{id}.{field}")));
+        }
+    }
+    Err(ConfigError::Parse(format!(
+        "unknown configuration key: {key}"
+    )))
+}
+
+/// Converts one YAML scalar or sequence into the internal TOML value model. Nested mappings are rejected
+/// because the file contract is flat dotted keys.
+fn yaml_to_toml(value: &serde_yaml::Value, key: &str) -> Result<Value, ConfigError> {
+    match value {
+        serde_yaml::Value::Bool(v) => Ok(Value::Boolean(*v)),
+        serde_yaml::Value::Number(v) => {
+            if let Some(int) = v.as_i64() {
+                Ok(Value::Integer(int))
+            } else if let Some(float) = v.as_f64() {
+                Ok(Value::Float(float))
+            } else {
+                Err(ConfigError::Parse(format!("{key}: unsupported number")))
+            }
+        }
+        serde_yaml::Value::String(v) => Ok(Value::String(v.clone())),
+        serde_yaml::Value::Sequence(items) => Ok(Value::Array(
+            items
+                .iter()
+                .map(|item| yaml_to_toml(item, key))
+                .collect::<Result<_, _>>()?,
+        )),
+        serde_yaml::Value::Null => Err(ConfigError::Parse(format!("{key}: value is missing"))),
+        serde_yaml::Value::Mapping(_) | serde_yaml::Value::Tagged(_) => Err(ConfigError::Parse(
+            format!("{key}: nested values are not allowed, configuration keys are flat"),
+        )),
+    }
+}
+
+/// Reads the cluster IDs of a `gateway.clusters` declaration, given as CSV or as a YAML list.
+fn declared_cluster_ids(value: &serde_yaml::Value) -> Result<Vec<String>, ConfigError> {
+    let entries: Vec<String> = match value {
+        serde_yaml::Value::String(csv) => csv.split(',').map(|id| id.trim().to_string()).collect(),
+        serde_yaml::Value::Sequence(items) => items
+            .iter()
+            .map(|item| {
+                item.as_str().map(str::to_string).ok_or_else(|| {
+                    ConfigError::Parse("gateway.clusters: entries must be strings".to_string())
+                })
+            })
+            .collect::<Result<_, _>>()?,
+        _ => {
+            return Err(ConfigError::Parse(
+                "gateway.clusters: expected a comma-separated string or a list".to_string(),
+            ));
+        }
+    };
+    Ok(entries.into_iter().filter(|id| !id.is_empty()).collect())
+}
+
+/// Parses the flat-key YAML file into the internal table model and enforces the `gateway.clusters`
+/// declaration: when present, it is authoritative, so a configured but undeclared cluster is rejected and a
+/// declared but unconfigured cluster gets the connection defaults.
+fn read_config_file(contents: &str) -> Result<toml::Table, ConfigError> {
+    let document: serde_yaml::Value =
+        serde_yaml::from_str(contents).map_err(|e| ConfigError::Parse(e.to_string()))?;
+    let mut table = toml::Table::new();
+    if document.is_null() {
+        return Ok(table);
+    }
+    let mapping = document.as_mapping().ok_or_else(|| {
+        ConfigError::Parse(
+            "configuration must be a mapping of flat dotted keys (gateway.…: value)".to_string(),
+        )
+    })?;
+
+    let mut declared: Option<Vec<String>> = None;
+    for (key, value) in mapping {
+        let key = key
+            .as_str()
+            .ok_or_else(|| ConfigError::Parse("configuration keys must be strings".to_string()))?;
+        match resolve_flat_key(key)? {
+            FlatKey::ClusterDeclaration => declared = Some(declared_cluster_ids(value)?),
+            FlatKey::Path(path) => insert_path(&mut table, &path, yaml_to_toml(value, key)?),
+        }
+    }
+
+    if let Some(declared) = declared {
+        // The declaration is authoritative even when empty: an empty list yields an empty cluster map,
+        // which validation rejects, instead of silently falling back to the built-in default cluster.
+        let clusters = table
+            .entry("clusters".to_string())
+            .or_insert_with(|| Value::Table(toml::Table::new()))
+            .as_table_mut()
+            .expect("clusters table inserted above");
+        for id in &declared {
+            clusters
+                .entry(id.clone())
+                .or_insert_with(|| Value::Table(toml::Table::new()));
+        }
+        if let Some(clusters) = table.get("clusters").and_then(Value::as_table) {
+            for id in clusters.keys() {
+                if !declared.iter().any(|declared_id| declared_id == id) {
+                    return Err(ConfigError::Parse(format!(
+                        "gateway.cluster.{id}.* is configured but {id} is not declared in gateway.clusters"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(table)
+}
+
 /// Loads configuration from all sources with precedence CLI > env > file > defaults.
 ///
 /// `env` is passed explicitly (rather than read from the process environment) so loading is deterministic and
@@ -728,9 +947,7 @@ pub fn load(
     if let Some(path) = path {
         let contents = std::fs::read_to_string(path)
             .map_err(|e| ConfigError::Io(format!("{}: {e}", path.display())))?;
-        table = contents
-            .parse::<toml::Table>()
-            .map_err(|e| ConfigError::Parse(e.to_string()))?;
+        table = read_config_file(&contents)?;
     }
 
     // Each override is kept with the source that wrote it, so a failure names what the operator wrote.
@@ -852,20 +1069,13 @@ mod tests {
     fn file_overrides_defaults() {
         let config = load_file(
             r#"
-            [server.rest]
-            bind_address = "127.0.0.1:18080"
-            request_timeout = "5s"
-            max_body_bytes = "2MiB"
-
-            [clusters.default]
-            bootstrap_servers = ["fluss-1:9123", "fluss-2:9123"]
-
-            [metadata]
-            default_page_size = 25
-
-            [write]
-            max_delivery_time = "4s"
-            "#,
+gateway.rest.listen: 127.0.0.1:18080
+gateway.rest.write.request-timeout: 5s
+gateway.rest.write.max-request-bytes: 2MiB
+gateway.rest.write.max-delivery-time: 4s
+gateway.cluster.default.bootstrap.servers: ["fluss-1:9123", "fluss-2:9123"]
+gateway.metadata.default-page-size: 25
+"#,
         )
         .unwrap();
         assert_eq!(
@@ -885,16 +1095,108 @@ mod tests {
         assert_eq!(config.write.max_delivery_time.get(), Duration::from_secs(4));
     }
 
+    /// The configuration surface documented by FIP-49 §Gateway Configuration, restricted to the keys the
+    /// gateway implements today, parses as one flat dotted-key YAML document.
+    #[test]
+    fn fip_yaml_example_parses_with_flat_dotted_keys() {
+        let config = load_file(
+            r#"
+gateway.clusters: default
+gateway.cluster.default.bootstrap.servers: 127.0.0.1:9123
+gateway.rest.listen: 0.0.0.0:8080
+gateway.rest.write.max-request-bytes: 32MiB
+gateway.rest.write.request-timeout: 30s
+gateway.rest.lookup.max-keys: 128
+gateway.rest.prefix-lookup.max-prefixes: 16
+gateway.rest.prefix-lookup.max-rows-per-prefix: 1000
+gateway.metrics.enabled: true
+gateway.metrics.exporter.prometheus.listen: 0.0.0.0:9095
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cluster(&config, "default").bootstrap_servers,
+            vec!["127.0.0.1:9123"]
+        );
+        assert_eq!(
+            config.server.rest.bind_address,
+            "0.0.0.0:8080".parse().unwrap()
+        );
+        assert_eq!(config.server.rest.max_body_bytes.bytes(), 32 * 1024 * 1024);
+        assert_eq!(
+            config.server.rest.request_timeout.get(),
+            Duration::from_secs(30)
+        );
+        assert_eq!(config.lookup.max_keys, 128);
+        assert_eq!(config.lookup.max_prefixes, 16);
+        assert_eq!(config.lookup.max_rows_per_prefix, 1000);
+        assert!(config.server.metrics.enabled);
+        assert_eq!(
+            config.server.metrics.bind_address,
+            "0.0.0.0:9095".parse().unwrap()
+        );
+    }
+
+    /// A key outside the documented vocabulary is rejected with the exact flat name the operator wrote,
+    /// not a translated internal path.
+    #[test]
+    fn unknown_flat_key_is_rejected_with_its_original_name() {
+        for contents in [
+            "gateway.rest.listenn: 0.0.0.0:8080\n",
+            "rest.listen: 0.0.0.0:8080\n",
+            "gateway.rest.lookup.max-keyz: 5\n",
+        ] {
+            let error = load_file(contents).unwrap_err();
+            assert!(matches!(error, ConfigError::Parse(_)), "got: {error:?}");
+            let key = contents.split(':').next().unwrap();
+            assert!(error.to_string().contains(key), "{key}: {error}");
+        }
+    }
+
+    /// `gateway.clusters` is the authoritative declaration: configuring an undeclared cluster is an error.
+    #[test]
+    fn undeclared_cluster_keys_are_rejected() {
+        let error = load_file(
+            "gateway.clusters: default\ngateway.cluster.analytics.bootstrap.servers: a:9123\n",
+        )
+        .unwrap_err();
+        assert!(matches!(error, ConfigError::Parse(_)), "got: {error:?}");
+        assert!(error.to_string().contains("analytics"), "got: {error}");
+    }
+
+    /// A declared cluster without further keys is reachable with the built-in connection defaults.
+    #[test]
+    fn declared_but_unconfigured_cluster_gets_defaults() {
+        let config = load_file("gateway.clusters: default, analytics\n").unwrap();
+        assert_eq!(config.clusters.len(), 2);
+        assert_eq!(
+            cluster(&config, "analytics").bootstrap_servers,
+            vec!["127.0.0.1:9123"]
+        );
+    }
+
+    /// The bootstrap list accepts both the FIP csv form and a YAML list.
+    #[test]
+    fn bootstrap_servers_accept_csv_and_yaml_list() {
+        let config =
+            load_file("gateway.cluster.default.bootstrap.servers: a:9123, b:9123\n").unwrap();
+        assert_eq!(
+            cluster(&config, "default").bootstrap_servers,
+            vec!["a:9123", "b:9123"]
+        );
+
+        let config =
+            load_file("gateway.cluster.default.bootstrap.servers: [a:9123, b:9123]\n").unwrap();
+        assert_eq!(
+            cluster(&config, "default").bootstrap_servers,
+            vec!["a:9123", "b:9123"]
+        );
+    }
+
     #[test]
     fn write_delivery_and_response_budget_must_fit_request_timeout() {
         let error = load_file(
-            r#"
-            [server.rest]
-            request_timeout = "20s"
-
-            [write]
-            max_delivery_time = "20s"
-            "#,
+            "gateway.rest.write.request-timeout: 20s\ngateway.rest.write.max-delivery-time: 20s\n",
         )
         .unwrap_err();
 
@@ -907,15 +1209,10 @@ mod tests {
     fn env_overrides_file() {
         let file = write_temp_config(
             r#"
-            [server.rest]
-            bind_address = "127.0.0.1:18080"
-
-            [server.metrics]
-            enabled = true
-
-            [clusters.default]
-            bootstrap_servers = ["from-file:9123"]
-            "#,
+gateway.rest.listen: 127.0.0.1:18080
+gateway.metrics.enabled: true
+gateway.cluster.default.bootstrap.servers: from-file:9123
+"#,
         );
         let mut env = no_env();
         env.insert(
@@ -967,12 +1264,9 @@ mod tests {
     fn multiple_clusters_and_exact_environment_paths_are_supported() {
         let file = write_temp_config(
             r#"
-            [clusters.default]
-            bootstrap_servers = ["default:9123"]
-
-            [clusters.analytics_eu]
-            bootstrap_servers = ["file:9123"]
-            "#,
+gateway.cluster.default.bootstrap.servers: default:9123
+gateway.cluster.analytics_eu.bootstrap.servers: file:9123
+"#,
         );
         let mut env = no_env();
         env.insert(
@@ -989,7 +1283,7 @@ mod tests {
 
     #[test]
     fn cluster_map_and_ids_are_strict() {
-        let error = load_file("[clusters]\n").unwrap_err();
+        let error = load_file("gateway.clusters: \"\"\n").unwrap_err();
         assert!(
             problems(error)
                 .iter()
@@ -998,7 +1292,7 @@ mod tests {
 
         for id in ["Default", "two-clusters", "_hidden"] {
             let error = load_file(&format!(
-                "[clusters.{id}]\nbootstrap_servers = [\"127.0.0.1:9123\"]\n"
+                "gateway.cluster.{id}.bootstrap.servers: 127.0.0.1:9123\n"
             ))
             .unwrap_err();
             assert!(matches!(error, ConfigError::Parse(_)), "{id}: {error:?}");
@@ -1007,7 +1301,7 @@ mod tests {
 
     #[test]
     fn cli_overrides_env_and_file() {
-        let file = write_temp_config("[server.rest]\nbind_address = \"127.0.0.1:18080\"\n");
+        let file = write_temp_config("gateway.rest.listen: 127.0.0.1:18080\n");
         let mut env = no_env();
         env.insert(
             "FLUSS_GATEWAY__SERVER_REST__BIND_ADDRESS".to_string(),
@@ -1026,7 +1320,7 @@ mod tests {
     #[test]
     fn missing_file_reported() {
         let error = load(
-            Some(Path::new("/nonexistent/fluss-gateway.toml")),
+            Some(Path::new("/nonexistent/gateway.yaml")),
             &no_env(),
             &CliOverrides::default(),
         )
@@ -1036,20 +1330,32 @@ mod tests {
 
     #[test]
     fn unknown_file_field_rejected() {
-        let error = load_file("[server.rest]\nbind_addres = \"127.0.0.1:8080\"\n").unwrap_err();
+        let error = load_file("gateway.rest.listenn: 127.0.0.1:8080\n").unwrap_err();
         assert!(matches!(error, ConfigError::Parse(_)), "got: {error:?}");
-        assert!(error.to_string().contains("bind_addres"), "got: {error}");
+        assert!(
+            error.to_string().contains("gateway.rest.listenn"),
+            "got: {error}"
+        );
     }
 
     #[test]
-    fn malformed_file_reports_line() {
-        let error = load_file("[lookup]\nmax_keys = 1\nmax_keys = 2\n").unwrap_err();
-        assert!(error.to_string().contains("line 3"), "got: {error}");
+    fn malformed_file_reports_position() {
+        let error = load_file("gateway.rest.lookup.max-keys: [1\n").unwrap_err();
+        assert!(matches!(error, ConfigError::Parse(_)), "got: {error:?}");
+        assert!(error.to_string().contains("line"), "got: {error}");
+    }
+
+    #[test]
+    fn duplicate_flat_key_rejected() {
+        let error = load_file("gateway.rest.lookup.max-keys: 1\ngateway.rest.lookup.max-keys: 2\n")
+            .unwrap_err();
+        assert!(matches!(error, ConfigError::Parse(_)), "got: {error:?}");
+        assert!(error.to_string().contains("duplicate"), "got: {error}");
     }
 
     #[test]
     fn unknown_section_rejected() {
-        let error = load_file("[query]\nmax_concurrent = 32\n").unwrap_err();
+        let error = load_file("gateway.query.max-concurrent: 32\n").unwrap_err();
         assert!(matches!(error, ConfigError::Parse(_)), "got: {error:?}");
         assert!(error.to_string().contains("query"), "got: {error}");
     }
@@ -1084,7 +1390,7 @@ mod tests {
 
     #[test]
     fn file_error_under_a_section_with_an_env_override_names_the_file() {
-        let file = write_temp_config("[server]\ninstance_i = \"x\"\n");
+        let file = write_temp_config("gateway.metadata.cache-ttl: 0s\n");
         let mut env = no_env();
         env.insert(
             "FLUSS_GATEWAY__SERVER_REST__BIND_ADDRESS".to_string(),
@@ -1092,7 +1398,11 @@ mod tests {
         );
         let error = load(Some(file.path()), &env, &CliOverrides::default()).unwrap_err();
         assert!(matches!(error, ConfigError::Parse(_)), "got: {error:?}");
-        assert!(error.to_string().contains("instance_i"), "got: {error}");
+        assert!(error.to_string().contains("cache_ttl"), "got: {error}");
+        assert!(
+            !error.to_string().contains("FLUSS_GATEWAY__"),
+            "file problem misattributed to the env override: {error}"
+        );
     }
 
     #[test]
@@ -1147,7 +1457,8 @@ mod tests {
     #[test]
     fn invalid_duration_rejected() {
         for bad in ["60", "60 s", "6.5s", "s", "60d", "-1s"] {
-            let error = load_file(&format!("[shutdown]\ndrain_timeout = \"{bad}\"\n")).unwrap_err();
+            let error =
+                load_file(&format!("gateway.shutdown.drain-timeout: \"{bad}\"\n")).unwrap_err();
             assert!(matches!(error, ConfigError::Parse(_)), "{bad}: {error:?}");
             assert!(
                 error.to_string().contains("drain_timeout"),
@@ -1159,7 +1470,8 @@ mod tests {
     #[test]
     fn invalid_byte_size_rejected() {
         for bad in ["\"4Mb\"", "\"MiB\"", "-1", "\"1.5MiB\""] {
-            let error = load_file(&format!("[lookup]\nmax_key_bytes = {bad}\n")).unwrap_err();
+            let error =
+                load_file(&format!("gateway.rest.lookup.max-key-bytes: {bad}\n")).unwrap_err();
             assert!(matches!(error, ConfigError::Parse(_)), "{bad}: {error:?}");
             assert!(
                 error.to_string().contains("max_key_bytes"),
@@ -1171,10 +1483,13 @@ mod tests {
     #[test]
     fn zero_durations_and_sizes_rejected_while_parsing() {
         for (key, contents) in [
-            ("cache_ttl", "[metadata]\ncache_ttl = \"0s\"\n"),
-            ("drain_timeout", "[shutdown]\ndrain_timeout = \"0ms\"\n"),
-            ("max_body_bytes", "[server.rest]\nmax_body_bytes = 0\n"),
-            ("max_key_bytes", "[lookup]\nmax_key_bytes = \"0MiB\"\n"),
+            ("cache_ttl", "gateway.metadata.cache-ttl: 0s\n"),
+            ("drain_timeout", "gateway.shutdown.drain-timeout: 0ms\n"),
+            (
+                "max_body_bytes",
+                "gateway.rest.write.max-request-bytes: 0\n",
+            ),
+            ("max_key_bytes", "gateway.rest.lookup.max-key-bytes: 0MiB\n"),
         ] {
             let error = load_file(contents).unwrap_err();
             assert!(matches!(error, ConfigError::Parse(_)), "{key}: {error:?}");
@@ -1185,9 +1500,11 @@ mod tests {
     #[test]
     fn zero_counts_rejected_by_validation() {
         let error = load_file(
-            "[metadata]\ndefault_page_size = 0\nmax_page_size = 0\ncache_max_entries = 0\n\
-             [lookup]\nmax_keys = 0\nmax_prefixes = 0\nmax_rows_per_prefix = 0\nqueue_size = 0\nmax_concurrent = 0\n\
-             [write]\nmax_rows = 0\n",
+            "gateway.metadata.default-page-size: 0\ngateway.metadata.max-page-size: 0\n\
+             gateway.metadata.cache-max-entries: 0\ngateway.rest.lookup.max-keys: 0\n\
+             gateway.rest.prefix-lookup.max-prefixes: 0\ngateway.rest.prefix-lookup.max-rows-per-prefix: 0\n\
+             gateway.rest.lookup.queue-size: 0\ngateway.rest.lookup.max-concurrent: 0\n\
+             gateway.rest.write.max-rows: 0\n",
         )
         .unwrap_err();
         let problems = problems(error);
@@ -1213,14 +1530,14 @@ mod tests {
     fn removed_and_out_of_scope_configuration_keys_are_rejected() {
         for contents in [
             // Scan and cursor state, dropped with the stateless contract.
-            "[scan]\nmax_open_global = 8\n",
-            "[scan]\ncursor_ttl = \"1m\"\n",
+            "gateway.scan.max-open-global: 8\n",
+            "gateway.scan.cursor-ttl: 1m\n",
             // Rate limiting, dropped by directive.
-            "[server.rest]\nmax_concurrent_requests = 64\n",
-            "[write]\nmax_concurrent_requests = 8\n",
-            // Authentication and transport security, out of scope.
-            "[security]\nauthentication = \"trust\"\n",
-            "[server]\ntls_cert = \"/etc/tls.pem\"\n",
+            "gateway.rest.write.max-concurrent-requests: 64\n",
+            "gateway.rest.write.rate-limit.enabled: true\n",
+            // Authentication and transport security, out of scope until their tasks land.
+            "gateway.security.authentication: trust\n",
+            "gateway.tls.cert: /etc/tls.pem\n",
         ] {
             assert!(load_file(contents).is_err(), "accepted: {contents}");
         }
@@ -1228,14 +1545,16 @@ mod tests {
 
     #[test]
     fn empty_bootstrap_rejected() {
-        let error = load_file("[clusters.default]\nbootstrap_servers = []\n").unwrap_err();
+        let error = load_file("gateway.cluster.default.bootstrap.servers: []\n").unwrap_err();
         assert!(matches!(error, ConfigError::Invalid(_)), "got: {error:?}");
     }
 
     #[test]
     fn contradictory_page_sizes_rejected() {
-        let error =
-            load_file("[metadata]\ndefault_page_size = 100\nmax_page_size = 10\n").unwrap_err();
+        let error = load_file(
+            "gateway.metadata.default-page-size: 100\ngateway.metadata.max-page-size: 10\n",
+        )
+        .unwrap_err();
         assert!(
             problems(error)
                 .iter()
@@ -1243,7 +1562,7 @@ mod tests {
         );
 
         let error = load_file(&format!(
-            "[metadata]\nmax_page_size = {}\n",
+            "gateway.metadata.max-page-size: {}\n",
             METADATA_MAX_PAGE_SIZE_CEILING + 1
         ))
         .unwrap_err();
@@ -1257,8 +1576,8 @@ mod tests {
     #[test]
     fn contradictory_health_timing_rejected() {
         let error = load_file(
-            "[health]\nprobe_interval = \"5s\"\nprobe_timeout = \"10s\"\n\
-             reconnect_initial_backoff = \"1m\"\nreconnect_max_backoff = \"10s\"\n",
+            "gateway.health.probe-interval: 5s\ngateway.health.probe-timeout: 10s\n\
+             gateway.health.reconnect-initial-backoff: 1m\ngateway.health.reconnect-max-backoff: 10s\n",
         )
         .unwrap_err();
         let problems = problems(error);
@@ -1279,7 +1598,7 @@ mod tests {
     #[test]
     fn metrics_address_must_differ_from_rest_address() {
         let error = load_file(
-            "[server.rest]\nbind_address = \"127.0.0.1:9095\"\n[server.metrics]\nbind_address = \"127.0.0.1:9095\"\n",
+            "gateway.rest.listen: 127.0.0.1:9095\ngateway.metrics.exporter.prometheus.listen: 127.0.0.1:9095\n",
         )
         .unwrap_err();
         assert!(
@@ -1291,7 +1610,7 @@ mod tests {
 
     #[test]
     fn non_loopback_bind_is_accepted_without_an_instance_id_but_warns() {
-        let config = load_file("[server.rest]\nbind_address = \"0.0.0.0:8080\"\n").unwrap();
+        let config = load_file("gateway.rest.listen: 0.0.0.0:8080\n").unwrap();
         assert!(config.server.instance_id.is_none());
         assert_eq!(config.warnings().len(), 1);
         assert!(config.warnings()[0].contains("not loopback"));
@@ -1304,7 +1623,7 @@ mod tests {
 
     #[test]
     fn malformed_instance_id_rejected() {
-        let error = load_file("[server]\ninstance_id = \"has space\"\n").unwrap_err();
+        let error = load_file("gateway.instance-id: has space\n").unwrap_err();
         assert!(
             problems(error)
                 .iter()
