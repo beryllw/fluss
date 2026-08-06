@@ -36,6 +36,11 @@ pub struct InnerWriteBatch {
     results: BroadcastOnce<BatchWriteResult>,
     completed: AtomicBool,
     attempts: AtomicI32,
+    /// Whether the batch's most recent completed delivery attempt was hard-rejected by storage
+    /// backpressure. A rejected batch re-enters the queue provably unwritten, so expiring there
+    /// surfaces the typed retriable code (FIP-49 `storage_backpressure`); a later failure of a
+    /// different kind clears it, because that outcome may be indeterminate.
+    backpressure_rejected: AtomicBool,
     drained_ms: i64,
     batch_sequence: i32,
     writer_id: i64,
@@ -51,6 +56,7 @@ impl InnerWriteBatch {
             results: Default::default(),
             completed: AtomicBool::new(false),
             attempts: AtomicI32::new(0),
+            backpressure_rejected: AtomicBool::new(false),
             drained_ms: -1,
             batch_sequence: NO_BATCH_SEQUENCE,
             writer_id: NO_WRITER_ID,
@@ -96,6 +102,18 @@ impl InnerWriteBatch {
 
     fn drained(&mut self, now_ms: i64) {
         self.drained_ms = max(self.drained_ms, now_ms);
+    }
+
+    fn mark_backpressure_rejected(&self) {
+        self.backpressure_rejected.store(true, Ordering::Release);
+    }
+
+    fn clear_backpressure_rejected(&self) {
+        self.backpressure_rejected.store(false, Ordering::Release);
+    }
+
+    fn backpressure_rejected(&self) -> bool {
+        self.backpressure_rejected.load(Ordering::Acquire)
     }
 
     fn physical_table_path(&self) -> &Arc<PhysicalTablePath> {
@@ -201,6 +219,25 @@ impl WriteBatch {
 
     pub fn drained(&mut self, now_ms: i64) {
         self.inner_batch_mut().drained(now_ms);
+    }
+
+    /// Records that the most recent completed delivery attempt was hard-rejected by storage
+    /// backpressure, so expiring in the queue surfaces the typed code instead of a generic
+    /// timeout. The marker survives redelivery attempts of the rejection–retry cycle and is
+    /// cleared by [`Self::clear_backpressure_rejected`] when a different failure kind follows.
+    pub fn mark_backpressure_rejected(&self) {
+        self.inner_batch().mark_backpressure_rejected();
+    }
+
+    /// Clears the backpressure marker: the latest completed attempt failed for another reason,
+    /// so the batch's outcome is no longer provably "rejected before being applied".
+    pub fn clear_backpressure_rejected(&self) {
+        self.inner_batch().clear_backpressure_rejected();
+    }
+
+    /// Whether the most recent completed delivery attempt was a storage-backpressure rejection.
+    pub fn backpressure_rejected(&self) -> bool {
+        self.inner_batch().backpressure_rejected()
     }
 
     pub fn build(&mut self) -> Result<Bytes> {

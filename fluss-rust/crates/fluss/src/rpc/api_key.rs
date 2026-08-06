@@ -131,8 +131,12 @@ impl ApiKey {
             | ApiKey::ListKvSnapshots => Some(ApiVersionRange::new(ApiVersion(0), ApiVersion(0))),
             // PutKv / Lookup / PrefixLookup support v0 (legacy key encoding)
             // and v1 (Paimon BinaryRow key encoding for kv_format_version=2
-            // non-default bucket keys). The Rust client encodes both.
-            ApiKey::PutKv | ApiKey::Lookup | ApiKey::PrefixLookup => {
+            // non-default bucket keys). The Rust client encodes both. PutKv v2
+            // additionally declares that the client understands the
+            // STORAGE_BACKPRESSURE_EXCEPTION error code (72); it changes nothing
+            // on the wire, so a pre-v2 server still negotiates down safely.
+            ApiKey::PutKv => Some(ApiVersionRange::new(ApiVersion(0), ApiVersion(2))),
+            ApiKey::Lookup | ApiKey::PrefixLookup => {
                 Some(ApiVersionRange::new(ApiVersion(0), ApiVersion(1)))
             }
             Unknown(_) => None,

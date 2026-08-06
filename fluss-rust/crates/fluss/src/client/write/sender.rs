@@ -700,16 +700,22 @@ impl Sender {
             .fold(configured, Duration::min)
     }
 
+    /// Expires a batch whose delivery deadline has passed. A batch whose last attempt was a
+    /// storage-backpressure rejection is provably unwritten, so it surfaces the typed retriable
+    /// code (FIP-49 `storage_backpressure`) instead of the indeterminate generic timeout.
     fn expire_batch(&self, ready_write_batch: ReadyWriteBatch, adjust_sequences: bool) {
-        self.fail_batch(
-            ready_write_batch,
+        let error = if ready_write_batch.write_batch.backpressure_rejected() {
+            broadcast::Error::WriteFailed {
+                code: FlussError::StorageBackpressureException.code(),
+                message: "Write delivery budget exhausted under storage backpressure".to_string(),
+            }
+        } else {
             broadcast::Error::WriteFailed {
                 code: FlussError::RequestTimeOut.code(),
                 message: "Write delivery deadline exceeded".to_string(),
-            },
-            None,
-            adjust_sequences,
-        );
+            }
+        };
+        self.fail_batch(ready_write_batch, error, None, adjust_sequences);
     }
 
     fn expire_accumulated_batches(&self) {
@@ -891,6 +897,14 @@ impl Sender {
                 }
             }
 
+            // Track whether the newest completed attempt was a backpressure hard rejection: if
+            // the batch then expires in the queue before another attempt completes, the expiry
+            // sweep surfaces the typed code instead of the indeterminate generic timeout.
+            if error == FlussError::StorageBackpressureException {
+                ready_write_batch.write_batch.mark_backpressure_rejected();
+            } else {
+                ready_write_batch.write_batch.clear_backpressure_rejected();
+            }
             self.re_enqueue_batch(ready_write_batch);
             return Ok(Self::is_invalid_metadata_error(error).then_some(physical_table_path));
         }
@@ -1418,6 +1432,131 @@ mod tests {
                 if code == FlussError::RequestTimeOut.code()
         ));
         assert!(!accumulator.has_incomplete());
+        Ok(())
+    }
+
+    /// A batch hard-rejected by backpressure that then expires while waiting in the queue
+    /// surfaces the typed storage-backpressure code from the expiry sweep — the rejection proved
+    /// it unwritten — instead of the indeterminate generic timeout.
+    #[tokio::test]
+    async fn queued_expiry_after_backpressure_rejection_surfaces_the_typed_error() -> Result<()> {
+        let table_path = Arc::new(TablePath::new("db".to_string(), "tbl".to_string()));
+        let cluster = build_cluster_arc(table_path.as_ref(), 1, 1);
+        let metadata = Arc::new(Metadata::new_for_test(cluster.clone()));
+        let idempotence = disabled_idempotence();
+        let accumulator = Arc::new(RecordAccumulator::new(
+            Config::default(),
+            Arc::clone(&idempotence),
+        ));
+        let sender = Sender::new(
+            metadata,
+            Arc::clone(&accumulator),
+            1024 * 1024,
+            1000,
+            1,
+            10,
+            idempotence,
+            Arc::new(crate::metrics::WriterMetrics::new()),
+            Duration::from_secs(3),
+        );
+        let table_info = Arc::new(build_table_info(table_path.as_ref().clone(), 1, 1));
+        let physical_path = Arc::new(PhysicalTablePath::of(Arc::clone(&table_path)));
+        let row = GenericRow {
+            values: vec![Datum::Int32(1)],
+        };
+        let record = WriteRecord::for_append(table_info, physical_path, 1, &row).with_options(
+            WriteOptions::new(Instant::now() + Duration::from_millis(200)),
+        );
+        let result = accumulator.append(&record, 0, &cluster, false)?;
+        let handle = result.result_handle.expect("result handle");
+        let server = cluster.get_tablet_server(1).expect("server");
+        let nodes = HashSet::from([server.clone()]);
+        let mut batches = accumulator.drain(cluster, &nodes, 1024 * 1024)?;
+        let batch = batches
+            .remove(&1)
+            .expect("drained batches")
+            .pop()
+            .expect("batch");
+
+        // Rejected while budget remains: retried, and the rejection is remembered.
+        sender.handle_write_batch_error(
+            batch,
+            FlussError::StorageBackpressureException,
+            "write-pressure threshold reached".to_string(),
+        )?;
+
+        // The deadline passes while the batch waits in the queue; the sweep finds it.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        sender.expire_accumulated_batches();
+
+        match handle.wait().await? {
+            Err(broadcast::Error::WriteFailed { code, message }) => {
+                assert_eq!(code, FlussError::StorageBackpressureException.code());
+                assert!(message.contains("backpressure"), "{message}");
+            }
+            other => panic!("expected the typed backpressure failure, got {other:?}"),
+        }
+        assert!(!accumulator.has_incomplete());
+        Ok(())
+    }
+
+    /// A following failure of a different kind clears the marker: the newest attempt's outcome
+    /// is no longer provably "rejected before being applied", so a later expiry is the generic
+    /// indeterminate timeout again.
+    #[tokio::test]
+    async fn a_later_non_backpressure_failure_clears_the_marker() -> Result<()> {
+        let table_path = Arc::new(TablePath::new("db".to_string(), "tbl".to_string()));
+        let cluster = build_cluster_arc(table_path.as_ref(), 1, 1);
+        let metadata = Arc::new(Metadata::new_for_test(cluster.clone()));
+        let idempotence = disabled_idempotence();
+        let accumulator = Arc::new(RecordAccumulator::new(
+            Config::default(),
+            Arc::clone(&idempotence),
+        ));
+        let sender = Sender::new(
+            metadata,
+            Arc::clone(&accumulator),
+            1024 * 1024,
+            1000,
+            1,
+            10,
+            idempotence,
+            Arc::new(crate::metrics::WriterMetrics::new()),
+            Duration::from_secs(3),
+        );
+
+        let (batch, _handle) =
+            build_ready_batch(accumulator.as_ref(), cluster.clone(), table_path)?;
+        sender.handle_write_batch_error(
+            batch,
+            FlussError::StorageBackpressureException,
+            "write-pressure threshold reached".to_string(),
+        )?;
+
+        let server = cluster.get_tablet_server(1).expect("server");
+        let nodes = HashSet::from([server.clone()]);
+        let mut batches = accumulator.drain(cluster.clone(), &nodes, 1024 * 1024)?;
+        let batch = batches
+            .remove(&1)
+            .expect("drained batches")
+            .pop()
+            .expect("batch");
+        // The rejection is remembered across the redelivery attempt…
+        assert!(batch.write_batch.backpressure_rejected());
+
+        // …until a different failure kind completes, after which the outcome is indeterminate.
+        sender.handle_write_batch_error(
+            batch,
+            FlussError::NetworkException,
+            "connection reset".to_string(),
+        )?;
+        let mut batches = accumulator.drain(cluster, &nodes, 1024 * 1024)?;
+        let batch = batches
+            .remove(&1)
+            .expect("drained batches")
+            .pop()
+            .expect("batch");
+        assert!(!batch.write_batch.backpressure_rejected());
         Ok(())
     }
 
