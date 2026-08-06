@@ -52,7 +52,8 @@
 
 use crate::application::types::ClusterId;
 use crate::auth::{
-    Authenticator, ConfigUserStoreAuthenticator, StoredSecret, TrustAuthenticator, parse_user_table,
+    Authenticator, ConfigUserStoreAuthenticator, Secret, StoredSecret, TrustAuthenticator,
+    parse_user_table,
 };
 use serde::Deserialize;
 use serde::de::{self, Deserializer};
@@ -293,6 +294,12 @@ pub struct ClusterConfig {
     pub bootstrap_servers: Vec<String>,
     pub connect_timeout: ConfigDuration,
     pub request_timeout: ConfigDuration,
+    /// The SASL service account the gateway authenticates to Fluss with
+    /// (`gateway.cluster.<id>.connection.service.account`). Unset means a plaintext connection.
+    pub service_account: Option<String>,
+    /// The service account's password (`gateway.cluster.<id>.connection.service.secret`).
+    /// Must be set exactly when `service_account` is.
+    pub service_password: Option<Secret>,
 }
 
 impl Default for ClusterConfig {
@@ -301,6 +308,8 @@ impl Default for ClusterConfig {
             bootstrap_servers: vec!["127.0.0.1:9123".to_string()],
             connect_timeout: ConfigDuration::from_secs(10),
             request_timeout: ConfigDuration::from_secs(10),
+            service_account: None,
+            service_password: None,
         }
     }
 }
@@ -627,7 +636,8 @@ impl GatewayConfig {
         }
     }
 
-    /// Rejects an empty cluster map, invalid IDs, and unusable per-cluster bootstrap lists.
+    /// Rejects an empty cluster map, invalid IDs, unusable per-cluster bootstrap lists, and
+    /// half-configured service credentials.
     fn validate_clusters(&self, problems: &mut Vec<String>) {
         if self.clusters.is_empty() {
             problems.push("clusters must configure at least one cluster".to_string());
@@ -643,6 +653,12 @@ impl GatewayConfig {
             {
                 problems.push(format!(
                     "clusters.{id}.bootstrap_servers entries must not be blank"
+                ));
+            }
+            if cluster.service_account.is_some() != cluster.service_password.is_some() {
+                problems.push(format!(
+                    "gateway.cluster.{id}.connection.service.account and \
+                     gateway.cluster.{id}.connection.service.secret must be set together"
                 ));
             }
         }
@@ -893,6 +909,8 @@ const FLAT_CLUSTER_KEYS: &[(&str, &str)] = &[
     ("bootstrap.servers", "bootstrap_servers"),
     ("connect-timeout", "connect_timeout"),
     ("request-timeout", "request_timeout"),
+    ("connection.service.account", "service_account"),
+    ("connection.service.secret", "service_password"),
 ];
 
 /// One recognised flat configuration key.
@@ -1265,6 +1283,55 @@ gateway.metrics.exporter.prometheus.listen: 0.0.0.0:9095
             cluster(&config, "analytics").bootstrap_servers,
             vec!["127.0.0.1:9123"]
         );
+    }
+
+    /// The FIP service-account keys configure the SASL identity the gateway connects with;
+    /// the secret never appears in a Debug rendering of the configuration.
+    #[test]
+    fn cluster_service_account_parses_and_redacts_the_secret() {
+        let config = load_file(
+            "gateway.cluster.default.connection.service.account: gateway_svc\n\
+             gateway.cluster.default.connection.service.secret: sup3r-s3cret\n",
+        )
+        .unwrap();
+        let default_cluster = cluster(&config, "default");
+        assert_eq!(
+            default_cluster.service_account.as_deref(),
+            Some("gateway_svc")
+        );
+        assert_eq!(
+            default_cluster
+                .service_password
+                .as_ref()
+                .map(|secret| secret.expose()),
+            Some("sup3r-s3cret")
+        );
+        assert!(
+            !format!("{default_cluster:?}").contains("sup3r-s3cret"),
+            "secret leaked through Debug"
+        );
+        // Omitting both keys keeps today's plaintext connection.
+        let config = load_file("gateway.clusters: default\n").unwrap();
+        assert!(cluster(&config, "default").service_account.is_none());
+        assert!(cluster(&config, "default").service_password.is_none());
+    }
+
+    /// The account and its secret only make sense together: one without the other is a
+    /// misconfiguration, not a half-authenticated connection.
+    #[test]
+    fn cluster_service_credentials_must_be_paired() {
+        for contents in [
+            "gateway.cluster.default.connection.service.account: gateway_svc\n",
+            "gateway.cluster.default.connection.service.secret: sup3r\n",
+        ] {
+            let error = load_file(contents).unwrap_err();
+            assert!(
+                problems(error)
+                    .iter()
+                    .any(|p| p.contains("connection.service")),
+                "accepted: {contents}"
+            );
+        }
     }
 
     /// The bootstrap list accepts both the FIP csv form and a YAML list.

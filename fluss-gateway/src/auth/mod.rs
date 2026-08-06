@@ -99,6 +99,14 @@ impl From<&str> for Secret {
     }
 }
 
+/// Deserializes from a plain string so configuration values (e.g. a cluster service-account
+/// secret) can be carried as [`Secret`] and inherit its redacting `Debug`.
+impl<'de> serde::Deserialize<'de> for Secret {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer).map(Secret)
+    }
+}
+
 /// A neutral credential handed to the [`Authenticator`] by a protocol layer.
 ///
 /// Protocol adapters are responsible for turning wire-specific material (an HTTP

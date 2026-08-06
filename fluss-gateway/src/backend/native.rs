@@ -540,7 +540,7 @@ fn is_unsupported_api(error: &FlussClientError) -> bool {
 /// `acks=all`, and a short batch timeout. Retries are effectively unbounded because the per-entry delivery
 /// deadline, not an attempt count, is what terminates a write.
 fn client_config(cluster: &ClusterConfig, lookup: &LookupConfig) -> fluss::config::Config {
-    fluss::config::Config {
+    let mut config = fluss::config::Config {
         bootstrap_servers: cluster.bootstrap_servers.join(","),
         connect_timeout_ms: duration_millis(cluster.connect_timeout.get()),
         lookup_queue_size: lookup.queue_size as usize,
@@ -550,7 +550,16 @@ fn client_config(cluster: &ClusterConfig, lookup: &LookupConfig) -> fluss::confi
         writer_retries: i32::MAX,
         writer_batch_timeout_ms: 10,
         ..fluss::config::Config::default()
+    };
+    // Service credentials switch the connection to SASL/PLAIN with the account acting as
+    // itself — the super-user non-propagating transition mode. The authorization id stays
+    // empty here; per-user act-as connections install it per identity.
+    if let (Some(account), Some(password)) = (&cluster.service_account, &cluster.service_password) {
+        config.security_protocol = "sasl".to_string();
+        config.security_sasl_username = account.clone();
+        config.security_sasl_password = password.expose().to_string();
     }
+    config
 }
 
 fn duration_millis(duration: Duration) -> u64 {
@@ -722,6 +731,36 @@ mod tests {
     use fluss::metadata::{DataTypes, Schema, TableConfig};
     use std::collections::HashMap;
 
+    /// Without service credentials the native client keeps today's plaintext connection.
+    #[test]
+    fn client_config_defaults_to_plaintext_without_service_credentials() {
+        let cluster = ClusterConfig::default();
+        let config = client_config(&cluster, &crate::config::LookupConfig::default());
+        assert!(!config.is_sasl_enabled());
+        assert!(config.security_sasl_username.is_empty());
+        assert!(config.security_sasl_password.is_empty());
+    }
+
+    /// Configured service credentials turn on SASL/PLAIN with the account acting as itself:
+    /// no authorization id is set, per the super-user non-propagating transition mode.
+    #[test]
+    fn client_config_enables_sasl_with_service_credentials() {
+        let cluster = ClusterConfig {
+            service_account: Some("gateway_svc".to_string()),
+            service_password: Some(crate::auth::Secret::new("sup3r")),
+            ..ClusterConfig::default()
+        };
+        let config = client_config(&cluster, &crate::config::LookupConfig::default());
+        assert!(config.is_sasl_enabled());
+        assert!(
+            config.validate_security().is_ok(),
+            "security config invalid"
+        );
+        assert_eq!(config.security_sasl_username, "gateway_svc");
+        assert_eq!(config.security_sasl_password, "sup3r");
+        assert!(config.security_sasl_authorization_id.is_empty());
+    }
+
     /// Builds a `TableInfo` whose only interesting parts are the key layout and the table config, which is what
     /// `to_table_description` derives kind, formats, and capabilities from.
     fn table_info(
@@ -788,6 +827,7 @@ mod tests {
             bootstrap_servers: vec!["a:9123".to_string(), "b:9123".to_string()],
             connect_timeout: ConfigDuration::from_secs(7),
             request_timeout: ConfigDuration::from_secs(9),
+            ..ClusterConfig::default()
         };
         let lookup = LookupConfig::default();
         let config = client_config(&cluster, &lookup);
