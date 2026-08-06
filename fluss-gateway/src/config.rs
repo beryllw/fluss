@@ -40,9 +40,10 @@
 //! This supersedes the earlier sectioned TOML schema by explicit user decision: the REST contract and the
 //! configuration surface should quote one vocabulary, the FIP's.
 //!
-//! There is deliberately **no `gateway.security.*` section and no concurrency-permit key**. The gateway
-//! performs no authentication, authorisation, TLS termination, or rate limiting; the only request bounds are
-//! the input-validation caps under `gateway.rest.*`.
+//! There is deliberately **no concurrency-permit key and no TLS section**. The gateway applies no rate
+//! limiting (the only request bounds are the input-validation caps under `gateway.rest.*`), and transport
+//! security terminates at a fronting proxy. Client-to-gateway authentication is configured under
+//! `gateway.security.*` and performed by the pluggable [`crate::auth::Authenticator`].
 //!
 //! Env override convention (unchanged): `FLUSS_GATEWAY__<SECTION>__<KEY>`, with `__` separating path
 //! components of the *internal* sections. For example, `FLUSS_GATEWAY__SERVER_REST__BIND_ADDRESS` overrides
@@ -50,12 +51,16 @@
 //! `[clusters.analytics_eu].bootstrap_servers`.
 
 use crate::application::types::ClusterId;
+use crate::auth::{
+    Authenticator, ConfigUserStoreAuthenticator, StoredSecret, TrustAuthenticator, parse_user_table,
+};
 use serde::Deserialize;
 use serde::de::{self, Deserializer};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 use toml::Value;
 
@@ -427,6 +432,55 @@ impl Default for ShutdownConfig {
     }
 }
 
+/// The client-to-gateway authentication mode (`gateway.security.authentication`).
+///
+/// The FIP also lists `trusted-header` and `oidc`; they arrive as further [`Authenticator`]
+/// plugins and are rejected here until implemented, instead of silently degrading to trust.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthenticationMode {
+    /// The claimed username is taken at face value. The default, for local use.
+    #[default]
+    Trust,
+    /// Credentials are verified against the `gateway.security.users` table. For production.
+    Password,
+}
+
+/// `[security]`, the client-to-gateway authentication configuration.
+#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct SecurityConfig {
+    pub authentication: AuthenticationMode,
+    /// The FIP user table: comma-separated `name:secret` / `name:bcrypt:<hash>` entries, kept
+    /// raw here and parsed by [`parse_user_table`] during validation and authenticator
+    /// construction.
+    pub users: Option<String>,
+}
+
+impl SecurityConfig {
+    /// Parses the configured user table, attributing failures to `gateway.security.users`.
+    fn parsed_users(&self) -> Result<HashMap<String, StoredSecret>, String> {
+        parse_user_table(self.users.as_deref().unwrap_or(""))
+            .map_err(|e| format!("gateway.security.users: {e}"))
+    }
+
+    /// Builds the one global [`Authenticator`] shared by every frontend.
+    ///
+    /// Call after [`GatewayConfig::validate`]; a malformed user table still fails here rather
+    /// than panicking, so programmatic construction stays safe.
+    pub fn build_authenticator(&self) -> Result<Arc<dyn Authenticator>, ConfigError> {
+        match self.authentication {
+            AuthenticationMode::Trust => Ok(Arc::new(TrustAuthenticator::new())),
+            AuthenticationMode::Password => {
+                let users = self
+                    .parsed_users()
+                    .map_err(|problem| ConfigError::Invalid(vec![problem]))?;
+                Ok(Arc::new(ConfigUserStoreAuthenticator::new(users)))
+            }
+        }
+    }
+}
+
 /// Complete configuration for the gateway process.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -439,6 +493,7 @@ pub struct GatewayConfig {
     pub lookup: LookupConfig,
     pub write: WriteConfig,
     pub shutdown: ShutdownConfig,
+    pub security: SecurityConfig,
 }
 
 impl Default for GatewayConfig {
@@ -451,6 +506,7 @@ impl Default for GatewayConfig {
             lookup: LookupConfig::default(),
             write: WriteConfig::default(),
             shutdown: ShutdownConfig::default(),
+            security: SecurityConfig::default(),
         }
     }
 }
@@ -546,11 +602,28 @@ impl GatewayConfig {
 
         self.validate_clusters(&mut problems);
         self.validate_identity(&mut problems);
+        self.validate_security(&mut problems);
 
         if problems.is_empty() {
             Ok(())
         } else {
             Err(ConfigError::Invalid(problems))
+        }
+    }
+
+    /// Rejects a password mode whose user table is missing, empty, or malformed. Trust mode is
+    /// never rejected here; a configured-but-ignored user table is only a warning.
+    fn validate_security(&self, problems: &mut Vec<String>) {
+        if self.security.authentication != AuthenticationMode::Password {
+            return;
+        }
+        match self.security.parsed_users() {
+            Ok(users) if users.is_empty() => problems.push(
+                "gateway.security.users must configure at least one user when gateway.security.authentication is password"
+                    .to_string(),
+            ),
+            Ok(_) => {}
+            Err(problem) => problems.push(problem),
         }
     }
 
@@ -604,14 +677,22 @@ impl GatewayConfig {
 
     /// Returns non-fatal configuration advisories that should be logged at startup.
     pub fn warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
         if !self.server.rest.bind_address.ip().is_loopback() {
-            vec![format!(
+            warnings.push(format!(
                 "server.rest.bind_address {} is not loopback. The REST listener has no authentication or TLS",
                 self.server.rest.bind_address
-            )]
-        } else {
-            Vec::new()
+            ));
         }
+        if self.security.authentication == AuthenticationMode::Trust
+            && self.security.users.is_some()
+        {
+            warnings.push(
+                "gateway.security.users is ignored because gateway.security.authentication is trust"
+                    .to_string(),
+            );
+        }
+        warnings
     }
 }
 
@@ -795,6 +876,8 @@ const FLAT_FILE_KEYS: &[(&str, &str)] = &[
     ),
     ("gateway.metadata.cache-ttl", "metadata.cache_ttl"),
     ("gateway.shutdown.drain-timeout", "shutdown.drain_timeout"),
+    ("gateway.security.authentication", "security.authentication"),
+    ("gateway.security.users", "security.users"),
 ];
 
 /// The per-cluster key suffixes allowed under `gateway.cluster.<id>.`, mapped to [`ClusterConfig`] fields.
@@ -994,6 +1077,7 @@ pub fn load(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::{ClientCredential, Secret};
     use std::io::Write;
 
     fn no_env() -> BTreeMap<String, String> {
@@ -1191,6 +1275,122 @@ gateway.metrics.exporter.prometheus.listen: 0.0.0.0:9095
             cluster(&config, "default").bootstrap_servers,
             vec!["a:9123", "b:9123"]
         );
+    }
+
+    #[test]
+    fn security_defaults_to_trust_without_users() {
+        let config = load(None, &no_env(), &CliOverrides::default()).unwrap();
+        assert_eq!(config.security.authentication, AuthenticationMode::Trust);
+        assert!(config.security.users.is_none());
+        assert!(config.warnings().is_empty());
+    }
+
+    #[tokio::test]
+    async fn security_trust_mode_builds_a_trusting_authenticator() {
+        let config = load_file("gateway.security.authentication: trust\n").unwrap();
+        let authenticator = config.security.build_authenticator().unwrap();
+        let principal = authenticator
+            .authenticate(ClientCredential::Trust {
+                username: "anyone".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(principal.name, "anyone");
+    }
+
+    #[tokio::test]
+    async fn security_password_mode_builds_a_verifying_store() {
+        let hash = bcrypt::hash("s3cret", 4).unwrap();
+        let config = load_file(&format!(
+            "gateway.security.authentication: password\n\
+             gateway.security.users: alice:pw,bob:bcrypt:{hash}\n"
+        ))
+        .unwrap();
+        assert_eq!(config.security.authentication, AuthenticationMode::Password);
+
+        let authenticator = config.security.build_authenticator().unwrap();
+        let alice = authenticator
+            .authenticate(ClientCredential::Password {
+                username: "alice".into(),
+                secret: Secret::new("pw"),
+            })
+            .await
+            .unwrap();
+        assert_eq!(alice.name, "alice");
+        let bob = authenticator
+            .authenticate(ClientCredential::Password {
+                username: "bob".into(),
+                secret: Secret::new("s3cret"),
+            })
+            .await
+            .unwrap();
+        assert_eq!(bob.name, "bob");
+        // A verifying store never accepts a bare trust claim.
+        assert!(
+            authenticator
+                .authenticate(ClientCredential::Trust {
+                    username: "alice".into()
+                })
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn security_password_mode_requires_a_non_empty_user_table() {
+        for contents in [
+            "gateway.security.authentication: password\n",
+            "gateway.security.authentication: password\ngateway.security.users: \"\"\n",
+            "gateway.security.authentication: password\ngateway.security.users: \",\"\n",
+        ] {
+            let error = load_file(contents).unwrap_err();
+            assert!(
+                problems(error)
+                    .iter()
+                    .any(|p| p.contains("gateway.security.users")),
+                "accepted: {contents}"
+            );
+        }
+    }
+
+    #[test]
+    fn security_malformed_user_entry_fails_startup_naming_the_user() {
+        let error = load_file(
+            "gateway.security.authentication: password\n\
+             gateway.security.users: alice:pw,bob:bcrypt:not-a-hash\n",
+        )
+        .unwrap_err();
+        let problems = problems(error);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("gateway.security.users") && p.contains("bob")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn security_trust_mode_with_users_warns_they_are_ignored() {
+        let config = load_file("gateway.security.users: alice:pw\n").unwrap();
+        assert!(
+            config
+                .warnings()
+                .iter()
+                .any(|w| w.contains("gateway.security.users") && w.contains("ignored")),
+            "{:?}",
+            config.warnings()
+        );
+    }
+
+    #[test]
+    fn security_unimplemented_authentication_modes_are_rejected() {
+        // The FIP also lists trusted-header and oidc; they are future Authenticator plugins and
+        // must fail loudly instead of silently degrading to trust.
+        for mode in ["trusted-header", "oidc", "basic"] {
+            let error =
+                load_file(&format!("gateway.security.authentication: {mode}\n")).unwrap_err();
+            assert!(matches!(error, ConfigError::Parse(_)), "{mode}: {error:?}");
+        }
     }
 
     #[test]
@@ -1535,8 +1735,7 @@ gateway.cluster.analytics_eu.bootstrap.servers: file:9123
             // Rate limiting, dropped by directive.
             "gateway.rest.write.max-concurrent-requests: 64\n",
             "gateway.rest.write.rate-limit.enabled: true\n",
-            // Authentication and transport security, out of scope until their tasks land.
-            "gateway.security.authentication: trust\n",
+            // Transport security, out of scope (TLS terminates at a fronting proxy).
             "gateway.tls.cert: /etc/tls.pem\n",
         ] {
             assert!(load_file(contents).is_err(), "accepted: {contents}");
