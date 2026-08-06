@@ -57,6 +57,8 @@ arrow = { version = "59.0.0", features = ["ipc_compression", "ffi"] }
 async-trait = "0.1"
 axum = { version = "0.8", default-features = false, features = ["http1", "matched-path", "tokio"] }
 base64 = "0.22"
+# Password hashes in gateway.security.users are bcrypt (htpasswd -B compatible, FIP-49).
+bcrypt = "0.16"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 clap = { version = "4.5.37", features = ["derive"] }
 toml = "0.8"
@@ -70,6 +72,8 @@ serde_json = "1.0"
 serde_urlencoded = "0.7"
 # The gateway.yaml configuration file is YAML with flat dotted keys (FIP-49).
 serde_yaml = "0.9"
+# Constant-time comparison for plaintext password verification.
+subtle = "2"
 tokio = { version = "1.44.2", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 utoipa = { version = "5", features = ["axum_extras"] }
