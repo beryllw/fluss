@@ -51,7 +51,7 @@ curl -X POST http://localhost:8080/v1/clusters/default/databases/fluss/tables \
 
 curl -X POST http://localhost:8080/v1/clusters/default/databases/fluss/tables/users/records \
   -H 'Content-Type: application/json' \
-  -d '{"entries":[{"upsert":{"id":1,"name":"alice"}}]}'
+  -d '{"entries":[{"id":"w1","upsert":{"id":1,"name":"alice"}}]}'
 
 curl -X POST http://localhost:8080/v1/clusters/default/databases/fluss/tables/users/records/lookup \
   -H 'Content-Type: application/json' \

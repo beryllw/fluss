@@ -528,6 +528,12 @@ impl FlussTestingCluster {
         &self.bootstrap_servers
     }
 
+    /// The SASL (`CLIENT`) listener address, present when the cluster was built `with_sasl`.
+    /// External clients such as the gateway dial it with their own SASL configuration.
+    pub fn sasl_bootstrap_servers(&self) -> Option<&str> {
+        self.sasl_bootstrap_servers.as_deref()
+    }
+
     pub fn plaintext_tablet_bootstrap_server(&self, server_id: u16) -> Option<&str> {
         self.plaintext_tablet_bootstrap_servers
             .get(&server_id)
