@@ -286,6 +286,20 @@ impl Default for MetricsServerConfig {
     }
 }
 
+/// How the gateway identifies itself to one Fluss cluster
+/// (`gateway.cluster.<id>.connection.identity-mode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum IdentityMode {
+    /// One shared connection authenticated as the service account itself; Fluss sees only the
+    /// gateway account. The default, and the super-user non-propagating transition mode.
+    #[default]
+    Service,
+    /// One connection per authenticated user, carrying the SASL authorization id, so Fluss
+    /// authorizes as the impersonated end user (act-as).
+    User,
+}
+
 /// One `[clusters.<id>]` table, which configures how to reach a Fluss cluster.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -300,6 +314,29 @@ pub struct ClusterConfig {
     /// The service account's password (`gateway.cluster.<id>.connection.service.secret`).
     /// Must be set exactly when `service_account` is.
     pub service_password: Option<Secret>,
+    /// The identity the effective principal on Fluss is derived from
+    /// (`gateway.cluster.<id>.connection.identity-mode`).
+    pub identity_mode: IdentityMode,
+    /// Cap on per-user act-as connections (`gateway.cluster.<id>.connection.max`), user mode
+    /// only; exceeding it answers 429. Defaults to 512 when unset.
+    pub connection_max: Option<u32>,
+    /// Idle reclamation for per-user connections (`gateway.cluster.<id>.connection.idle-timeout`),
+    /// user mode only. Defaults to 10 minutes when unset.
+    pub connection_idle_timeout: Option<ConfigDuration>,
+}
+
+impl ClusterConfig {
+    /// The effective per-user connection cap of the user identity mode.
+    pub fn effective_connection_max(&self) -> usize {
+        self.connection_max.unwrap_or(512) as usize
+    }
+
+    /// The effective per-user idle reclamation timeout of the user identity mode.
+    pub fn effective_connection_idle_timeout(&self) -> Duration {
+        self.connection_idle_timeout
+            .map(ConfigDuration::get)
+            .unwrap_or(Duration::from_secs(600))
+    }
 }
 
 impl Default for ClusterConfig {
@@ -310,6 +347,9 @@ impl Default for ClusterConfig {
             request_timeout: ConfigDuration::from_secs(10),
             service_account: None,
             service_password: None,
+            identity_mode: IdentityMode::Service,
+            connection_max: None,
+            connection_idle_timeout: None,
         }
     }
 }
@@ -661,6 +701,25 @@ impl GatewayConfig {
                      gateway.cluster.{id}.connection.service.secret must be set together"
                 ));
             }
+            if cluster.identity_mode == IdentityMode::User {
+                // User mode impersonates through the super-user connection, so the service
+                // credentials are mandatory …
+                if cluster.service_account.is_none() {
+                    problems.push(format!(
+                        "gateway.cluster.{id}.connection.identity-mode user requires \
+                         gateway.cluster.{id}.connection.service.account credentials"
+                    ));
+                }
+                // … and the propagated identity must be a verified one: under trust
+                // authentication any client can claim any username (including the anonymous
+                // fallback), which must never become an act-as identity on Fluss.
+                if self.security.authentication == AuthenticationMode::Trust {
+                    problems.push(format!(
+                        "gateway.cluster.{id}.connection.identity-mode user requires verified \
+                         client identities; set gateway.security.authentication to password"
+                    ));
+                }
+            }
         }
     }
 
@@ -715,6 +774,16 @@ impl GatewayConfig {
                 "gateway.security.users is ignored because gateway.security.authentication is trust"
                     .to_string(),
             );
+        }
+        for (id, cluster) in &self.clusters {
+            if cluster.identity_mode == IdentityMode::Service
+                && (cluster.connection_max.is_some() || cluster.connection_idle_timeout.is_some())
+            {
+                warnings.push(format!(
+                    "gateway.cluster.{id}.connection.max and connection.idle-timeout are ignored \
+                     because connection.identity-mode is service"
+                ));
+            }
         }
         warnings
     }
@@ -911,6 +980,9 @@ const FLAT_CLUSTER_KEYS: &[(&str, &str)] = &[
     ("request-timeout", "request_timeout"),
     ("connection.service.account", "service_account"),
     ("connection.service.secret", "service_password"),
+    ("connection.identity-mode", "identity_mode"),
+    ("connection.max", "connection_max"),
+    ("connection.idle-timeout", "connection_idle_timeout"),
 ];
 
 /// One recognised flat configuration key.
@@ -1332,6 +1404,85 @@ gateway.metrics.exporter.prometheus.listen: 0.0.0.0:9095
                 "accepted: {contents}"
             );
         }
+    }
+
+    /// A complete FIP user-mode declaration parses, with the documented defaults for the
+    /// connection cap and idle reclamation when the keys are omitted.
+    #[test]
+    fn cluster_user_identity_mode_parses_with_documented_defaults() {
+        let config = load_file(
+            "gateway.security.authentication: password\ngateway.security.users: alice:pw\n\
+             gateway.cluster.default.connection.identity-mode: user\n\
+             gateway.cluster.default.connection.service.account: gateway_svc\n\
+             gateway.cluster.default.connection.service.secret: sup3r\n",
+        )
+        .unwrap();
+        let default_cluster = cluster(&config, "default");
+        assert_eq!(default_cluster.identity_mode, IdentityMode::User);
+        assert_eq!(default_cluster.effective_connection_max(), 512);
+        assert_eq!(
+            default_cluster.effective_connection_idle_timeout(),
+            Duration::from_secs(600)
+        );
+
+        let config = load_file(
+            "gateway.security.authentication: password\ngateway.security.users: alice:pw\n\
+             gateway.cluster.default.connection.identity-mode: user\n\
+             gateway.cluster.default.connection.service.account: gateway_svc\n\
+             gateway.cluster.default.connection.service.secret: sup3r\n\
+             gateway.cluster.default.connection.max: 16\n\
+             gateway.cluster.default.connection.idle-timeout: 1m\n",
+        )
+        .unwrap();
+        assert_eq!(cluster(&config, "default").effective_connection_max(), 16);
+        assert_eq!(
+            cluster(&config, "default").effective_connection_idle_timeout(),
+            Duration::from_secs(60)
+        );
+    }
+
+    /// User mode propagates identities to Fluss, so it demands super-user credentials and a
+    /// verifying client authenticator: trust-claimed names must never become act-as identities.
+    #[test]
+    fn cluster_user_identity_mode_demands_credentials_and_verified_identities() {
+        // Missing service credentials.
+        let error = load_file(
+            "gateway.security.authentication: password\ngateway.security.users: alice:pw\n\
+             gateway.cluster.default.connection.identity-mode: user\n",
+        )
+        .unwrap_err();
+        assert!(
+            problems(error)
+                .iter()
+                .any(|p| p.contains("requires") && p.contains("service.account")),
+        );
+
+        // Trust authentication (the default) cannot feed act-as identities.
+        let error = load_file(
+            "gateway.cluster.default.connection.identity-mode: user\n\
+             gateway.cluster.default.connection.service.account: gateway_svc\n\
+             gateway.cluster.default.connection.service.secret: sup3r\n",
+        )
+        .unwrap_err();
+        assert!(
+            problems(error)
+                .iter()
+                .any(|p| p.contains("verified") && p.contains("password")),
+        );
+    }
+
+    /// The connection pool keys have no effect under the default service mode and say so.
+    #[test]
+    fn cluster_pool_keys_warn_under_service_mode() {
+        let config = load_file("gateway.cluster.default.connection.max: 16\n").unwrap();
+        assert!(
+            config
+                .warnings()
+                .iter()
+                .any(|w| w.contains("connection.max") && w.contains("ignored")),
+            "{:?}",
+            config.warnings()
+        );
     }
 
     /// The bootstrap list accepts both the FIP csv form and a YAML list.

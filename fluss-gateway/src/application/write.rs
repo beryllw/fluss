@@ -398,7 +398,7 @@ impl GatewayService {
         request: WriteRequest,
     ) -> Result<WriteResult, GatewayError> {
         context.ensure_active()?;
-        let backend = self.backend(context)?;
+        let backend = self.backend(context).await?;
         let cache = self.cache(context)?;
         let table = request.table.clone();
         let table_name = table.to_string();

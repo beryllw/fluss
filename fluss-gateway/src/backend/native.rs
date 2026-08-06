@@ -63,12 +63,31 @@ impl NativeGatewayBackend {
         cluster: &ClusterConfig,
         lookup: &LookupConfig,
     ) -> Result<Self, GatewayError> {
-        let connection = FlussConnection::new_with_request_timeout(
-            client_config(cluster, lookup),
-            cluster.request_timeout.get(),
-        )
-        .await
-        .map_err(|e| map_fluss_error("connect to Fluss", e))?;
+        Self::connect_with(client_config(cluster, lookup), cluster, lookup).await
+    }
+
+    /// Connects acting as `act_as`: the connection authenticates with the service account and
+    /// carries the principal name as the SASL authorization id, so Fluss authorizes every call
+    /// on it as the impersonated end user (FIP-49 user identity mode).
+    pub async fn connect_as(
+        cluster: &ClusterConfig,
+        lookup: &LookupConfig,
+        act_as: &str,
+    ) -> Result<Self, GatewayError> {
+        let mut config = client_config(cluster, lookup);
+        config.security_sasl_authorization_id = act_as.to_string();
+        Self::connect_with(config, cluster, lookup).await
+    }
+
+    async fn connect_with(
+        config: fluss::config::Config,
+        cluster: &ClusterConfig,
+        lookup: &LookupConfig,
+    ) -> Result<Self, GatewayError> {
+        let connection =
+            FlussConnection::new_with_request_timeout(config, cluster.request_timeout.get())
+                .await
+                .map_err(|e| map_fluss_error("connect to Fluss", e))?;
         Ok(Self {
             connection: Arc::new(connection),
             lookup_concurrency: lookup.max_concurrent.max(1) as usize,

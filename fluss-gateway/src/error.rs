@@ -20,10 +20,12 @@
 //! [`ErrorKind`] represents client-visible failure conditions independently of the HTTP framework. The REST adapter
 //! obtains each status code from [`ErrorKind::http_status`].
 //!
-//! The taxonomy is deliberately closed at fourteen kinds. There is no `GONE` or `CURSOR_NOT_LOCAL` because the
-//! gateway holds no cursors, and no `RESOURCE_EXHAUSTED` because the gateway applies no rate limiting: the only
-//! request bounds are input-validation caps, which surface as [`ErrorKind::LimitExceeded`] (413) or
-//! [`ErrorKind::InvalidArgument`] (400). No response ever carries HTTP 429.
+//! The taxonomy is deliberately closed at fifteen kinds. There is no `GONE` or `CURSOR_NOT_LOCAL` because the
+//! gateway holds no cursors. The gateway applies no request rate limiting — the only per-request bounds are
+//! input-validation caps, surfacing as [`ErrorKind::LimitExceeded`] (413) or
+//! [`ErrorKind::InvalidArgument`] (400) — but per-user act-as connections are a bounded resource, so
+//! [`ErrorKind::ResourceExhausted`] (429, with a `Retry-After` header per FIP-49) reports connection-capacity
+//! exhaustion under the user identity mode.
 //!
 //! FIP-49 error-model notes: the FIP's `database_not_empty` (409) condition is carried by
 //! [`ErrorKind::FailedPrecondition`], and its `*_not_found` / `*_already_exists` families collapse onto
@@ -56,6 +58,8 @@ pub enum ErrorKind {
     NotAcceptable,
     /// The request exceeds a configured input-validation size limit. Maps to HTTP 413.
     LimitExceeded,
+    /// A bounded resource (per-user act-as connections) is at capacity. Maps to HTTP 429.
+    ResourceExhausted,
     /// The request exceeded its deadline. Maps to HTTP 504.
     DeadlineExceeded,
     /// Work was cancelled by the caller or by shutdown. Maps to HTTP 499.
@@ -71,7 +75,7 @@ impl ErrorKind {
     ///
     /// Kept in sync with the enum by [`ErrorKind::ordinal`], whose exhaustive match stops compiling when a
     /// variant is added without extending this table.
-    pub const ALL: [ErrorKind; 14] = [
+    pub const ALL: [ErrorKind; 15] = [
         ErrorKind::InvalidArgument,
         ErrorKind::Unauthenticated,
         ErrorKind::Unauthorized,
@@ -82,6 +86,7 @@ impl ErrorKind {
         ErrorKind::UnsupportedMediaType,
         ErrorKind::NotAcceptable,
         ErrorKind::LimitExceeded,
+        ErrorKind::ResourceExhausted,
         ErrorKind::DeadlineExceeded,
         ErrorKind::Cancelled,
         ErrorKind::Unavailable,
@@ -101,10 +106,11 @@ impl ErrorKind {
             ErrorKind::UnsupportedMediaType => 7,
             ErrorKind::NotAcceptable => 8,
             ErrorKind::LimitExceeded => 9,
-            ErrorKind::DeadlineExceeded => 10,
-            ErrorKind::Cancelled => 11,
-            ErrorKind::Unavailable => 12,
-            ErrorKind::Internal => 13,
+            ErrorKind::ResourceExhausted => 10,
+            ErrorKind::DeadlineExceeded => 11,
+            ErrorKind::Cancelled => 12,
+            ErrorKind::Unavailable => 13,
+            ErrorKind::Internal => 14,
         }
     }
 
@@ -121,6 +127,7 @@ impl ErrorKind {
             ErrorKind::UnsupportedMediaType => "UNSUPPORTED_MEDIA_TYPE",
             ErrorKind::NotAcceptable => "NOT_ACCEPTABLE",
             ErrorKind::LimitExceeded => "LIMIT_EXCEEDED",
+            ErrorKind::ResourceExhausted => "RESOURCE_EXHAUSTED",
             ErrorKind::DeadlineExceeded => "DEADLINE_EXCEEDED",
             ErrorKind::Cancelled => "CANCELLED",
             ErrorKind::Unavailable => "UNAVAILABLE",
@@ -143,6 +150,7 @@ impl ErrorKind {
             ErrorKind::UnsupportedMediaType => 415,
             ErrorKind::NotAcceptable => 406,
             ErrorKind::LimitExceeded => 413,
+            ErrorKind::ResourceExhausted => 429,
             ErrorKind::DeadlineExceeded => 504,
             ErrorKind::Cancelled => 499,
             ErrorKind::Unavailable => 503,
@@ -156,7 +164,9 @@ impl ErrorKind {
     /// per error through [`GatewayError::with_retryable`].
     pub fn default_retryable(self) -> bool {
         match self {
-            ErrorKind::DeadlineExceeded | ErrorKind::Unavailable => true,
+            ErrorKind::DeadlineExceeded | ErrorKind::Unavailable | ErrorKind::ResourceExhausted => {
+                true
+            }
             ErrorKind::InvalidArgument
             | ErrorKind::Unauthenticated
             | ErrorKind::Unauthorized
@@ -244,6 +254,12 @@ impl GatewayError {
     /// A request-size or configured input-validation limit was exceeded. Answered with HTTP 413.
     pub fn limit_exceeded(message: impl Into<String>) -> Self {
         Self::new(ErrorKind::LimitExceeded, message)
+    }
+
+    /// A bounded resource, such as the per-user act-as connection pool, is at capacity.
+    /// Answered with HTTP 429 and a `Retry-After` header.
+    pub fn resource_exhausted(message: impl Into<String>) -> Self {
+        Self::new(ErrorKind::ResourceExhausted, message)
     }
 
     /// The request ran past its deadline. Answered with HTTP 504.
@@ -381,7 +397,7 @@ mod tests {
     use super::*;
 
     /// The frozen taxonomy. Adding a variant breaks [`ErrorKind::ordinal`] first, then this table.
-    const CONTRACT: [(ErrorKind, u16, &str, bool); 14] = [
+    const CONTRACT: [(ErrorKind, u16, &str, bool); 15] = [
         (ErrorKind::InvalidArgument, 400, "INVALID_ARGUMENT", false),
         (ErrorKind::Unauthenticated, 401, "UNAUTHENTICATED", false),
         (ErrorKind::Unauthorized, 403, "UNAUTHORIZED", false),
@@ -402,6 +418,12 @@ mod tests {
         ),
         (ErrorKind::NotAcceptable, 406, "NOT_ACCEPTABLE", false),
         (ErrorKind::LimitExceeded, 413, "LIMIT_EXCEEDED", false),
+        (
+            ErrorKind::ResourceExhausted,
+            429,
+            "RESOURCE_EXHAUSTED",
+            true,
+        ),
         (ErrorKind::DeadlineExceeded, 504, "DEADLINE_EXCEEDED", true),
         (ErrorKind::Cancelled, 499, "CANCELLED", false),
         (ErrorKind::Unavailable, 503, "UNAVAILABLE", true),
@@ -421,13 +443,13 @@ mod tests {
     }
 
     #[test]
-    fn no_kind_maps_to_a_rate_limiting_or_cursor_status() {
+    fn only_connection_capacity_maps_to_429_and_nothing_maps_to_a_cursor_status() {
         for kind in ErrorKind::ALL {
             let status = kind.http_status();
-            assert_ne!(
-                status,
-                429,
-                "{} maps to a rate-limiting status",
+            assert_eq!(
+                status == 429,
+                kind == ErrorKind::ResourceExhausted,
+                "{} unexpectedly maps to 429",
                 kind.code()
             );
             assert_ne!(status, 410, "{} maps to a cursor status", kind.code());

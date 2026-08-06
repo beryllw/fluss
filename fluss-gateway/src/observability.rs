@@ -472,6 +472,37 @@ pub fn backend_connected(cluster: &str, connected: bool) {
         .set(if connected { 1.0 } else { 0.0 });
 }
 
+/// Records one per-user act-as connection created by the user identity mode (FIP-49
+/// `fluss_gateway_connections_created_total`).
+pub fn identity_connection_created(cluster: &str) {
+    metrics::counter!(
+        "fluss_gateway_connections_created_total",
+        "cluster" => cluster.to_string()
+    )
+    .increment(1);
+}
+
+/// Records one per-user act-as connection dropped from the pool (FIP-49
+/// `fluss_gateway_connections_closed_total`), with why it left.
+pub fn identity_connection_closed(cluster: &str, reason: &'static str) {
+    metrics::counter!(
+        "fluss_gateway_connections_closed_total",
+        "cluster" => cluster.to_string(),
+        "reason" => reason
+    )
+    .increment(1);
+}
+
+/// Sets the number of pooled per-user act-as connections (FIP-49
+/// `fluss_gateway_connections_active`).
+pub fn identity_connections_active(cluster: &str, active: usize) {
+    metrics::gauge!(
+        "fluss_gateway_connections_active",
+        "cluster" => cluster.to_string()
+    )
+    .set(active as f64);
+}
+
 /// Records one catalog read outcome and its duration.
 pub fn catalog_operation(
     cluster: &str,

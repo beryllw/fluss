@@ -22,9 +22,10 @@
 //! merges them, splits the result into an Axum router plus the generated OpenAPI document, and wraps the router
 //! in the middleware defined here.
 //!
-//! The middleware applies exactly two request bounds, both input validation: a maximum body size (413) and the
-//! per-request deadline (504). There is no concurrency permit and no 429 anywhere in the adapter — the gateway
-//! does not rate limit.
+//! The middleware applies two per-request input-validation bounds — a maximum body size (413) and the
+//! per-request deadline (504) — and no request rate limiting. HTTP 429 appears for exactly one condition:
+//! the per-user act-as connection pool of the user identity mode is at capacity
+//! (`RESOURCE_EXHAUSTED`, always with a `Retry-After` header, per FIP-49).
 
 pub mod auth;
 pub mod clusters;
@@ -253,7 +254,7 @@ impl From<&RestServerConfig> for RestOptions {
 struct ShapedResponse;
 
 /// Renders the error envelope with the status its kind maps to, marks the response as already shaped, and adds
-/// `Retry-After` to the one kind that is worth retrying immediately.
+/// `Retry-After` to the kinds that are worth retrying after a short pause.
 pub fn error_response(error: &GatewayError, request_id: &RequestId) -> Response {
     let status = StatusCode::from_u16(error.kind().http_status())
         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -261,7 +262,10 @@ pub fn error_response(error: &GatewayError, request_id: &RequestId) -> Response 
         json_response_with_status(status, &ErrorEnvelope::new(error, request_id.as_str()))
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
     response.extensions_mut().insert(ShapedResponse);
-    if error.kind() == crate::error::ErrorKind::Unavailable {
+    if matches!(
+        error.kind(),
+        crate::error::ErrorKind::Unavailable | crate::error::ErrorKind::ResourceExhausted
+    ) {
         response
             .headers_mut()
             .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
@@ -788,6 +792,65 @@ mod tests {
         assert!(parse_query::<QueryFixture>(&repeated).is_err());
         let unknown: Uri = "/?spec=a&bucket=7&extra=1".parse().unwrap();
         assert!(parse_query::<QueryFixture>(&unknown).is_err());
+    }
+
+    /// Under the user identity mode each authenticated Basic identity resolves its own act-as
+    /// connection: the injected connector observes one dial per distinct principal, and repeated
+    /// requests for a principal reuse the pooled backend.
+    #[tokio::test]
+    async fn user_identity_mode_dials_one_connection_per_principal() {
+        use crate::backend::identity::IdentityConnector;
+        use crate::backend::registry::ClusterRegistry;
+        use base64::Engine;
+
+        let dialed: Arc<parking_lot::Mutex<Vec<String>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let connector: IdentityConnector = {
+            let dialed = dialed.clone();
+            Arc::new(move |user: String| {
+                let dialed = dialed.clone();
+                Box::pin(async move {
+                    dialed.lock().push(user);
+                    Ok(Arc::new(TestBackend::new()) as Arc<dyn crate::backend::GatewayBackend>)
+                })
+            })
+        };
+        let clusters = Arc::new(ClusterRegistry::single_for_test_with_identity_pool(
+            "default",
+            Arc::new(TestBackend::new()),
+            test_support::green_report(),
+            connector,
+            8,
+            Duration::from_secs(3600),
+        ));
+        let mut state = test_support::state_with_clusters(clusters);
+        state.authenticator = Arc::new(crate::auth::ConfigUserStoreAuthenticator::new(
+            crate::auth::parse_user_table("alice:pw,bob:pw").expect("user table"),
+        ));
+        let app = build_router(state, &test_support::test_options());
+
+        for (user, times) in [("alice", 2), ("bob", 1)] {
+            for _ in 0..times {
+                let token = base64::engine::general_purpose::STANDARD.encode(format!("{user}:pw"));
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri("/v1/clusters/default/databases")
+                            .header("authorization", format!("Basic {token}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "{user}");
+            }
+        }
+        assert_eq!(
+            *dialed.lock(),
+            vec!["alice".to_string(), "bob".to_string()],
+            "one dial per principal, reused across requests"
+        );
     }
 
     #[tokio::test]

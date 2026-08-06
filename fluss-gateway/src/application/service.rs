@@ -89,13 +89,17 @@ impl GatewayService {
         self.max_write_delivery_time
     }
 
-    /// Resolves the backend of the request's cluster after checking that the request is still live.
-    pub(crate) fn backend(
+    /// Resolves the backend serving the request's principal on its cluster, after checking that
+    /// the request is still live. Under the user identity mode this may dial a new per-user
+    /// act-as connection, which is why resolution is asynchronous.
+    pub(crate) async fn backend(
         &self,
         context: &RequestContext,
     ) -> Result<Arc<dyn GatewayBackend>, GatewayError> {
         context.ensure_active()?;
-        self.clusters.backend(context.cluster_id().as_str())
+        self.clusters
+            .backend_for_principal(context.cluster_id().as_str(), context.principal())
+            .await
     }
 
     /// The metadata cache of the request's cluster.
@@ -234,7 +238,7 @@ mod tests {
         let service = service();
 
         assert_eq!(
-            kind_of(service.backend(&context("default", Instant::now()))),
+            kind_of(service.backend(&context("default", Instant::now())).await),
             ErrorKind::DeadlineExceeded
         );
 
@@ -248,13 +252,22 @@ mod tests {
             cancellation,
             crate::auth::Principal::new("tester"),
         );
-        assert_eq!(kind_of(service.backend(&cancelled)), ErrorKind::Cancelled);
+        assert_eq!(
+            kind_of(service.backend(&cancelled).await),
+            ErrorKind::Cancelled
+        );
 
         // A configured but disconnected cluster is unavailable, an unconfigured one is not found.
         let live = context("default", Instant::now() + Duration::from_secs(5));
-        assert_eq!(kind_of(service.backend(&live)), ErrorKind::Unavailable);
+        assert_eq!(
+            kind_of(service.backend(&live).await),
+            ErrorKind::Unavailable
+        );
         let unknown = context("missing", Instant::now() + Duration::from_secs(5));
-        assert_eq!(kind_of(service.backend(&unknown)), ErrorKind::NotFound);
+        assert_eq!(
+            kind_of(service.backend(&unknown).await),
+            ErrorKind::NotFound
+        );
     }
 
     #[tokio::test]

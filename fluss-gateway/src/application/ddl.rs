@@ -323,7 +323,7 @@ impl GatewayService {
         &self,
         context: &RequestContext,
     ) -> Result<Vec<String>, GatewayError> {
-        let backend = self.backend(context)?;
+        let backend = self.backend(context).await?;
         self.execute(context, backend.list_databases()).await
     }
 
@@ -333,7 +333,7 @@ impl GatewayService {
         context: &RequestContext,
         database: &str,
     ) -> Result<DatabaseDescription, GatewayError> {
-        let backend = self.backend(context)?;
+        let backend = self.backend(context).await?;
         self.execute(context, backend.describe_database(database))
             .await
             .map_err(|error| resource_error(error, "database", database))
@@ -346,7 +346,7 @@ impl GatewayService {
         request: CreateDatabaseRequest,
     ) -> Result<DatabaseDescription, GatewayError> {
         validate_create_database(&request)?;
-        let backend = self.backend(context)?;
+        let backend = self.backend(context).await?;
         self.execute(context, backend.create_database(&request))
             .await
             .map_err(|error| resource_error(error, "database", &request.name))?;
@@ -361,7 +361,7 @@ impl GatewayService {
         context: &RequestContext,
         database: &str,
     ) -> Result<(), GatewayError> {
-        let backend = self.backend(context)?;
+        let backend = self.backend(context).await?;
         self.execute(context, backend.drop_database(database))
             .await
             .map_err(|error| resource_error(error, "database", database))?;
@@ -375,7 +375,7 @@ impl GatewayService {
         context: &RequestContext,
         database: &str,
     ) -> Result<Vec<String>, GatewayError> {
-        let backend = self.backend(context)?;
+        let backend = self.backend(context).await?;
         self.execute(context, backend.list_tables(database))
             .await
             .map_err(|error| resource_error(error, "database", database))
@@ -387,7 +387,7 @@ impl GatewayService {
         context: &RequestContext,
         table: &TableRef,
     ) -> Result<Arc<TableDescription>, GatewayError> {
-        let backend = self.backend(context)?;
+        let backend = self.backend(context).await?;
         self.execute(context, backend.describe_table(table))
             .await
             .map_err(|error| resource_error(error, "table", table.to_string()))
@@ -400,7 +400,7 @@ impl GatewayService {
         request: CreateTableRequest,
     ) -> Result<Arc<TableDescription>, GatewayError> {
         validate_create_table(&request)?;
-        let backend = self.backend(context)?;
+        let backend = self.backend(context).await?;
         self.execute(context, backend.create_table(&request))
             .await
             .map_err(|error| resource_error(error, "table", request.table.to_string()))?;
@@ -420,7 +420,7 @@ impl GatewayService {
         context: &RequestContext,
         request: AlterTableRequest,
     ) -> Result<Arc<TableDescription>, GatewayError> {
-        let backend = self.backend(context)?;
+        let backend = self.backend(context).await?;
         let cache = self.cache(context)?;
         let current = self
             .execute(context, load_table(&cache, &backend, &request.table))
@@ -446,7 +446,7 @@ impl GatewayService {
         context: &RequestContext,
         table: &TableRef,
     ) -> Result<(), GatewayError> {
-        let backend = self.backend(context)?;
+        let backend = self.backend(context).await?;
         self.execute(context, backend.drop_table(table))
             .await
             .map_err(|error| resource_error(error, "table", table.to_string()))?;
@@ -460,7 +460,7 @@ impl GatewayService {
         context: &RequestContext,
         table: &TableRef,
     ) -> Result<Vec<PartitionDescription>, GatewayError> {
-        let backend = self.backend(context)?;
+        let backend = self.backend(context).await?;
         self.execute(context, backend.list_partitions(table))
             .await
             .map_err(|error| resource_error(error, "table", table.to_string()))
@@ -472,7 +472,7 @@ impl GatewayService {
         context: &RequestContext,
         request: PartitionMutationRequest,
     ) -> Result<PartitionDescription, GatewayError> {
-        let backend = self.backend(context)?;
+        let backend = self.backend(context).await?;
         let cache = self.cache(context)?;
         let table_name = request.table.to_string();
         let partition_name = partition_resource_name(&request.table, &request.spec);
@@ -509,7 +509,7 @@ impl GatewayService {
         table: &TableRef,
         partition_name: &str,
     ) -> Result<(), GatewayError> {
-        let backend = self.backend(context)?;
+        let backend = self.backend(context).await?;
         let cache = self.cache(context)?;
         let table_name = table.to_string();
         let resource_name = format!("{table}/{partition_name}");
@@ -548,7 +548,7 @@ impl GatewayService {
         &self,
         context: &RequestContext,
     ) -> Result<ClusterHealthReport, GatewayError> {
-        let backend = self.backend(context)?;
+        let backend = self.backend(context).await?;
         self.execute(context, backend.cluster_health()).await
     }
 }

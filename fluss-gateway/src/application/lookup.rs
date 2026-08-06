@@ -55,7 +55,7 @@ impl GatewayService {
         if keys.is_empty() {
             return Ok(Vec::new());
         }
-        let backend = self.backend(context)?;
+        let backend = self.backend(context).await?;
         let expected = keys.len();
         let outcomes = self.execute(context, backend.lookup(table, keys)).await?;
         check_alignment(
@@ -80,7 +80,7 @@ impl GatewayService {
         if request.prefixes.is_empty() {
             return Ok(Vec::new());
         }
-        let backend = self.backend(context)?;
+        let backend = self.backend(context).await?;
         let expected = request.prefixes.len();
         let outcomes = self
             .execute(context, backend.prefix_lookup(table, request))

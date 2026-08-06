@@ -25,6 +25,7 @@
 //! stream, scanner, cursor, or any other handle that would outlive the call, because the gateway keeps no
 //! request-spanning state.
 
+pub mod identity;
 pub mod model;
 pub mod native;
 mod native_lookup;
