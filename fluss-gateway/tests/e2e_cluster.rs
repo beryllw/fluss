@@ -38,6 +38,7 @@ use fluss_gateway::config::{AuthenticationMode, GatewayConfig, IdentityMode};
 use fluss_gateway::lifecycle::{RunningGateway, start};
 use fluss_test_cluster::{FlussTestingCluster, FlussTestingClusterBuilder};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::time::Duration;
 use support::Api;
@@ -508,6 +509,165 @@ async fn user_identity_mode_acts_as_end_users_end_to_end() {
     assert_eq!(status, 403, "{body}");
     assert_eq!(body["error"]["code"], "UNAUTHORIZED", "{body}");
     assert_eq!(body["error"]["retryable"], false, "{body}");
+
+    gateway.shutdown().await.expect("clean shutdown");
+}
+
+/// A backpressure-tuned cluster, following the server's own KvTabletTest recipe: a 1 KiB RocksDB
+/// write buffer shrinks the flush budget to roughly twenty write-buffer-sized files (~20 KiB), so
+/// any ordinary storm batch is rejected by the admission gate *before* touching RocksDB — a
+/// deterministic hard StorageBackpressureException with no memtable stalls — while single small
+/// rows still fit. The proactive Fluss L0 trigger is parked high so the soft-throttle path stays
+/// quiet and the journey observes the hard-rejection contract alone. Needs the branch image for
+/// the backpressure protocol chain; port 19523 keeps it clear of the other clusters.
+static BACKPRESSURE_CLUSTER: LazyLock<FlussTestingCluster> = LazyLock::new(|| {
+    let (image, tag) = impersonation_image().expect("checked by the test before first use");
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Runtime::new().expect("cluster runtime");
+        runtime.block_on(async {
+            let mut conf = HashMap::new();
+            conf.insert("kv.rocksdb.writebuffer.size".to_string(), "1kb".to_string());
+            conf.insert(
+                "kv.backpressure.l0-slowdown-trigger".to_string(),
+                "1000000".to_string(),
+            );
+            FlussTestingClusterBuilder::new_with_cluster_conf("gateway-e2e-backpressure", &conf)
+                .with_image(image, tag)
+                .with_port(19523)
+                .build()
+                .await
+        })
+    })
+    .join()
+    .expect("cluster thread")
+});
+
+/// Pseudo-random alphanumeric noise: incompressible enough that a row's wire size stays close
+/// to its logical size, so the server-side flush-budget arithmetic is driven by real bytes.
+fn noise(seed: u64, len: usize) -> String {
+    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut out = String::with_capacity(len + 8);
+    while out.len() < len {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        for byte in state.to_le_bytes() {
+            out.push(char::from(b'a' + (byte % 26)));
+        }
+    }
+    out.truncate(len);
+    out
+}
+
+/// The FIP-49 `storage_backpressure` contract end to end: driving the KV store past its flush
+/// budget makes the server hard-reject writes, the client retries inside the delivery budget and
+/// then surfaces the typed code, and the gateway reports it only inside `failures[]` of a 200
+/// partial-success response — retriable, rejected, and never a whole-request HTTP status.
+#[tokio::test]
+async fn storage_backpressure_surfaces_as_entry_level_retriable_failures() {
+    if impersonation_image().is_none() {
+        eprintln!(
+            "skipping backpressure e2e: set FLUSS_IMPERSONATION_IMAGE to an image built from this branch"
+        );
+        return;
+    }
+    let bootstrap = BACKPRESSURE_CLUSTER
+        .plaintext_bootstrap_servers()
+        .to_string();
+
+    // A short delivery budget makes the client exhaust its backpressure retries quickly, so the
+    // typed failure surfaces within the test window instead of being retried away. It still has
+    // to fit at least one full round trip plus a retry, or every batch just expires in flight as
+    // the FIP's indeterminate timeout before a rejection ever reaches it.
+    let mut config = gateway_config(&bootstrap);
+    config.write.max_delivery_time = fluss_gateway::config::ConfigDuration::from_secs(4);
+    config.validate().expect("valid backpressure configuration");
+    let (gateway, api) = start_gateway(config).await;
+    wait_until_available(&api, None).await;
+
+    // One bucket concentrates every write on the same RocksDB instance.
+    let tables = "/v1/clusters/default/databases/fluss/tables";
+    let table = format!("{tables}/e2e_backpressure");
+    expect_status(
+        api.post_json(
+            tables,
+            &json!({
+                "table_name": "e2e_backpressure",
+                "columns": [
+                    {"name": "id", "data_type": {"type": "BIGINT", "nullable": false}},
+                    {"name": "payload", "data_type": {"type": "STRING", "nullable": true}}
+                ],
+                "primary_key": {"columns": ["id"]},
+                "distribution": {"bucket_count": 1, "bucket_keys": ["id"]}
+            }),
+        )
+        .await,
+        201,
+        "create table",
+    )
+    .await;
+
+    // A gentle write first: the cluster genuinely accepts data before the storm begins.
+    let warmed_up = expect_status(
+        api.post_json(
+            &format!("{table}/records"),
+            &json!({"entries": [{"id": "warm", "upsert": {"id": 0, "payload": "warm-up"}}]}),
+        )
+        .await,
+        200,
+        "warm-up write",
+    )
+    .await;
+    assert_eq!(warmed_up["success_count"], 1, "{warmed_up}");
+
+    // A batch of one hundred 4 KiB rows into the single bucket: every PutKv the client
+    // assembles from them exceeds the ~20 KiB flush budget on its own, so the admission gate
+    // rejects each attempt outright and the client's retry budget drains into the typed failure.
+    let mut backpressure_failures = 0usize;
+    let mut successes = 0usize;
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let mut batch = 0u64;
+    'drive: while std::time::Instant::now() < deadline {
+        let entries: Vec<Value> = (0..100u64)
+            .map(|row| {
+                let id = batch * 1_000_000 + row;
+                json!({"id": format!("e{id}"), "upsert": {"id": id, "payload": noise(id, 4096)}})
+            })
+            .collect();
+        batch += 1;
+        let response = api
+            .post_json(&format!("{table}/records"), &json!({"entries": entries}))
+            .await;
+        // The FIP contract: backpressure is never a whole-request HTTP status.
+        let status = response.status();
+        let body: Value = response.json().await.expect("JSON body");
+        assert_eq!(status, 200, "{body}");
+        successes += body["success_count"].as_u64().unwrap_or(0) as usize;
+        for failure in body["failures"].as_array().into_iter().flatten() {
+            if failure["error_code"] == "STORAGE_BACKPRESSURE" {
+                assert_eq!(failure["retryable"], true, "{failure}");
+                assert_eq!(failure["completion"], "rejected", "{failure}");
+                backpressure_failures += 1;
+            } else {
+                // A batch that expires in flight before a rejection reaches it is the FIP's
+                // indeterminate timeout — legitimate under overload, but not what this
+                // journey is hunting for.
+                assert_eq!(
+                    failure["error_code"], "DEADLINE_EXCEEDED",
+                    "unexpected entry failure under backpressure: {failure}"
+                );
+            }
+        }
+        if backpressure_failures > 0 {
+            break 'drive;
+        }
+    }
+
+    assert!(
+        backpressure_failures > 0,
+        "the cluster never rejected a write with STORAGE_BACKPRESSURE \
+         ({successes} rows written in {batch} rounds)"
+    );
 
     gateway.shutdown().await.expect("clean shutdown");
 }
