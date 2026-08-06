@@ -80,6 +80,7 @@ impl WriterClient {
             config.writer_retries,
             Arc::clone(&idempotence_manager),
             Arc::clone(&metrics),
+            std::time::Duration::from_millis(config.writer_kv_backpressure_max_throttle_ms),
         ));
 
         let join_handle = tokio::spawn(async move {

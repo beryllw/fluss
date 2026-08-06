@@ -16,6 +16,7 @@
 // under the License.
 
 mod accumulator;
+pub(crate) mod backpressure;
 mod batch;
 mod dynamic_batch_size;
 mod idempotence;

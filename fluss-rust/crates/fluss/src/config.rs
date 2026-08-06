@@ -162,6 +162,13 @@ pub struct Config {
     #[arg(long, default_value_t = DEFAULT_WRITER_BUFFER_WAIT_TIMEOUT_MS)]
     pub writer_buffer_wait_timeout_ms: u64,
 
+    /// Upper bound in milliseconds of the per-bucket cooperative KV backpressure throttle:
+    /// a bucket reporting pressure `p ∈ (0, 1]` delays the next request touching it by
+    /// `p * this` value. Mirrors the Java client's `client.writer.kv-backpressure.max-throttle`
+    /// (default 3000 = 3s).
+    #[arg(long, default_value_t = 3000)]
+    pub writer_kv_backpressure_max_throttle_ms: u64,
+
     /// Connect timeout in milliseconds for TCP transport connect.
     /// Default: 120000 (120 seconds).
     #[arg(long, default_value_t = DEFAULT_CONNECT_TIMEOUT_MS)]
@@ -318,6 +325,7 @@ impl Default for Config {
                 DEFAULT_WRITER_MAX_INFLIGHT_REQUESTS_PER_BUCKET,
             writer_buffer_memory_size: DEFAULT_WRITER_BUFFER_MEMORY_SIZE,
             writer_buffer_wait_timeout_ms: DEFAULT_WRITER_BUFFER_WAIT_TIMEOUT_MS,
+            writer_kv_backpressure_max_throttle_ms: 3000,
             connect_timeout_ms: DEFAULT_CONNECT_TIMEOUT_MS,
             security_protocol: String::from(DEFAULT_SECURITY_PROTOCOL),
             security_sasl_mechanism: String::from(DEFAULT_SASL_MECHANISM),

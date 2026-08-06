@@ -18,6 +18,7 @@
 use crate::client::broadcast;
 use crate::client::metadata::Metadata;
 use crate::client::write::IdempotenceManager;
+use crate::client::write::backpressure::BackpressureThrottle;
 use crate::client::write::batch::WriteBatch;
 use crate::client::{ReadyWriteBatch, RecordAccumulator};
 use crate::cluster::ServerNode;
@@ -65,6 +66,8 @@ pub struct Sender {
     retries: i32,
     idempotence_manager: Arc<IdempotenceManager>,
     metrics: Arc<WriterMetrics>,
+    /// Per-bucket cooperative KV backpressure throttle fed by PutKv response signals.
+    backpressure: BackpressureThrottle,
 }
 
 impl Sender {
@@ -78,6 +81,7 @@ impl Sender {
         retries: i32,
         idempotence_manager: Arc<IdempotenceManager>,
         metrics: Arc<WriterMetrics>,
+        kv_backpressure_max_throttle: Duration,
     ) -> Self {
         Self {
             running: AtomicBool::new(true),
@@ -90,6 +94,7 @@ impl Sender {
             retries,
             idempotence_manager,
             metrics,
+            backpressure: BackpressureThrottle::new(kv_backpressure_max_throttle),
         }
     }
 
@@ -555,6 +560,12 @@ impl Sender {
     ) -> Result<()> {
         macro_rules! send {
             ($request:expr) => {{
+                // Cooperative KV backpressure: a request touching pressured buckets waits out
+                // their throttle first, so pressure surfaces as latency inside the delivery
+                // deadline rather than as an error.
+                if let Some(until) = self.backpressure.delay_until(table_buckets.iter()) {
+                    tokio::time::sleep_until(until.into()).await;
+                }
                 // Record send latency for the request round trip regardless of
                 // outcome, so it is captured before the success/error branch.
                 let send_start = Instant::now();
@@ -623,6 +634,7 @@ impl Sender {
                 panic!("Missing ready batch for table bucket {tb}");
             };
             pending_buckets.remove(&tb);
+            self.backpressure.observe(&tb, bucket_resp.pressure());
 
             match bucket_resp.error_code() {
                 Some(code) if code != FlussError::None.code() => {
@@ -1181,6 +1193,12 @@ trait BucketResponse {
     fn error_message(&self) -> Option<&String>;
 
     fn partition_id(&self) -> Option<PartitionId>;
+
+    /// The cooperative backpressure signal piggybacked on the response, if the write path
+    /// carries one. Only KV responses do.
+    fn pressure(&self) -> Option<f32> {
+        None
+    }
 }
 
 impl BucketResponse for PbProduceLogRespForBucket {
@@ -1212,6 +1230,10 @@ impl BucketResponse for PbPutKvRespForBucket {
 
     fn partition_id(&self) -> Option<PartitionId> {
         self.partition_id
+    }
+
+    fn pressure(&self) -> Option<f32> {
+        self.pressure
     }
 }
 
@@ -1300,6 +1322,7 @@ mod tests {
             1,
             idempotence,
             Arc::new(crate::metrics::WriterMetrics::new()),
+            Duration::from_secs(3),
         );
 
         let (batch, _handle) =
@@ -1343,6 +1366,7 @@ mod tests {
             10,
             idempotence,
             Arc::new(crate::metrics::WriterMetrics::new()),
+            Duration::from_secs(3),
         );
         let table_info = Arc::new(build_table_info(table_path.as_ref().clone(), 1, 1));
         let physical_path = Arc::new(PhysicalTablePath::of(Arc::clone(&table_path)));
@@ -1467,6 +1491,7 @@ mod tests {
             0,
             idempotence,
             Arc::new(crate::metrics::WriterMetrics::new()),
+            Duration::from_secs(3),
         ));
         let table_info = Arc::new(build_table_info(table_path.as_ref().clone(), 1, 2));
         let physical_path = Arc::new(PhysicalTablePath::of(table_path));
@@ -1586,6 +1611,7 @@ mod tests {
                 1,
                 idempotence,
                 Arc::new(crate::metrics::WriterMetrics::new()),
+                Duration::from_secs(3),
             );
 
             let (batch, _handle) =
@@ -1647,6 +1673,7 @@ mod tests {
                 1,
                 idempotence,
                 Arc::new(crate::metrics::WriterMetrics::new()),
+                Duration::from_secs(3),
             );
 
             // build_ready_batch drains the batch (sets drained_ms) and appends a
@@ -1792,6 +1819,7 @@ mod tests {
                     1,
                     idempotence,
                     Arc::new(crate::metrics::WriterMetrics::new()),
+                    Duration::from_secs(3),
                 );
 
                 let (batch, _handle) =
@@ -1869,6 +1897,7 @@ mod tests {
                     1,
                     idempotence,
                     Arc::new(crate::metrics::WriterMetrics::new()),
+                    Duration::from_secs(3),
                 );
 
                 let (batch, _handle) =
@@ -1922,6 +1951,7 @@ mod tests {
             0,
             idempotence,
             Arc::new(crate::metrics::WriterMetrics::new()),
+            Duration::from_secs(3),
         );
 
         let (batch, handle) = build_ready_batch(accumulator.as_ref(), cluster.clone(), table_path)?;
@@ -1959,6 +1989,7 @@ mod tests {
             0,
             idempotence,
             Arc::new(crate::metrics::WriterMetrics::new()),
+            Duration::from_secs(3),
         );
 
         let (batch, handle) = build_ready_batch(accumulator.as_ref(), cluster, table_path)?;
@@ -1984,6 +2015,76 @@ mod tests {
         Ok(())
     }
 
+    /// The per-bucket pressure piggybacked on a PutKv response feeds the throttle, and a
+    /// pressure-free follow-up response releases it.
+    #[tokio::test]
+    async fn kv_response_pressure_feeds_and_releases_the_throttle() -> Result<()> {
+        let table_path = Arc::new(TablePath::new("db".to_string(), "tbl".to_string()));
+        let cluster = build_cluster_arc(table_path.as_ref(), 1, 1);
+        let metadata = Arc::new(Metadata::new_for_test(cluster.clone()));
+        let idempotence = disabled_idempotence();
+        let accumulator = Arc::new(RecordAccumulator::new(
+            Config::default(),
+            Arc::clone(&idempotence),
+        ));
+        let sender = Sender::new(
+            metadata,
+            accumulator.clone(),
+            1024 * 1024,
+            1000,
+            1,
+            0,
+            idempotence,
+            Arc::new(crate::metrics::WriterMetrics::new()),
+            Duration::from_secs(3),
+        );
+
+        let respond = |pressure: Option<f32>| PutKvResponse {
+            buckets_resp: vec![PbPutKvRespForBucket {
+                bucket_id: 0,
+                pressure,
+                ..Default::default()
+            }],
+        };
+
+        // A pressured response schedules a delay for the bucket.
+        let (batch, handle) =
+            build_ready_batch(accumulator.as_ref(), cluster.clone(), table_path.clone())?;
+        let bucket = batch.table_bucket.clone();
+        let mut records_by_bucket = HashMap::from([(bucket.clone(), batch)]);
+        sender
+            .handle_write_response(
+                1,
+                std::slice::from_ref(&bucket),
+                &mut records_by_bucket,
+                respond(Some(0.5)),
+            )
+            .await?;
+        assert!(matches!(handle.wait().await?, Ok(())));
+        assert!(
+            sender.backpressure.delay_until([&bucket]).is_some(),
+            "pressure must throttle the bucket"
+        );
+
+        // A pressure-free response clears it.
+        let (batch, handle) = build_ready_batch(accumulator.as_ref(), cluster, table_path)?;
+        let mut records_by_bucket = HashMap::from([(bucket.clone(), batch)]);
+        sender
+            .handle_write_response(
+                1,
+                std::slice::from_ref(&bucket),
+                &mut records_by_bucket,
+                respond(None),
+            )
+            .await?;
+        assert!(matches!(handle.wait().await?, Ok(())));
+        assert!(
+            sender.backpressure.delay_until([&bucket]).is_none(),
+            "a normal response must release the throttle"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_unknown_writer_id_resets() -> Result<()> {
         let table_path = Arc::new(TablePath::new("db".to_string(), "tbl".to_string()));
@@ -2004,6 +2105,7 @@ mod tests {
             i32::MAX,
             Arc::clone(&idempotence),
             Arc::new(crate::metrics::WriterMetrics::new()),
+            Duration::from_secs(3),
         );
 
         // build_ready_batch drains the batch, which assigns seq=0 and adds in-flight
@@ -2051,6 +2153,7 @@ mod tests {
             0,
             Arc::clone(&idempotence),
             Arc::new(crate::metrics::WriterMetrics::new()),
+            Duration::from_secs(3),
         );
 
         // build_ready_batch drains the batch, which assigns seq=0 and adds in-flight
@@ -2097,6 +2200,7 @@ mod tests {
             i32::MAX,
             Arc::clone(&idempotence),
             Arc::new(crate::metrics::WriterMetrics::new()),
+            Duration::from_secs(3),
         );
 
         // build_ready_batch drains the batch, which assigns seq=0 and adds in-flight
