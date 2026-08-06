@@ -119,6 +119,8 @@ pub struct FlussTestingClusterBuilder {
     remote_data_dir: Option<std::path::PathBuf>,
     sasl_enabled: bool,
     sasl_users: Vec<(String, String)>,
+    /// JAAS `impersonate_<user>="..."` grants: (authenticated user, allowed authzids or `*`).
+    sasl_impersonation_grants: Vec<(String, String)>,
     coordinator_host_port: u16,
     plain_client_port: Option<u16>,
     image: String,
@@ -140,6 +142,22 @@ impl FlussTestingClusterBuilder {
         self.sasl_enabled = true;
         self.sasl_users = users;
         self.plain_client_port = Some(self.coordinator_host_port + 100);
+        self
+    }
+
+    /// Grants SASL/PLAIN impersonation to already-declared users: each `(user, allowed)` pair
+    /// becomes an `impersonate_<user>="<allowed>"` JAAS option, where `allowed` is `*` or a
+    /// comma-separated allowlist of authorization ids.
+    pub fn with_sasl_impersonation(mut self, grants: Vec<(String, String)>) -> Self {
+        self.sasl_impersonation_grants = grants;
+        self
+    }
+
+    /// Overrides the Fluss image for this cluster only, taking precedence over the
+    /// `FLUSS_IMAGE`/`FLUSS_VERSION` environment and the compiled-in default.
+    pub fn with_image(mut self, image: impl Into<String>, tag: impl Into<String>) -> Self {
+        self.image = image.into();
+        self.image_tag = tag.into();
         self
     }
 
@@ -174,6 +192,7 @@ impl FlussTestingClusterBuilder {
             remote_data_dir: None,
             sasl_enabled: false,
             sasl_users: Vec::new(),
+            sasl_impersonation_grants: Vec::new(),
             coordinator_host_port: 9123,
             plain_client_port: None,
             // runtime env overrides the compile-time default (server-compat CI lane)
@@ -220,6 +239,11 @@ impl FlussTestingClusterBuilder {
                 .sasl_users
                 .iter()
                 .map(|(u, p)| format!("user_{}=\"{}\"", u, p))
+                .chain(
+                    self.sasl_impersonation_grants
+                        .iter()
+                        .map(|(u, allowed)| format!("impersonate_{}=\"{}\"", u, allowed)),
+                )
                 .collect();
             let jaas_config = format!(
                 "org.apache.fluss.security.auth.sasl.plain.PlainLoginModule required {};",

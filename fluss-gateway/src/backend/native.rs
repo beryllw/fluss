@@ -63,7 +63,9 @@ impl NativeGatewayBackend {
         cluster: &ClusterConfig,
         lookup: &LookupConfig,
     ) -> Result<Self, GatewayError> {
-        Self::connect_with(client_config(cluster, lookup), cluster, lookup).await
+        Self::connect_with(client_config(cluster, lookup), cluster, lookup)
+            .await
+            .map_err(|e| map_fluss_error("connect to Fluss", e))
     }
 
     /// Connects acting as `act_as`: the connection authenticates with the service account and
@@ -76,18 +78,19 @@ impl NativeGatewayBackend {
     ) -> Result<Self, GatewayError> {
         let mut config = client_config(cluster, lookup);
         config.security_sasl_authorization_id = act_as.to_string();
-        Self::connect_with(config, cluster, lookup).await
+        Self::connect_with(config, cluster, lookup)
+            .await
+            .map_err(|error| map_act_as_connect_error(act_as, error))
     }
 
     async fn connect_with(
         config: fluss::config::Config,
         cluster: &ClusterConfig,
         lookup: &LookupConfig,
-    ) -> Result<Self, GatewayError> {
+    ) -> Result<Self, FlussClientError> {
         let connection =
             FlussConnection::new_with_request_timeout(config, cluster.request_timeout.get())
-                .await
-                .map_err(|e| map_fluss_error("connect to Fluss", e))?;
+                .await?;
         Ok(Self {
             connection: Arc::new(connection),
             lookup_concurrency: lookup.max_concurrent.max(1) as usize,
@@ -674,6 +677,22 @@ pub(crate) fn map_fluss_error(context: &str, error: FlussClientError) -> Gateway
     map_fluss_error_kind(context, error).with_retryable(retriable)
 }
 
+/// Maps a failure to dial an act-as connection (FIP-49 user identity mode).
+///
+/// A definitive authentication rejection here means the server refused to let the service
+/// account act as this principal — the caller's identity is outside the server-side
+/// impersonation allowlist — which is the caller's 403, not an internal gateway failure.
+/// Every other dial failure keeps the shared connect mapping.
+fn map_act_as_connect_error(act_as: &str, error: FlussClientError) -> GatewayError {
+    if error.api_error() == Some(FlussError::AuthenticateException) {
+        log::warn!("Fluss refused an act-as connection for principal {act_as:?}: {error}");
+        return GatewayError::unauthorized(format!(
+            "Fluss refused to authorize acting as `{act_as}`"
+        ));
+    }
+    map_fluss_error("connect to Fluss", error)
+}
+
 fn map_fluss_error_kind(context: &str, error: FlussClientError) -> GatewayError {
     if let Some(api_error) = error.api_error() {
         match api_error {
@@ -749,6 +768,33 @@ mod tests {
     use crate::error::ErrorDetails;
     use fluss::metadata::{DataTypes, Schema, TableConfig};
     use std::collections::HashMap;
+
+    /// A definitive authentication rejection on an act-as dial is the caller's 403 — the
+    /// principal is outside the server-side impersonation allowlist — while every other dial
+    /// failure keeps the shared connect mapping.
+    #[test]
+    fn act_as_authentication_rejection_maps_to_unauthorized() {
+        let refused = map_act_as_connect_error(
+            "carol",
+            FlussClientError::FlussAPIError {
+                api_error: FlussError::AuthenticateException
+                    .to_api_error(Some("not authorized to impersonate".to_string())),
+            },
+        );
+        assert_eq!(refused.kind(), ErrorKind::Unauthorized);
+        assert!(!refused.retryable());
+        assert!(refused.message().contains("carol"), "{refused:?}");
+
+        // Any other dial failure stays on the shared connect mapping.
+        let transient = map_act_as_connect_error(
+            "carol",
+            FlussClientError::FlussAPIError {
+                api_error: FlussError::NetworkException.to_api_error(None),
+            },
+        );
+        assert_eq!(transient.kind(), ErrorKind::Unavailable);
+        assert!(transient.retryable());
+    }
 
     /// Without service credentials the native client keeps today's plaintext connection.
     #[test]

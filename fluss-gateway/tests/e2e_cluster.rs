@@ -27,11 +27,14 @@
 //! password gateways and a SASL listener for the service-account gateway. Each test starts its own
 //! in-process gateway on an ephemeral port over the production `lifecycle::start` path, so the
 //! native backend, the reconnect supervisor, and the real HTTP listener are all exercised.
+//!
+//! Container names and host ports are fixed, so invoking the suite again while the previous run's
+//! containers are still being torn down can race; leave a few seconds between back-to-back runs.
 
 mod support;
 
 use fluss_gateway::auth::Secret;
-use fluss_gateway::config::{AuthenticationMode, GatewayConfig};
+use fluss_gateway::config::{AuthenticationMode, GatewayConfig, IdentityMode};
 use fluss_gateway::lifecycle::{RunningGateway, start};
 use fluss_test_cluster::{FlussTestingCluster, FlussTestingClusterBuilder};
 use serde_json::{Value, json};
@@ -356,5 +359,155 @@ async fn sasl_service_account_gateway_reaches_the_cluster() {
     let body: Value = refused.json().await.expect("JSON body");
     assert_eq!(status, 503, "{body}");
     assert_eq!(body["error"]["code"], "UNAVAILABLE", "{body}");
+    gateway.shutdown().await.expect("clean shutdown");
+}
+
+/// The act-as journeys need a Fluss image with SASL/PLAIN impersonation support (built from this
+/// branch); the released images do not carry it yet, so they are gated behind an env variable:
+///
+/// ```bash
+/// FLUSS_IMPERSONATION_IMAGE=apache/fluss FLUSS_IMPERSONATION_VERSION=fip49-poc \
+///     cargo test --features integration_tests --test e2e_cluster
+/// ```
+fn impersonation_image() -> Option<(String, String)> {
+    let image = std::env::var("FLUSS_IMPERSONATION_IMAGE").ok()?;
+    let tag = std::env::var("FLUSS_IMPERSONATION_VERSION").unwrap_or_else(|_| "latest".to_string());
+    Some((image, tag))
+}
+
+/// An impersonation-enabled cluster: the service account may act as `alice` and `bob` — and
+/// deliberately not as anyone else. Ports 19323/19423 keep it clear of the shared cluster.
+static ACT_AS_CLUSTER: LazyLock<FlussTestingCluster> = LazyLock::new(|| {
+    let (image, tag) = impersonation_image().expect("checked by the test before first use");
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Runtime::new().expect("cluster runtime");
+        runtime.block_on(async {
+            FlussTestingClusterBuilder::new("gateway-e2e-act-as")
+                .with_sasl(vec![(
+                    SERVICE_ACCOUNT.to_string(),
+                    SERVICE_SECRET.to_string(),
+                )])
+                .with_sasl_impersonation(vec![(
+                    SERVICE_ACCOUNT.to_string(),
+                    "alice,bob".to_string(),
+                )])
+                .with_image(image, tag)
+                .with_port(19323)
+                .build()
+                .await
+        })
+    })
+    .join()
+    .expect("cluster thread")
+});
+
+/// The FIP-49 user identity mode end to end: every REST principal reaches Fluss over its own
+/// SASL connection carrying its name as the authorization id. Users inside the server-side
+/// allowlist complete real writes and lookups; a user outside it authenticates to the gateway
+/// but the server refuses the act-as connection, so the request answers UNAVAILABLE.
+#[tokio::test]
+async fn user_identity_mode_acts_as_end_users_end_to_end() {
+    if impersonation_image().is_none() {
+        eprintln!(
+            "skipping act-as e2e: set FLUSS_IMPERSONATION_IMAGE to an impersonation-enabled image"
+        );
+        return;
+    }
+    let bootstrap = ACT_AS_CLUSTER
+        .sasl_bootstrap_servers()
+        .expect("the cluster exposes a SASL listener")
+        .to_string();
+
+    // User identity mode demands verified client identities, so the gateway runs password mode;
+    // carol is a legitimate gateway user who is missing from the server-side allowlist.
+    let mut config = gateway_config(&bootstrap);
+    {
+        let cluster = config
+            .clusters
+            .values_mut()
+            .next()
+            .expect("the default cluster");
+        cluster.service_account = Some(SERVICE_ACCOUNT.to_string());
+        cluster.service_password = Some(Secret::from(SERVICE_SECRET));
+        cluster.identity_mode = IdentityMode::User;
+    }
+    config.security.authentication = AuthenticationMode::Password;
+    config.security.users = Some("alice:pw-a,bob:pw-b,carol:pw-c".to_string());
+    config.validate().expect("valid user-mode configuration");
+    let (gateway, api) = start_gateway(config).await;
+    wait_until_available(&api, Some(("alice", "pw-a"))).await;
+
+    // Alice creates the table over her own act-as connection.
+    let tables = "/v1/clusters/default/databases/fluss/tables";
+    let table = format!("{tables}/e2e_act_as");
+    expect_status(
+        api.post_json_with_basic(
+            tables,
+            &json!({
+                "table_name": "e2e_act_as",
+                "columns": [
+                    {"name": "id", "data_type": {"type": "BIGINT", "nullable": false}},
+                    {"name": "author", "data_type": {"type": "STRING", "nullable": true}}
+                ],
+                "primary_key": {"columns": ["id"]}
+            }),
+            "alice",
+            "pw-a",
+        )
+        .await,
+        201,
+        "create table as alice",
+    )
+    .await;
+
+    // Alice and bob write over their own connections; bob's lookup sees both rows.
+    for (user, pass, entry_id, row_id) in [("alice", "pw-a", "a1", 1), ("bob", "pw-b", "b1", 2)] {
+        let written = expect_status(
+            api.post_json_with_basic(
+                &format!("{table}/records"),
+                &json!({"entries": [
+                    {"id": entry_id, "upsert": {"id": row_id, "author": user}}
+                ]}),
+                user,
+                pass,
+            )
+            .await,
+            200,
+            &format!("write as {user}"),
+        )
+        .await;
+        assert_eq!(written["success_count"], 1, "{written}");
+    }
+    let looked_up = expect_status(
+        api.post_json_with_basic(
+            &format!("{table}/records/lookup"),
+            &json!({"keys": [{"id": 1}, {"id": 2}]}),
+            "bob",
+            "pw-b",
+        )
+        .await,
+        200,
+        "lookup as bob",
+    )
+    .await;
+    assert_eq!(looked_up["results"][0]["row"]["author"], "alice");
+    assert_eq!(looked_up["results"][1]["row"]["author"], "bob");
+
+    // Carol clears gateway authentication but the server refuses to let the service account act
+    // as her: the act-as dial is definitively rejected, which is her 403.
+    let refused = api
+        .post_json_with_basic(
+            &format!("{table}/records/lookup"),
+            &json!({"keys": [{"id": 1}]}),
+            "carol",
+            "pw-c",
+        )
+        .await;
+    let status = refused.status();
+    let body: Value = refused.json().await.expect("JSON body");
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(body["error"]["code"], "UNAUTHORIZED", "{body}");
+    assert_eq!(body["error"]["retryable"], false, "{body}");
+
     gateway.shutdown().await.expect("clean shutdown");
 }

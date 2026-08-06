@@ -97,6 +97,23 @@ impl Api {
         self.post_json_accept(path, body, "application/json").await
     }
 
+    /// Sends a JSON POST request carrying HTTP basic credentials.
+    pub async fn post_json_with_basic(
+        &self,
+        path: &str,
+        body: &Value,
+        user: &str,
+        pass: &str,
+    ) -> reqwest::Response {
+        self.client
+            .post(self.url(path))
+            .basic_auth(user, Some(pass))
+            .json(body)
+            .send()
+            .await
+            .expect("POST request")
+    }
+
     /// Sends a JSON POST request with an explicit response media type.
     pub async fn post_json_accept(
         &self,
