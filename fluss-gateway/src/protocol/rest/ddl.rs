@@ -26,8 +26,10 @@
 //! mutation is attempted rather than a silently ignored instruction. Creations answer `201` with a `Location`
 //! header naming the new resource; deletions answer `204` with an empty body.
 //!
-//! There is deliberately no `validate_only` dry-run flag: Fluss exposes no server-side validation API, and a
-//! client-side simulation would promise a guarantee the gateway cannot keep (PLAN §4.8).
+//! Create table supports the FIP-49 `validate_only` dry run: the whole gateway-side validation chain runs —
+//! body shape, type vocabulary, primary-key rules — and answers a `200` summary without touching the backend.
+//! The dry run promises exactly that chain and nothing more; kernel-side conditions (an existing table, an
+//! unknown config key) still surface only on the real creation.
 
 use crate::application::ddl::{
     AlterTableRequest, ColumnDefinition, CreateDatabaseRequest, CreateTableRequest,
@@ -50,7 +52,7 @@ use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Instant;
 use utoipa::ToSchema;
@@ -118,6 +120,19 @@ pub struct CreateTableBody {
     #[serde(default)]
     pub custom_properties: HashMap<String, String>,
     pub comment: Option<String>,
+    /// FIP-49 dry run: validate the definition without creating the table.
+    #[serde(default)]
+    pub validate_only: bool,
+}
+
+/// The `200` summary answered by a successful `validate_only` dry run.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ValidateOnlyResponse {
+    pub validate_only: bool,
+    pub database: String,
+    pub table: String,
+    pub column_count: usize,
+    pub primary_key: Vec<String>,
 }
 
 /// One supported table change. Added columns must be nullable, since existing rows have no value for them.
@@ -283,6 +298,7 @@ pub(crate) async fn drop_database(
     ),
     request_body(content = CreateTableBody, content_type = "application/json"),
     responses(
+        (status = 200, description = "Dry run: the definition is valid, nothing was created", body = ValidateOnlyResponse),
         (status = 201, description = "Table created", body = TableResponse),
         (status = 400, description = "Invalid table definition", body = ErrorEnvelopeSchema),
         (status = 404, description = "Cluster or database not found", body = ErrorEnvelopeSchema),
@@ -311,7 +327,18 @@ pub(crate) async fn create_table(
         let body: CreateTableBody = parse_json_body(&headers, &body)?;
         let table = TableRef::new(database, body.table_name.clone());
         let location = table_location(&cluster, &table);
+        let validate_only = body.validate_only;
         let request = create_table_request(table, body)?;
+        if validate_only {
+            // The chain above is the whole dry-run promise; the backend is never consulted.
+            return json_response(&ValidateOnlyResponse {
+                validate_only: true,
+                database: request.table.database.clone(),
+                table: request.table.table.clone(),
+                column_count: request.columns.len(),
+                primary_key: request.primary_key.clone(),
+            });
+        }
         let context = application_context(&request_id, deadline, &principal, &cluster)?;
         let created = state.application.create_table(&context, request).await?;
         created_response(&TableResponse::from(created.as_ref()), &location)
@@ -737,6 +764,71 @@ mod tests {
     #[test]
     fn location_path_segments_are_percent_encoded() {
         assert_eq!(encode_segment("sales/eu 1"), "sales%2Feu%201");
+    }
+
+    /// `validate_only` runs the whole gateway-side validation chain and answers the FIP dry-run
+    /// summary without the table ever reaching the backend.
+    #[tokio::test]
+    async fn validate_only_answers_200_without_creating_the_table() {
+        let app = test_support::app(Arc::new(TestBackend::new()));
+        let dry_run = SHIPMENTS.replacen('{', "{\"validate_only\": true,", 1);
+        let response = send(
+            &app,
+            Method::POST,
+            "/v1/clusters/default/databases/fluss/tables",
+            &dry_run,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "validate_only": true,
+                "database": "fluss",
+                "table": "shipments",
+                "column_count": 3,
+                "primary_key": ["region", "id"]
+            })
+        );
+
+        // The dry run never touched the backend: the table does not exist afterwards.
+        let lookup = send(
+            &app,
+            Method::GET,
+            "/v1/clusters/default/databases/fluss/tables/shipments",
+            "",
+        )
+        .await;
+        assert_eq!(lookup.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// The dry run is a real validation: a body the create path would reject is rejected
+    /// identically, and nothing about `validate_only` bypasses the chain.
+    #[tokio::test]
+    async fn validate_only_still_runs_the_validation_chain() {
+        let app = test_support::app(Arc::new(TestBackend::new()));
+        for broken in [
+            // Empty primary key columns.
+            r#"{"validate_only": true, "table_name": "t",
+                "columns": [{"name": "id", "data_type": {"type": "BIGINT", "nullable": false}}],
+                "primary_key": {"columns": []}}"#,
+            // A type outside the vocabulary.
+            r#"{"validate_only": true, "table_name": "t",
+                "columns": [{"name": "id", "data_type": {"type": "UUID"}}]}"#,
+        ] {
+            let response = send(
+                &app,
+                Method::POST,
+                "/v1/clusters/default/databases/fluss/tables",
+                broken,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{broken}");
+            let json = response_json(response).await;
+            assert_eq!(json["error"]["code"], "INVALID_ARGUMENT", "{broken}");
+        }
     }
 
     #[test]
