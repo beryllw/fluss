@@ -67,10 +67,13 @@ impl FlussConnection {
             None => rpc_client,
         };
         let connections = if arg.is_sasl_enabled() {
-            Arc::new(rpc_client.with_sasl(
-                arg.security_sasl_username.clone(),
-                arg.security_sasl_password.clone(),
-            ))
+            let authorization_id = (!arg.security_sasl_authorization_id.is_empty())
+                .then(|| arg.security_sasl_authorization_id.clone());
+            Arc::new(rpc_client.with_sasl_config(crate::rpc::SaslConfig {
+                username: arg.security_sasl_username.clone(),
+                password: arg.security_sasl_password.clone(),
+                authorization_id,
+            }))
         } else {
             Arc::new(rpc_client)
         };

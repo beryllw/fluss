@@ -64,6 +64,10 @@ const AUTH_JITTER: f64 = 0.2;
 pub struct SaslConfig {
     pub username: String,
     pub password: String,
+    /// The identity to impersonate (RFC 4616 authzid). `None` acts as the authenticated user
+    /// itself; the server allows impersonation only for users granted it via the JAAS
+    /// `impersonate_<username>` option.
+    pub authorization_id: Option<String>,
 }
 
 impl fmt::Debug for SaslConfig {
@@ -71,6 +75,7 @@ impl fmt::Debug for SaslConfig {
         f.debug_struct("SaslConfig")
             .field("username", &self.username)
             .field("password", &"[REDACTED]")
+            .field("authorization_id", &self.authorization_id)
             .finish()
     }
 }
@@ -213,7 +218,18 @@ impl RpcClient {
     }
 
     pub fn with_sasl(mut self, username: String, password: String) -> Self {
-        self.sasl_config = Some(SaslConfig { username, password });
+        self.sasl_config = Some(SaslConfig {
+            username,
+            password,
+            authorization_id: None,
+        });
+        self
+    }
+
+    /// Installs a complete SASL configuration, including an optional authorization id for
+    /// impersonation. Prefer [`RpcClient::with_sasl`] when acting as the authenticated user.
+    pub fn with_sasl_config(mut self, sasl_config: SaslConfig) -> Self {
+        self.sasl_config = Some(sasl_config);
         self
     }
 
@@ -266,7 +282,7 @@ impl RpcClient {
         Self::check_api_versions(&connection, server_node.server_type()).await?;
 
         if let Some(ref sasl) = self.sasl_config {
-            Self::authenticate(&connection, &sasl.username, &sasl.password).await?;
+            Self::authenticate(&connection, sasl).await?;
         }
 
         Ok(connection)
@@ -292,16 +308,16 @@ impl RpcClient {
     /// (matching Java's unbounded retry behaviour). Non-retriable errors
     /// (wrong password, unknown user) propagate immediately as
     /// `Error::FlussAPIError` with the original error code.
-    async fn authenticate(
-        connection: &ServerConnection,
-        username: &str,
-        password: &str,
-    ) -> Result<(), Error> {
+    async fn authenticate(connection: &ServerConnection, sasl: &SaslConfig) -> Result<(), Error> {
         use crate::rpc::fluss_api_error::FlussError;
         use crate::rpc::message::AuthenticateRequest;
         use rand::Rng;
 
-        let initial_request = AuthenticateRequest::new_plain(username, password);
+        let initial_request = AuthenticateRequest::new_plain_with_authorization_id(
+            sasl.authorization_id.as_deref().unwrap_or(""),
+            &sasl.username,
+            &sasl.password,
+        );
         let mut retry_count: u32 = 0;
 
         loop {

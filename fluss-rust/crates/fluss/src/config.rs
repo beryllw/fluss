@@ -179,6 +179,14 @@ pub struct Config {
     #[arg(long, default_value_t = String::new())]
     #[serde(skip_serializing)]
     pub security_sasl_password: String,
+
+    /// The authorization id (the user to impersonate) requested during SASL/PLAIN
+    /// authentication, as defined by RFC 4616. The server permits it only if the authenticated
+    /// user is granted impersonation via the `impersonate_<username>` option in the server-side
+    /// JAAS configuration. Empty means the client acts as the authenticated user itself.
+    /// Mirrors the Java client's `client.security.sasl.authorization-id`.
+    #[arg(long, default_value_t = String::new())]
+    pub security_sasl_authorization_id: String,
     /// Maximum number of pending lookup operations
     /// Default: 25600 (matching Java CLIENT_LOOKUP_QUEUE_SIZE)
     #[arg(long, default_value_t = 25600)]
@@ -269,6 +277,10 @@ impl std::fmt::Debug for Config {
             .field("security_sasl_mechanism", &self.security_sasl_mechanism)
             .field("security_sasl_username", &self.security_sasl_username)
             .field("security_sasl_password", &"[REDACTED]")
+            .field(
+                "security_sasl_authorization_id",
+                &self.security_sasl_authorization_id,
+            )
             .field("lookup_queue_size", &self.lookup_queue_size)
             .field("lookup_max_batch_size", &self.lookup_max_batch_size)
             .field("lookup_batch_timeout_ms", &self.lookup_batch_timeout_ms)
@@ -311,6 +323,7 @@ impl Default for Config {
             security_sasl_mechanism: String::from(DEFAULT_SASL_MECHANISM),
             security_sasl_username: String::new(),
             security_sasl_password: String::new(),
+            security_sasl_authorization_id: String::new(),
             lookup_queue_size: 25600,
             lookup_max_batch_size: 128,
             lookup_batch_timeout_ms: 100,
