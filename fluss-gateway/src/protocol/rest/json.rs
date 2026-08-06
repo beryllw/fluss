@@ -1284,8 +1284,9 @@ mod tests {
 #[cfg(test)]
 mod round_trip_tests {
     use super::*;
-    use crate::application::{DataType as DomainType, InputColumn, RowField, SchemaDecoder};
+    use crate::backend::types::{DataType as DomainType, RowField};
     use crate::protocol::rest::input::parse_input_value;
+    use crate::protocol::rest::input_decode::{InputColumn, SchemaDecoder};
     use arrow::array::make_builder;
     use fluss::metadata::DataType as FlussDataType;
     use fluss::record::to_arrow_type;

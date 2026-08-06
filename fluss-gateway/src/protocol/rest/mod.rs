@@ -17,8 +17,8 @@
 
 //! REST adapter: router assembly and cross-cutting middleware.
 //!
-//! Data and metadata handlers call [`crate::application::GatewayService`] and never reach a
-//! cluster backend directly. Each endpoint module builds its own [`OpenApiRouter`], and [`build_router`]
+//! Data and metadata handlers dispatch through the orchestration modules (`catalog_ops`,
+//! `write_ops`, `lookup_ops`), which resolve the caller's backend from the cluster registry. Each endpoint module builds its own [`OpenApiRouter`], and [`build_router`]
 //! merges them, splits the result into an Axum router plus the generated OpenAPI document, and wraps the router
 //! in the middleware defined here.
 //!
@@ -28,6 +28,7 @@
 //! (`resource_exhausted`, always with a `Retry-After` header, per FIP-49).
 
 pub mod auth;
+pub(crate) mod catalog_ops;
 pub mod clusters;
 pub mod datatype;
 pub mod ddl;
@@ -38,14 +39,17 @@ pub mod input_value;
 pub mod json;
 pub mod limits;
 pub mod lookup;
+pub(crate) mod lookup_ops;
 pub mod metadata;
 pub mod openapi;
 pub mod pagination;
 pub mod records;
+pub(crate) mod write_ops;
 
-use crate::application::{CancellationSignal, ClusterId, GatewayService, RequestContext};
 use crate::auth::{Authenticator, Principal};
+use crate::backend::context::{CancellationSignal, RequestContext};
 use crate::backend::registry::ClusterRegistry;
+use crate::backend::types::ClusterId;
 use crate::config::{LookupConfig, MetadataConfig, RestServerConfig, WriteConfig};
 use crate::error::{ErrorEnvelope, GatewayError};
 use crate::lifecycle::Readiness;
@@ -71,10 +75,10 @@ use utoipa_axum::router::OpenApiRouter;
 /// request, a session, or a client.
 #[derive(Clone)]
 pub struct RestState {
-    /// Protocol-neutral application facade used by REST data and metadata handlers.
-    pub application: Arc<GatewayService>,
-    /// Cluster registry retained for cluster discovery, health, and lifecycle control paths.
+    /// Cluster registry resolving each request's backend; also serves discovery and health.
     pub clusters: Arc<ClusterRegistry>,
+    /// The finite per-entry write delivery lifetime from `gateway.rest.write.max-delivery-time`.
+    pub write_delivery_time: Duration,
     pub readiness: Arc<Readiness>,
     pub bind_address: SocketAddr,
     pub started_at: Instant,
@@ -676,8 +680,8 @@ pub mod test_support {
         let readiness = Arc::new(Readiness::new());
         readiness.set_serving();
         RestState {
-            application: Arc::new(GatewayService::new(clusters.clone())),
             clusters,
+            write_delivery_time: Duration::from_secs(20),
             readiness,
             bind_address: "127.0.0.1:8080".parse().expect("valid"),
             started_at: Instant::now(),

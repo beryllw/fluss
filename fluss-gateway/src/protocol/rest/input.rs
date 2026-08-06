@@ -21,8 +21,8 @@
 //! object fields. Writes instead retain number lexemes and ordered object entries until the
 //! application layer validates them against the authoritative Fluss schema.
 
-use crate::application::InputValue;
 use crate::error::GatewayError;
+use crate::protocol::rest::input_value::InputValue;
 use std::collections::HashSet;
 
 const MAX_NESTING_DEPTH: usize = 128;

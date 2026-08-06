@@ -17,10 +17,11 @@
 
 //! Stateless REST gateway for Apache Fluss.
 //!
-//! [`protocol::rest`] serves the HTTP surface and calls [`application::GatewayService`]. The application layer
-//! dispatches through [`backend::GatewayBackend`], whose native implementation over `fluss-rs` lives in
-//! [`backend::native`]. Protocol adapters never reach `fluss-rs` types directly and the backend never returns
-//! protocol types. [`lifecycle`] owns startup, readiness, background tasks, and graceful shutdown.
+//! [`protocol::rest`] serves the HTTP surface — routing, authentication, JSON decoding, and request
+//! orchestration — and dispatches through [`backend::GatewayBackend`], whose native implementation over
+//! `fluss-rs` lives in [`backend::native`]. The REST layer never reaches `fluss-rs` types directly and the
+//! backend never returns protocol types, the FIP-49 two-component shape. [`lifecycle`] owns startup,
+//! readiness, background tasks, and graceful shutdown.
 //!
 //! # Statelessness contract
 //!
@@ -29,10 +30,9 @@
 //! from the request plus current cluster state, so any instance can serve any request and instances can be added
 //! or removed freely behind a plain load balancer. The only in-process state is performance-only and safe to
 //! lose: the per-cluster connection pool ([`backend::resilient`]), the per-cluster table metadata cache
-//! ([`application::metadata_cache`]), and request-scoped write buffers that are flushed before the HTTP response
+//! ([`backend::metadata_cache`]), and request-scoped write buffers that are flushed before the HTTP response
 //! is sent.
 
-pub mod application;
 pub mod auth;
 pub mod backend;
 pub mod config;

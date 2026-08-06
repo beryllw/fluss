@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The lookup half of [`GatewayService`]: batched primary-key lookup and bounded prefix lookup.
+//! Lookup orchestration for the REST endpoints: batched primary-key lookup and bounded prefix lookup.
 //!
-//! Both methods are thin: they resolve the request's cluster, run the backend call under the request's
+//! Both functions are thin: they resolve the request's cluster, run the backend call under the request's
 //! cancellation signal and absolute deadline, and check the one invariant the whole REST contract rests on —
 //! that the backend answered with exactly one outcome per input, in input order. Everything schema-shaped
 //! (which columns a key carries, how a value parses) belongs to the adapter, and everything cluster-shaped
@@ -32,66 +32,60 @@
 //! not-found outcome, because a primary key names at most one row. A prefix lookup answers per prefix with a
 //! zero-row batch, because an empty range is a normal result rather than a missing resource.
 
-use crate::application::{GatewayService, RequestContext};
+use crate::backend::context::RequestContext;
 use crate::backend::model::{
     LookupKey, LookupOutcome, PrefixLookupOutcome, PrefixLookupRequest, TableRef,
 };
+use crate::backend::registry::ClusterRegistry;
 use crate::error::GatewayError;
 
-/// The two lookup paths.
+/// Looks up rows by primary key, returning exactly one outcome per input key in input order.
 ///
-/// One of several inherent `impl GatewayService` blocks; see [`crate::application::service`].
-impl GatewayService {
-    /// Looks up rows by primary key, returning exactly one outcome per input key in input order.
-    ///
-    /// Keys carry values in logical primary-key order, partition key columns included. A miss is an outcome,
-    /// never an error.
-    pub async fn lookup(
-        &self,
-        context: &RequestContext,
-        table: &TableRef,
-        keys: Vec<LookupKey>,
-    ) -> Result<Vec<LookupOutcome>, GatewayError> {
-        if keys.is_empty() {
-            return Ok(Vec::new());
-        }
-        let backend = self.backend(context).await?;
-        let expected = keys.len();
-        let outcomes = self.execute(context, backend.lookup(table, keys)).await?;
-        check_alignment(
-            "lookup",
-            expected,
-            outcomes.iter().map(|outcome| outcome.input_index),
-        )?;
-        Ok(outcomes)
+/// Keys carry values in logical primary-key order, partition key columns included. A miss is an outcome,
+/// never an error.
+pub(crate) async fn lookup(
+    clusters: &ClusterRegistry,
+    context: &RequestContext,
+    table: &TableRef,
+    keys: Vec<LookupKey>,
+) -> Result<Vec<LookupOutcome>, GatewayError> {
+    if keys.is_empty() {
+        return Ok(Vec::new());
     }
+    let backend = clusters.backend_for_context(context).await?;
+    let expected = keys.len();
+    let outcomes = context.run(backend.lookup(table, keys)).await?;
+    check_alignment(
+        "lookup",
+        expected,
+        outcomes.iter().map(|outcome| outcome.input_index),
+    )?;
+    Ok(outcomes)
+}
 
-    /// Looks up rows by key prefix, returning exactly one outcome per input prefix in input order.
-    ///
-    /// The prefix columns must cover the table's bucket keys so each prefix routes to a single bucket, which the
-    /// Fluss client decides while building its lookuper; a refusal arrives here as an invalid argument carrying
-    /// the client's own message. Results are truncated at `request.max_rows_per_prefix` and flagged when they are.
-    pub async fn prefix_lookup(
-        &self,
-        context: &RequestContext,
-        table: &TableRef,
-        request: PrefixLookupRequest,
-    ) -> Result<Vec<PrefixLookupOutcome>, GatewayError> {
-        if request.prefixes.is_empty() {
-            return Ok(Vec::new());
-        }
-        let backend = self.backend(context).await?;
-        let expected = request.prefixes.len();
-        let outcomes = self
-            .execute(context, backend.prefix_lookup(table, request))
-            .await?;
-        check_alignment(
-            "prefix lookup",
-            expected,
-            outcomes.iter().map(|outcome| outcome.input_index),
-        )?;
-        Ok(outcomes)
+/// Looks up rows by key prefix, returning exactly one outcome per input prefix in input order.
+///
+/// The prefix columns must cover the table's bucket keys so each prefix routes to a single bucket, which the
+/// Fluss client decides while building its lookuper; a refusal arrives here as an invalid argument carrying
+/// the client's own message. Results are truncated at `request.max_rows_per_prefix` and flagged when they are.
+pub(crate) async fn prefix_lookup(
+    clusters: &ClusterRegistry,
+    context: &RequestContext,
+    table: &TableRef,
+    request: PrefixLookupRequest,
+) -> Result<Vec<PrefixLookupOutcome>, GatewayError> {
+    if request.prefixes.is_empty() {
+        return Ok(Vec::new());
     }
+    let backend = clusters.backend_for_context(context).await?;
+    let expected = request.prefixes.len();
+    let outcomes = context.run(backend.prefix_lookup(table, request)).await?;
+    check_alignment(
+        "prefix lookup",
+        expected,
+        outcomes.iter().map(|outcome| outcome.input_index),
+    )?;
+    Ok(outcomes)
 }
 
 /// Verifies that a backend answered with one outcome per input, in input order.
@@ -125,15 +119,15 @@ fn check_alignment(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::application::{CancellationSignal, ClusterId};
+    use crate::backend::context::CancellationSignal;
     use crate::backend::model::{KeyValue, LookupOutcomeKind};
-    use crate::backend::registry::ClusterRegistry;
     use crate::backend::testing::TestBackend;
+    use crate::backend::types::ClusterId;
     use crate::error::ErrorKind;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    fn service() -> (GatewayService, Arc<TestBackend>) {
+    fn clusters() -> (Arc<ClusterRegistry>, Arc<TestBackend>) {
         let backend = Arc::new(TestBackend::new());
         let clusters = Arc::new(ClusterRegistry::single_for_test(
             "default",
@@ -146,7 +140,7 @@ mod tests {
                 active_leader_replicas: 1,
             },
         ));
-        (GatewayService::new(clusters), backend)
+        (clusters, backend)
     }
 
     fn context() -> RequestContext {
@@ -165,13 +159,17 @@ mod tests {
 
     #[tokio::test]
     async fn a_batch_answers_one_outcome_per_key_in_input_order() {
-        let (service, _backend) = service();
+        let (clusters, _backend) = clusters();
         let table = TableRef::new("fluss", "users");
 
-        let outcomes = service
-            .lookup(&context(), &table, vec![key(1), key(404), key(2)])
-            .await
-            .expect("the fixture table exists");
+        let outcomes = lookup(
+            &clusters,
+            &context(),
+            &table,
+            vec![key(1), key(404), key(2)],
+        )
+        .await
+        .expect("the fixture table exists");
 
         assert_eq!(outcomes.len(), 3);
         assert_eq!(
@@ -187,52 +185,59 @@ mod tests {
 
     #[tokio::test]
     async fn an_empty_batch_never_reaches_the_backend() {
-        let (service, _backend) = service();
+        let (clusters, _backend) = clusters();
         let table = TableRef::new("fluss", "missing");
 
         // A missing table would be a 404 from the backend; an empty batch answers without asking.
         assert!(
-            service
-                .lookup(&context(), &table, Vec::new())
+            lookup(&clusters, &context(), &table, Vec::new())
                 .await
                 .expect("an empty batch is trivially satisfiable")
                 .is_empty()
         );
         assert!(
-            service
-                .prefix_lookup(
-                    &context(),
-                    &table,
-                    PrefixLookupRequest {
-                        prefix_columns: vec!["region".to_string()],
-                        prefixes: Vec::new(),
-                        max_rows_per_prefix: 10,
-                    },
-                )
-                .await
-                .expect("an empty batch is trivially satisfiable")
-                .is_empty()
+            prefix_lookup(
+                &clusters,
+                &context(),
+                &table,
+                PrefixLookupRequest {
+                    prefix_columns: vec!["region".to_string()],
+                    prefixes: Vec::new(),
+                    max_rows_per_prefix: 10,
+                },
+            )
+            .await
+            .expect("an empty batch is trivially satisfiable")
+            .is_empty()
         );
     }
 
     #[tokio::test]
     async fn a_missing_table_is_reported_by_the_backend() {
-        let (service, _backend) = service();
-        let error = service
-            .lookup(&context(), &TableRef::new("fluss", "missing"), vec![key(1)])
-            .await
-            .expect_err("the fixture has no such table");
+        let (clusters, _backend) = clusters();
+        let error = lookup(
+            &clusters,
+            &context(),
+            &TableRef::new("fluss", "missing"),
+            vec![key(1)],
+        )
+        .await
+        .expect_err("the fixture has no such table");
         assert_eq!(error.kind(), ErrorKind::NotFound);
     }
 
     #[tokio::test]
     async fn an_unreachable_cluster_fails_the_whole_batch() {
-        let (service, backend) = service();
+        let (clusters, backend) = clusters();
         backend.set_available(false);
-        let error = service
-            .lookup(&context(), &TableRef::new("fluss", "users"), vec![key(1)])
-            .await
-            .expect_err("an unreachable cluster cannot answer");
+        let error = lookup(
+            &clusters,
+            &context(),
+            &TableRef::new("fluss", "users"),
+            vec![key(1)],
+        )
+        .await
+        .expect_err("an unreachable cluster cannot answer");
         assert_eq!(error.kind(), ErrorKind::Unavailable);
     }
 

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Protocol-neutral write models, all-or-nothing preflight, and the write half of [`GatewayService`].
+//! Write orchestration for the records endpoint: request models, all-or-nothing preflight, dispatch.
 //!
 //! Two invariants are fixed by design and are not configurable per request. Preflight is
 //! **all-or-nothing**: every entry is validated and decoded against the authoritative table schema before the
@@ -33,17 +33,19 @@
 //! itself. Only the former is treated as a schema mismatch, which buys exactly one forced metadata refresh and
 //! one repeated preflight before the failure is returned to the caller.
 
-use crate::application::service::resource_error;
-use crate::application::{
-    GatewayService, InputColumn, InputValue, RequestContext, SchemaDecoder, TableDescription,
-    TableKind,
-};
+use crate::backend::context::RequestContext;
+use crate::backend::metadata_cache::load_table;
 use crate::backend::model::{
-    PreparedWriteEntry, PreparedWriteOperation, PreparedWriteRequest, TableRef, WriteResult,
+    PreparedWriteEntry, PreparedWriteOperation, PreparedWriteRequest, TableDescription, TableKind,
+    TableRef, WriteResult,
 };
+use crate::backend::registry::ClusterRegistry;
 use crate::config::WRITE_RESPONSE_BUDGET;
 use crate::error::GatewayError;
+use crate::error::resource_error;
 use crate::protocol::rest::input_decode::RowDecodeError;
+use crate::protocol::rest::input_decode::{InputColumn, SchemaDecoder};
+use crate::protocol::rest::input_value::InputValue;
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
@@ -80,16 +82,9 @@ impl WriteOperation {
             Self::Delete(_) => "delete",
         }
     }
-
-    /// The untyped row object carried by this operation.
-    pub fn row(&self) -> &InputValue {
-        match self {
-            Self::Append(row) | Self::Upsert(row) | Self::Delete(row) => row,
-        }
-    }
 }
 
-/// One preflight failure plus a structural staleness signal consumed by [`GatewayService::write`].
+/// One preflight failure plus a structural staleness signal consumed by [`write`].
 ///
 /// The signal is true only when the failure refers to the *cached table shape* — an unknown or missing column,
 /// a partial-update target that is not in the schema — so that one forced metadata refresh plus one repeated
@@ -382,102 +377,93 @@ fn input_columns(description: &TableDescription) -> Vec<InputColumn> {
         .collect()
 }
 
-/// The batch write path.
+/// Validates and decodes the complete request before submitting its first row.
 ///
-/// One of several inherent `impl GatewayService` blocks; see [`crate::application::service`].
-impl GatewayService {
-    /// Validates and decodes the complete request before submitting its first row.
-    ///
-    /// Unlike read operations, the native acknowledgement phase is deliberately **not** wrapped in the request
-    /// deadline. Each row carries an earlier delivery deadline, and the backend returns completion-unknown
-    /// entry outcomes after ownership rather than a request-level timeout — collapsing those into one 504
-    /// would hide the fact that part of the batch may already be durable.
-    pub async fn write(
-        &self,
-        context: &RequestContext,
-        request: WriteRequest,
-    ) -> Result<WriteResult, GatewayError> {
-        context.ensure_active()?;
-        let backend = self.backend(context).await?;
-        let cache = self.cache(context)?;
-        let table = request.table.clone();
-        let table_name = table.to_string();
+/// Unlike read operations, the native acknowledgement phase is deliberately **not** wrapped in the request
+/// deadline. Each row carries an earlier delivery deadline, and the backend returns completion-unknown
+/// entry outcomes after ownership rather than a request-level timeout — collapsing those into one 504
+/// would hide the fact that part of the batch may already be durable.
+pub(crate) async fn write(
+    clusters: &ClusterRegistry,
+    max_write_delivery_time: std::time::Duration,
+    context: &RequestContext,
+    request: WriteRequest,
+) -> Result<WriteResult, GatewayError> {
+    context.ensure_active()?;
+    let backend = clusters.backend_for_context(context).await?;
+    let cache = clusters.table_cache(context.cluster_id().as_str())?;
+    let table = request.table.clone();
+    let table_name = table.to_string();
 
-        let description = self
-            .execute(
-                context,
-                crate::application::service::load_table(&cache, &backend, &table),
+    let description = context
+        .run(load_table(&cache, &backend, &table))
+        .await
+        .map_err(|error| resource_error(error, "table", &table_name))?;
+
+    let prepared = match preflight(
+        context.cluster_id().as_str(),
+        &request,
+        &description,
+        context.deadline(),
+        max_write_delivery_time,
+    ) {
+        Ok(prepared) => prepared,
+        Err(error) if error.is_schema_mismatch() => {
+            // The failure refers to the cached table shape, so one forced refresh and one repeated
+            // preflight are worth it. At most one refresh happens per request.
+            let refreshed = context
+                .run(cache.refresh(&table, || async {
+                    Ok((*backend.describe_table(&table).await?).clone())
+                }))
+                .await
+                .map_err(|error| resource_error(error, "table", &table_name))?;
+            preflight(
+                context.cluster_id().as_str(),
+                &request,
+                &refreshed,
+                context.deadline(),
+                max_write_delivery_time,
             )
-            .await
-            .map_err(|error| resource_error(error, "table", &table_name))?;
-
-        let prepared = match preflight(
-            context.cluster_id().as_str(),
-            &request,
-            &description,
-            context.deadline(),
-            self.max_write_delivery_time(),
-        ) {
-            Ok(prepared) => prepared,
-            Err(error) if error.is_schema_mismatch() => {
-                // The failure refers to the cached table shape, so one forced refresh and one repeated
-                // preflight are worth it. At most one refresh happens per request.
-                let refreshed = self
-                    .execute(
-                        context,
-                        cache.refresh(&table, || async {
-                            Ok((*backend.describe_table(&table).await?).clone())
-                        }),
-                    )
-                    .await
-                    .map_err(|error| resource_error(error, "table", &table_name))?;
-                preflight(
-                    context.cluster_id().as_str(),
-                    &request,
-                    &refreshed,
-                    context.deadline(),
-                    self.max_write_delivery_time(),
-                )
-                .map_err(|error| resource_error(error.into_gateway_error(), "table", &table_name))?
-            }
-            Err(error) => {
-                return Err(resource_error(
-                    error.into_gateway_error(),
-                    "table",
-                    &table_name,
-                ));
-            }
-        };
-
-        let result = backend
-            .write(prepared)
-            .await
-            .map_err(|error| resource_error(error, "table", &table_name))?;
-
-        // A per-entry verdict that names the schema or the target is evidence the cached description is stale,
-        // so the next request re-reads it rather than repeating the same doomed batch.
-        if result.entries.iter().any(|entry| {
-            entry.failure.as_ref().is_some_and(|failure| {
-                failure.error_code == "invalid_argument" || failure.error_code == "not_found"
-            })
-        }) {
-            cache.invalidate_table(&table).await;
+            .map_err(|error| resource_error(error.into_gateway_error(), "table", &table_name))?
         }
-        Ok(result)
+        Err(error) => {
+            return Err(resource_error(
+                error.into_gateway_error(),
+                "table",
+                &table_name,
+            ));
+        }
+    };
+
+    let result = backend
+        .write(prepared)
+        .await
+        .map_err(|error| resource_error(error, "table", &table_name))?;
+
+    // A per-entry verdict that names the schema or the target is evidence the cached description is stale,
+    // so the next request re-reads it rather than repeating the same doomed batch.
+    if result.entries.iter().any(|entry| {
+        entry.failure.as_ref().is_some_and(|failure| {
+            failure.error_code == "invalid_argument" || failure.error_code == "not_found"
+        })
+    }) {
+        cache.invalidate_table(&table).await;
     }
+    Ok(result)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::application::{CancellationSignal, ClusterId, DataType};
     use crate::backend::GatewayBackend;
+    use crate::backend::context::CancellationSignal;
     use crate::backend::model::{
         ClusterHealthReport, ClusterStatus, ColumnDescription, TableCapabilities, WriteCompletion,
         WriteEntryResult, WriteFailure,
     };
     use crate::backend::registry::ClusterRegistry;
     use crate::backend::testing::TestBackend;
+    use crate::backend::types::{ClusterId, DataType};
     use crate::error::ErrorKind;
     use arrow::datatypes::{DataType as ArrowType, Field, Schema};
     use std::collections::HashMap;
@@ -621,7 +607,10 @@ mod tests {
             (WriteOperation::Delete(row.clone()), "delete"),
         ] {
             assert_eq!(operation.name(), name);
-            assert_eq!(operation.row(), &row);
+            let (WriteOperation::Append(carried)
+            | WriteOperation::Upsert(carried)
+            | WriteOperation::Delete(carried)) = &operation;
+            assert_eq!(carried, &row);
         }
     }
 
@@ -1045,8 +1034,8 @@ mod tests {
         assert!(prepared.delivery_deadline <= request_deadline - WRITE_RESPONSE_BUDGET);
     }
 
-    fn service_with(backend: Arc<TestBackend>) -> GatewayService {
-        GatewayService::new(Arc::new(ClusterRegistry::single_for_test(
+    fn clusters_with(backend: Arc<TestBackend>) -> Arc<ClusterRegistry> {
+        Arc::new(ClusterRegistry::single_for_test(
             "default",
             backend,
             ClusterHealthReport {
@@ -1056,7 +1045,7 @@ mod tests {
                 num_leader_replicas: 3,
                 active_leader_replicas: 3,
             },
-        )))
+        ))
     }
 
     fn context() -> RequestContext {
@@ -1089,11 +1078,15 @@ mod tests {
     #[tokio::test]
     async fn a_preflight_failure_submits_zero_rows() {
         let backend = Arc::new(TestBackend::new());
-        let service = service_with(backend.clone());
-        let error = service
-            .write(&context(), users_request(&["dup", "dup"]))
-            .await
-            .unwrap_err();
+        let clusters = clusters_with(backend.clone());
+        let error = write(
+            &clusters,
+            Duration::from_secs(20),
+            &context(),
+            users_request(&["dup", "dup"]),
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(error.kind(), ErrorKind::InvalidArgument);
         assert!(backend.recorded_writes().is_empty());
@@ -1103,12 +1096,16 @@ mod tests {
     async fn delivery_failures_are_reported_per_entry_in_input_order() {
         let backend = Arc::new(TestBackend::new());
         backend.inject_write_failure(vec![1], WriteCompletion::Unknown, "unavailable", true);
-        let service = service_with(backend.clone());
+        let clusters = clusters_with(backend.clone());
 
-        let result = service
-            .write(&context(), users_request(&["first", "second", "third"]))
-            .await
-            .unwrap();
+        let result = write(
+            &clusters,
+            Duration::from_secs(20),
+            &context(),
+            users_request(&["first", "second", "third"]),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             result.entries,
@@ -1141,12 +1138,16 @@ mod tests {
     async fn a_schema_change_between_preflight_and_submission_is_a_failed_precondition() {
         let backend = Arc::new(TestBackend::new());
         backend.evolve_schema_before_next_write();
-        let service = service_with(backend.clone());
+        let clusters = clusters_with(backend.clone());
 
-        let error = service
-            .write(&context(), users_request(&["one"]))
-            .await
-            .unwrap_err();
+        let error = write(
+            &clusters,
+            Duration::from_secs(20),
+            &context(),
+            users_request(&["one"]),
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(error.kind(), ErrorKind::FailedPrecondition);
         assert!(backend.recorded_writes().is_empty());
@@ -1155,12 +1156,14 @@ mod tests {
     #[tokio::test]
     async fn an_unknown_column_triggers_one_metadata_refresh_before_failing() {
         let backend = Arc::new(TestBackend::new());
-        let service = service_with(backend.clone());
+        let clusters = clusters_with(backend.clone());
         let mut request = users_request(&["one"]);
         request.entries[0].operation =
             WriteOperation::Upsert(object(vec![("id", number("1")), ("ghost", text("x"))]));
 
-        let error = service.write(&context(), request).await.unwrap_err();
+        let error = write(&clusters, Duration::from_secs(20), &context(), request)
+            .await
+            .unwrap_err();
 
         assert_eq!(error.kind(), ErrorKind::InvalidArgument);
         assert_eq!(

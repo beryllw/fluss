@@ -20,10 +20,10 @@
 //! The installed connection is a pooled resource, not request state: dropping and rebuilding it changes latency,
 //! never correctness, which is what lets any instance serve any request.
 
-use crate::application::ddl::{
+use crate::backend::GatewayBackend;
+use crate::backend::model::{
     AlterTableRequest, CreateDatabaseRequest, CreateTableRequest, PartitionMutationRequest,
 };
-use crate::backend::GatewayBackend;
 use crate::backend::model::{
     ClusterHealthReport, DatabaseDescription, LookupKey, LookupOutcome, PartitionDescription,
     PrefixLookupOutcome, PrefixLookupRequest, PreparedWriteRequest, TableDescription, TableRef,

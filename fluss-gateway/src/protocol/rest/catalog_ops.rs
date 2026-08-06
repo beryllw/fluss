@@ -16,84 +16,22 @@
 
 //! Catalog reads, catalog mutation models, and their protocol-neutral validation.
 //!
-//! This module owns the metadata and DDL half of [`GatewayService`]. The models and validators below are
-//! complete; the service methods in the inherent `impl` block at the end of the file report an unsupported
-//! operation until the metadata and DDL endpoints are wired to the backend.
+//! Catalog orchestration for the REST metadata and DDL endpoints: request validation, backend
+//! dispatch under the request lifecycle, cache maintenance, and canonical read-back.
 
-use crate::application::service::{cache_table, load_table, resource_error};
-use crate::application::validate_table_schema;
-use crate::application::{
-    ClusterHealthReport, DataType, DatabaseDescription, GatewayService, InputColumn,
-    PartitionDescription, RequestContext, TableDescription, TableRef, validate_data_type,
+use crate::backend::context::RequestContext;
+use crate::backend::metadata_cache::{cache_table, load_table};
+use crate::backend::model::{
+    AlterTableRequest, ColumnDefinition, CreateDatabaseRequest, CreateTableRequest,
+    DatabaseDescription, PartitionDescription, PartitionMutationRequest, PartitionSpecEntry,
+    TableChange, TableDescription, TableRef,
 };
-use crate::error::GatewayError;
+use crate::backend::registry::ClusterRegistry;
+use crate::backend::types::DataType;
+use crate::error::{GatewayError, resource_error};
+use crate::protocol::rest::input_decode::{InputColumn, validate_data_type, validate_table_schema};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-
-/// Creates one database.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CreateDatabaseRequest {
-    pub name: String,
-    pub comment: Option<String>,
-    pub custom_properties: HashMap<String, String>,
-}
-
-/// One column supplied by create or alter table.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ColumnDefinition {
-    pub name: String,
-    pub data_type: DataType,
-    pub comment: Option<String>,
-}
-
-/// Bucket distribution supplied by create table.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TableDistributionDefinition {
-    pub bucket_count: i32,
-    pub bucket_keys: Vec<String>,
-}
-
-/// Creates one table using only user-owned metadata.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CreateTableRequest {
-    pub table: TableRef,
-    pub columns: Vec<ColumnDefinition>,
-    pub primary_key: Vec<String>,
-    pub partitioned_by: Vec<String>,
-    pub distribution: Option<TableDistributionDefinition>,
-    pub configs: HashMap<String, String>,
-    pub custom_properties: HashMap<String, String>,
-    pub comment: Option<String>,
-}
-
-/// One supported table alteration. The containing vector preserves request order.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TableChange {
-    AddColumn(ColumnDefinition),
-    SetConfig { key: String, value: String },
-    ResetConfig { key: String },
-}
-
-/// Applies one ordered group of table alterations in a single native request.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AlterTableRequest {
-    pub table: TableRef,
-    pub changes: Vec<TableChange>,
-}
-
-/// Ordered partition key and value supplied by a client.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PartitionSpecEntry {
-    pub key: String,
-    pub value: String,
-}
-
-/// Creates or identifies one partition.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PartitionMutationRequest {
-    pub table: TableRef,
-    pub spec: Vec<PartitionSpecEntry>,
-}
 
 /// Validates one database creation before native dispatch.
 pub fn validate_create_database(request: &CreateDatabaseRequest) -> Result<(), GatewayError> {
@@ -314,249 +252,257 @@ fn partition_resource_name(table: &TableRef, spec: &[PartitionSpecEntry]) -> Str
     format!("{table}/{partition_name}")
 }
 
-/// Catalog reads, catalog mutations, and cluster health.
-///
-/// One of several inherent `impl GatewayService` blocks; see [`crate::application::service`].
-impl GatewayService {
-    /// Lists every database name of the request's cluster, unsorted and unpaginated.
-    pub async fn list_databases(
-        &self,
-        context: &RequestContext,
-    ) -> Result<Vec<String>, GatewayError> {
-        let backend = self.backend(context).await?;
-        self.execute(context, backend.list_databases()).await
-    }
+/// Lists every database name of the request's cluster, unsorted and unpaginated.
+pub(crate) async fn list_databases(
+    clusters: &ClusterRegistry,
+    context: &RequestContext,
+) -> Result<Vec<String>, GatewayError> {
+    let backend = clusters.backend_for_context(context).await?;
+    context.run(backend.list_databases()).await
+}
 
-    /// Describes one database.
-    pub async fn describe_database(
-        &self,
-        context: &RequestContext,
-        database: &str,
-    ) -> Result<DatabaseDescription, GatewayError> {
-        let backend = self.backend(context).await?;
-        self.execute(context, backend.describe_database(database))
-            .await
-            .map_err(|error| resource_error(error, "database", database))
-    }
+/// Describes one database.
+pub(crate) async fn describe_database(
+    clusters: &ClusterRegistry,
+    context: &RequestContext,
+    database: &str,
+) -> Result<DatabaseDescription, GatewayError> {
+    let backend = clusters.backend_for_context(context).await?;
+    context
+        .run(backend.describe_database(database))
+        .await
+        .map_err(|error| resource_error(error, "database", database))
+}
 
-    /// Creates one database and reads its canonical metadata back before returning.
-    pub async fn create_database(
-        &self,
-        context: &RequestContext,
-        request: CreateDatabaseRequest,
-    ) -> Result<DatabaseDescription, GatewayError> {
-        validate_create_database(&request)?;
-        let backend = self.backend(context).await?;
-        self.execute(context, backend.create_database(&request))
-            .await
-            .map_err(|error| resource_error(error, "database", &request.name))?;
-        self.execute(context, backend.describe_database(&request.name))
-            .await
-            .map_err(|error| resource_error(error, "database", &request.name))
-    }
+/// Creates one database and reads its canonical metadata back before returning.
+pub(crate) async fn create_database(
+    clusters: &ClusterRegistry,
+    context: &RequestContext,
+    request: CreateDatabaseRequest,
+) -> Result<DatabaseDescription, GatewayError> {
+    validate_create_database(&request)?;
+    let backend = clusters.backend_for_context(context).await?;
+    context
+        .run(backend.create_database(&request))
+        .await
+        .map_err(|error| resource_error(error, "database", &request.name))?;
+    context
+        .run(backend.describe_database(&request.name))
+        .await
+        .map_err(|error| resource_error(error, "database", &request.name))
+}
 
-    /// Drops one empty database and invalidates its table-cache prefix.
-    pub async fn drop_database(
-        &self,
-        context: &RequestContext,
-        database: &str,
-    ) -> Result<(), GatewayError> {
-        let backend = self.backend(context).await?;
-        self.execute(context, backend.drop_database(database))
-            .await
-            .map_err(|error| resource_error(error, "database", database))?;
-        self.cache(context)?.invalidate_database(database).await;
-        Ok(())
-    }
+/// Drops one empty database and invalidates its table-cache prefix.
+pub(crate) async fn drop_database(
+    clusters: &ClusterRegistry,
+    context: &RequestContext,
+    database: &str,
+) -> Result<(), GatewayError> {
+    let backend = clusters.backend_for_context(context).await?;
+    context
+        .run(backend.drop_database(database))
+        .await
+        .map_err(|error| resource_error(error, "database", database))?;
+    clusters
+        .table_cache(context.cluster_id().as_str())?
+        .invalidate_database(database)
+        .await;
+    Ok(())
+}
 
-    /// Lists every table name of one database, unsorted and unpaginated.
-    pub async fn list_tables(
-        &self,
-        context: &RequestContext,
-        database: &str,
-    ) -> Result<Vec<String>, GatewayError> {
-        let backend = self.backend(context).await?;
-        self.execute(context, backend.list_tables(database))
-            .await
-            .map_err(|error| resource_error(error, "database", database))
-    }
+/// Lists every table name of one database, unsorted and unpaginated.
+pub(crate) async fn list_tables(
+    clusters: &ClusterRegistry,
+    context: &RequestContext,
+    database: &str,
+) -> Result<Vec<String>, GatewayError> {
+    let backend = clusters.backend_for_context(context).await?;
+    context
+        .run(backend.list_tables(database))
+        .await
+        .map_err(|error| resource_error(error, "database", database))
+}
 
-    /// Describes one table straight from the backend, bypassing the write-path metadata cache.
-    pub async fn describe_table(
-        &self,
-        context: &RequestContext,
-        table: &TableRef,
-    ) -> Result<Arc<TableDescription>, GatewayError> {
-        let backend = self.backend(context).await?;
-        self.execute(context, backend.describe_table(table))
-            .await
-            .map_err(|error| resource_error(error, "table", table.to_string()))
-    }
+/// Describes one table straight from the backend, bypassing the write-path metadata cache.
+pub(crate) async fn describe_table(
+    clusters: &ClusterRegistry,
+    context: &RequestContext,
+    table: &TableRef,
+) -> Result<Arc<TableDescription>, GatewayError> {
+    let backend = clusters.backend_for_context(context).await?;
+    context
+        .run(backend.describe_table(table))
+        .await
+        .map_err(|error| resource_error(error, "table", table.to_string()))
+}
 
-    /// Creates one table, invalidates stale metadata, and returns a canonical describe result.
-    pub async fn create_table(
-        &self,
-        context: &RequestContext,
-        request: CreateTableRequest,
-    ) -> Result<Arc<TableDescription>, GatewayError> {
-        validate_create_table(&request)?;
-        let backend = self.backend(context).await?;
-        self.execute(context, backend.create_table(&request))
-            .await
-            .map_err(|error| resource_error(error, "table", request.table.to_string()))?;
-        let cache = self.cache(context)?;
-        cache.invalidate_table(&request.table).await;
-        let description = self
-            .execute(context, backend.describe_table(&request.table))
-            .await
-            .map_err(|error| resource_error(error, "table", request.table.to_string()))?;
-        self.execute(context, cache_table(&cache, &request.table, description))
-            .await
-    }
+/// Creates one table, invalidates stale metadata, and returns a canonical describe result.
+pub(crate) async fn create_table(
+    clusters: &ClusterRegistry,
+    context: &RequestContext,
+    request: CreateTableRequest,
+) -> Result<Arc<TableDescription>, GatewayError> {
+    validate_create_table(&request)?;
+    let backend = clusters.backend_for_context(context).await?;
+    context
+        .run(backend.create_table(&request))
+        .await
+        .map_err(|error| resource_error(error, "table", request.table.to_string()))?;
+    let cache = clusters.table_cache(context.cluster_id().as_str())?;
+    cache.invalidate_table(&request.table).await;
+    let description = context
+        .run(backend.describe_table(&request.table))
+        .await
+        .map_err(|error| resource_error(error, "table", request.table.to_string()))?;
+    context
+        .run(cache_table(&cache, &request.table, description))
+        .await
+}
 
-    /// Validates all changes, sends one native alteration, and returns canonical metadata.
-    pub async fn alter_table(
-        &self,
-        context: &RequestContext,
-        request: AlterTableRequest,
-    ) -> Result<Arc<TableDescription>, GatewayError> {
-        let backend = self.backend(context).await?;
-        let cache = self.cache(context)?;
-        let current = self
-            .execute(context, load_table(&cache, &backend, &request.table))
-            .await
-            .map_err(|error| resource_error(error, "table", request.table.to_string()))?;
-        validate_alter_table(&request, &current)
-            .map_err(|error| resource_error(error, "table", request.table.to_string()))?;
-        self.execute(context, backend.alter_table(&request))
-            .await
-            .map_err(|error| resource_error(error, "table", request.table.to_string()))?;
-        cache.invalidate_table(&request.table).await;
-        let description = self
-            .execute(context, backend.describe_table(&request.table))
-            .await
-            .map_err(|error| resource_error(error, "table", request.table.to_string()))?;
-        self.execute(context, cache_table(&cache, &request.table, description))
-            .await
-    }
+/// Validates all changes, sends one native alteration, and returns canonical metadata.
+pub(crate) async fn alter_table(
+    clusters: &ClusterRegistry,
+    context: &RequestContext,
+    request: AlterTableRequest,
+) -> Result<Arc<TableDescription>, GatewayError> {
+    let backend = clusters.backend_for_context(context).await?;
+    let cache = clusters.table_cache(context.cluster_id().as_str())?;
+    let current = context
+        .run(load_table(&cache, &backend, &request.table))
+        .await
+        .map_err(|error| resource_error(error, "table", request.table.to_string()))?;
+    validate_alter_table(&request, &current)
+        .map_err(|error| resource_error(error, "table", request.table.to_string()))?;
+    context
+        .run(backend.alter_table(&request))
+        .await
+        .map_err(|error| resource_error(error, "table", request.table.to_string()))?;
+    cache.invalidate_table(&request.table).await;
+    let description = context
+        .run(backend.describe_table(&request.table))
+        .await
+        .map_err(|error| resource_error(error, "table", request.table.to_string()))?;
+    context
+        .run(cache_table(&cache, &request.table, description))
+        .await
+}
 
-    /// Drops one table and invalidates any cached metadata for it.
-    pub async fn drop_table(
-        &self,
-        context: &RequestContext,
-        table: &TableRef,
-    ) -> Result<(), GatewayError> {
-        let backend = self.backend(context).await?;
-        self.execute(context, backend.drop_table(table))
-            .await
-            .map_err(|error| resource_error(error, "table", table.to_string()))?;
-        self.cache(context)?.invalidate_table(table).await;
-        Ok(())
-    }
+/// Drops one table and invalidates any cached metadata for it.
+pub(crate) async fn drop_table(
+    clusters: &ClusterRegistry,
+    context: &RequestContext,
+    table: &TableRef,
+) -> Result<(), GatewayError> {
+    let backend = clusters.backend_for_context(context).await?;
+    context
+        .run(backend.drop_table(table))
+        .await
+        .map_err(|error| resource_error(error, "table", table.to_string()))?;
+    clusters
+        .table_cache(context.cluster_id().as_str())?
+        .invalidate_table(table)
+        .await;
+    Ok(())
+}
 
-    /// Lists every partition of a partitioned table, unsorted and unpaginated.
-    pub async fn list_partitions(
-        &self,
-        context: &RequestContext,
-        table: &TableRef,
-    ) -> Result<Vec<PartitionDescription>, GatewayError> {
-        let backend = self.backend(context).await?;
-        self.execute(context, backend.list_partitions(table))
-            .await
-            .map_err(|error| resource_error(error, "table", table.to_string()))
-    }
+/// Lists every partition of a partitioned table, unsorted and unpaginated.
+pub(crate) async fn list_partitions(
+    clusters: &ClusterRegistry,
+    context: &RequestContext,
+    table: &TableRef,
+) -> Result<Vec<PartitionDescription>, GatewayError> {
+    let backend = clusters.backend_for_context(context).await?;
+    context
+        .run(backend.list_partitions(table))
+        .await
+        .map_err(|error| resource_error(error, "table", table.to_string()))
+}
 
-    /// Creates an exactly validated partition and reads its canonical metadata back.
-    pub async fn create_partition(
-        &self,
-        context: &RequestContext,
-        request: PartitionMutationRequest,
-    ) -> Result<PartitionDescription, GatewayError> {
-        let backend = self.backend(context).await?;
-        let cache = self.cache(context)?;
-        let table_name = request.table.to_string();
-        let partition_name = partition_resource_name(&request.table, &request.spec);
-        let current = self
-            .execute(context, load_table(&cache, &backend, &request.table))
-            .await
-            .map_err(|error| resource_error(error, "table", &table_name))?;
-        validate_partition_spec(&request, &current)?;
-        self.execute(context, backend.create_partition(&request))
-            .await
-            .map_err(|error| resource_error(error, "partition", &partition_name))?;
-        cache.invalidate_partition(&request.table).await;
-        let partitions = self
-            .execute(context, backend.list_partitions(&request.table))
-            .await
-            .map_err(|error| resource_error(error, "table", &table_name))?;
-        let expected: Vec<(String, String)> = request
+/// Creates an exactly validated partition and reads its canonical metadata back.
+pub(crate) async fn create_partition(
+    clusters: &ClusterRegistry,
+    context: &RequestContext,
+    request: PartitionMutationRequest,
+) -> Result<PartitionDescription, GatewayError> {
+    let backend = clusters.backend_for_context(context).await?;
+    let cache = clusters.table_cache(context.cluster_id().as_str())?;
+    let table_name = request.table.to_string();
+    let partition_name = partition_resource_name(&request.table, &request.spec);
+    let current = context
+        .run(load_table(&cache, &backend, &request.table))
+        .await
+        .map_err(|error| resource_error(error, "table", &table_name))?;
+    validate_partition_spec(&request, &current)?;
+    context
+        .run(backend.create_partition(&request))
+        .await
+        .map_err(|error| resource_error(error, "partition", &partition_name))?;
+    cache.invalidate_partition(&request.table).await;
+    let partitions = context
+        .run(backend.list_partitions(&request.table))
+        .await
+        .map_err(|error| resource_error(error, "table", &table_name))?;
+    let expected: Vec<(String, String)> = request
+        .spec
+        .iter()
+        .map(|entry| (entry.key.clone(), entry.value.clone()))
+        .collect();
+    partitions
+        .into_iter()
+        .find(|partition| partition.spec == expected)
+        .ok_or_else(|| {
+            GatewayError::internal("created partition was absent from canonical read-back")
+        })
+}
+
+/// Drops one partition selected by canonical partition name.
+pub(crate) async fn drop_partition(
+    clusters: &ClusterRegistry,
+    context: &RequestContext,
+    table: &TableRef,
+    partition_name: &str,
+) -> Result<(), GatewayError> {
+    let backend = clusters.backend_for_context(context).await?;
+    let cache = clusters.table_cache(context.cluster_id().as_str())?;
+    let table_name = table.to_string();
+    let resource_name = format!("{table}/{partition_name}");
+    let current = context
+        .run(load_table(&cache, &backend, table))
+        .await
+        .map_err(|error| resource_error(error, "table", &table_name))?;
+    let partition = context
+        .run(backend.list_partitions(table))
+        .await
+        .map_err(|error| resource_error(error, "table", &table_name))?
+        .into_iter()
+        .find(|partition| partition.partition_name == partition_name)
+        .ok_or_else(|| {
+            GatewayError::not_found(format!("partition `{partition_name}` does not exist"))
+                .with_resource("partition", Some(resource_name.clone()))
+        })?;
+    let request = PartitionMutationRequest {
+        table: table.clone(),
+        spec: partition
             .spec
-            .iter()
-            .map(|entry| (entry.key.clone(), entry.value.clone()))
-            .collect();
-        partitions
             .into_iter()
-            .find(|partition| partition.spec == expected)
-            .ok_or_else(|| {
-                GatewayError::internal("created partition was absent from canonical read-back")
-            })
-    }
-
-    /// Drops one partition selected by canonical partition name.
-    pub async fn drop_partition(
-        &self,
-        context: &RequestContext,
-        table: &TableRef,
-        partition_name: &str,
-    ) -> Result<(), GatewayError> {
-        let backend = self.backend(context).await?;
-        let cache = self.cache(context)?;
-        let table_name = table.to_string();
-        let resource_name = format!("{table}/{partition_name}");
-        let current = self
-            .execute(context, load_table(&cache, &backend, table))
-            .await
-            .map_err(|error| resource_error(error, "table", &table_name))?;
-        let partition = self
-            .execute(context, backend.list_partitions(table))
-            .await
-            .map_err(|error| resource_error(error, "table", &table_name))?
-            .into_iter()
-            .find(|partition| partition.partition_name == partition_name)
-            .ok_or_else(|| {
-                GatewayError::not_found(format!("partition `{partition_name}` does not exist"))
-                    .with_resource("partition", Some(resource_name.clone()))
-            })?;
-        let request = PartitionMutationRequest {
-            table: table.clone(),
-            spec: partition
-                .spec
-                .into_iter()
-                .map(|(key, value)| PartitionSpecEntry { key, value })
-                .collect(),
-        };
-        validate_partition_spec(&request, &current)?;
-        self.execute(context, backend.drop_partition(&request))
-            .await
-            .map_err(|error| resource_error(error, "partition", &resource_name))?;
-        cache.invalidate_partition(table).await;
-        Ok(())
-    }
-
-    /// Reports Fluss cluster health through the request's cluster backend.
-    pub async fn cluster_health(
-        &self,
-        context: &RequestContext,
-    ) -> Result<ClusterHealthReport, GatewayError> {
-        let backend = self.backend(context).await?;
-        self.execute(context, backend.cluster_health()).await
-    }
+            .map(|(key, value)| PartitionSpecEntry { key, value })
+            .collect(),
+    };
+    validate_partition_spec(&request, &current)?;
+    context
+        .run(backend.drop_partition(&request))
+        .await
+        .map_err(|error| resource_error(error, "partition", &resource_name))?;
+    cache.invalidate_partition(table).await;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::application::{ColumnDescription, TableCapabilities, TableKind};
+    use crate::backend::model::{
+        ColumnDescription, TableCapabilities, TableDistributionDefinition, TableKind,
+    };
     use arrow::datatypes::Schema;
     use std::sync::Arc;
 

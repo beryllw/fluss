@@ -466,6 +466,30 @@ fn touch(recency: &mut VecDeque<TableRef>, table: &TableRef) {
     recency.push_back(table.clone());
 }
 
+/// Reads table metadata through the per-cluster cache, loading it from the backend on a miss.
+pub(crate) async fn load_table(
+    cache: &TableMetadataCache<crate::backend::model::TableDescription>,
+    backend: &std::sync::Arc<dyn crate::backend::GatewayBackend>,
+    table: &TableRef,
+) -> Result<std::sync::Arc<crate::backend::model::TableDescription>, GatewayError> {
+    cache
+        .get_or_load(table, || async {
+            Ok((*backend.describe_table(table).await?).clone())
+        })
+        .await
+}
+
+/// Publishes a freshly read description into the cache and returns the cached instance.
+pub(crate) async fn cache_table(
+    cache: &TableMetadataCache<crate::backend::model::TableDescription>,
+    table: &TableRef,
+    description: std::sync::Arc<crate::backend::model::TableDescription>,
+) -> Result<std::sync::Arc<crate::backend::model::TableDescription>, GatewayError> {
+    cache
+        .refresh(table, || async move { Ok((*description).clone()) })
+        .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

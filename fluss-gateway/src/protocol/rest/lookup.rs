@@ -390,7 +390,7 @@ async fn run_lookup(
 ) -> Result<LookupResponse, GatewayError> {
     let request = request?;
     let context = application_context(request_id, deadline, principal, cluster)?;
-    let description = state.application.describe_table(&context, table).await?;
+    let description = super::catalog_ops::describe_table(&state.clusters, &context, table).await?;
     check_exact_lookup_supported(table, &description)?;
     check_count(
         "keys",
@@ -408,7 +408,7 @@ async fn run_lookup(
         .collect::<Result<Vec<_>, _>>()?;
     check_key_bytes(state, &keys)?;
 
-    let outcomes = state.application.lookup(&context, table, keys).await?;
+    let outcomes = super::lookup_ops::lookup(&state.clusters, &context, table, keys).await?;
     let results = outcomes
         .into_iter()
         .map(|outcome| to_lookup_result(outcome, request.fail_fast))
@@ -431,7 +431,7 @@ async fn run_prefix_lookup(
 ) -> Result<PrefixLookupResponse, GatewayError> {
     let request = request?;
     let context = application_context(request_id, deadline, principal, cluster)?;
-    let description = state.application.describe_table(&context, table).await?;
+    let description = super::catalog_ops::describe_table(&state.clusters, &context, table).await?;
     check_table_has_a_primary_key(table, &description)?;
     check_count(
         "prefixes",
@@ -453,18 +453,17 @@ async fn run_prefix_lookup(
     check_key_bytes(state, &prefixes)?;
 
     let max_rows_per_prefix = state.lookup_limits.max_rows_per_prefix;
-    let outcomes = state
-        .application
-        .prefix_lookup(
-            &context,
-            table,
-            PrefixLookupRequest {
-                prefix_columns: request.prefix_columns.clone(),
-                prefixes,
-                max_rows_per_prefix,
-            },
-        )
-        .await?;
+    let outcomes = super::lookup_ops::prefix_lookup(
+        &state.clusters,
+        &context,
+        table,
+        PrefixLookupRequest {
+            prefix_columns: request.prefix_columns.clone(),
+            prefixes,
+            max_rows_per_prefix,
+        },
+    )
+    .await?;
     let results = outcomes
         .into_iter()
         .map(|outcome| to_prefix_result(outcome, request.fail_fast))

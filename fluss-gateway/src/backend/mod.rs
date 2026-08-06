@@ -39,7 +39,7 @@ pub mod types;
 #[cfg(any(test, feature = "test-backend"))]
 pub mod testing;
 
-use crate::application::ddl::{
+use crate::backend::model::{
     AlterTableRequest, CreateDatabaseRequest, CreateTableRequest, PartitionMutationRequest,
 };
 use crate::error::GatewayError;

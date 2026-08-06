@@ -359,8 +359,10 @@ fn classify_error(error: &FlussClientError) -> (&'static str, String, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::application::{DataType, InputColumn, InputValue, SchemaDecoder};
     use crate::backend::model::TableRef;
+    use crate::backend::types::DataType;
+    use crate::protocol::rest::input_decode::{InputColumn, SchemaDecoder};
+    use crate::protocol::rest::input_value::InputValue;
     use parking_lot::{Condvar, Mutex};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
@@ -372,7 +374,7 @@ mod tests {
         }
     }
 
-    fn row(value: i32) -> crate::application::DecodedRow {
+    fn row(value: i32) -> crate::protocol::rest::input_decode::DecodedRow {
         let decoder = SchemaDecoder::new(vec![InputColumn::new(
             "id",
             DataType::Int { nullable: false },

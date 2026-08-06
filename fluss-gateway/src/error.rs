@@ -392,6 +392,23 @@ impl ErrorEnvelope {
     }
 }
 
+/// Attaches machine-readable resource context to the error kinds that name a resource.
+pub(crate) fn resource_error(
+    error: GatewayError,
+    resource_kind: &'static str,
+    resource_name: impl Into<String>,
+) -> GatewayError {
+    if error.details().is_some()
+        || !matches!(
+            error.kind(),
+            ErrorKind::NotFound | ErrorKind::AlreadyExists | ErrorKind::FailedPrecondition
+        )
+    {
+        return error;
+    }
+    error.with_resource(resource_kind, Some(resource_name.into()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -540,5 +557,16 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn resource_context_is_added_only_to_resource_naming_kinds() {
+        let named = resource_error(GatewayError::not_found("gone"), "table", "db.t");
+        assert_eq!(
+            named.details().and_then(|d| d.resource_name.clone()),
+            Some("db.t".to_string())
+        );
+        let untouched = resource_error(GatewayError::internal("boom"), "table", "db.t");
+        assert!(untouched.details().is_none());
     }
 }

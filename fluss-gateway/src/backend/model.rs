@@ -23,8 +23,9 @@
 //! Every model is request-scoped. Nothing here represents a handle, session, or cursor that would outlive the
 //! request that produced it.
 
-use crate::application::{DataType, DecodedRow};
+use crate::backend::types::DataType;
 use crate::error::GatewayError;
+use crate::protocol::rest::input_decode::DecodedRow;
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use std::collections::HashMap;
@@ -146,7 +147,7 @@ impl TableDescription {
 /// One fully decoded row mutation passed from the application layer to a backend.
 ///
 /// The native row is kept behind the backend boundary. Protocol adapters only provide
-/// [`crate::application::InputValue`] and never construct this type directly.
+/// [`crate::protocol::rest::input_value::InputValue`] and never construct this type directly.
 #[derive(Debug, Clone)]
 pub enum PreparedWriteOperation {
     Append(DecodedRow),
@@ -409,4 +410,71 @@ pub struct ClusterHealthReport {
     pub in_sync_replicas: i32,
     pub num_leader_replicas: i32,
     pub active_leader_replicas: i32,
+}
+
+// --- Catalog mutation requests: the vocabulary of the backend trait's DDL methods. ---
+
+/// Creates one database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateDatabaseRequest {
+    pub name: String,
+    pub comment: Option<String>,
+    pub custom_properties: HashMap<String, String>,
+}
+
+/// One column supplied by create or alter table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnDefinition {
+    pub name: String,
+    pub data_type: DataType,
+    pub comment: Option<String>,
+}
+
+/// Bucket distribution supplied by create table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableDistributionDefinition {
+    pub bucket_count: i32,
+    pub bucket_keys: Vec<String>,
+}
+
+/// Creates one table using only user-owned metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateTableRequest {
+    pub table: TableRef,
+    pub columns: Vec<ColumnDefinition>,
+    pub primary_key: Vec<String>,
+    pub partitioned_by: Vec<String>,
+    pub distribution: Option<TableDistributionDefinition>,
+    pub configs: HashMap<String, String>,
+    pub custom_properties: HashMap<String, String>,
+    pub comment: Option<String>,
+}
+
+/// One supported table alteration. The containing vector preserves request order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TableChange {
+    AddColumn(ColumnDefinition),
+    SetConfig { key: String, value: String },
+    ResetConfig { key: String },
+}
+
+/// Applies one ordered group of table alterations in a single native request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlterTableRequest {
+    pub table: TableRef,
+    pub changes: Vec<TableChange>,
+}
+
+/// Ordered partition key and value supplied by a client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionSpecEntry {
+    pub key: String,
+    pub value: String,
+}
+
+/// Creates or identifies one partition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionMutationRequest {
+    pub table: TableRef,
+    pub spec: Vec<PartitionSpecEntry>,
 }

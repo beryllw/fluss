@@ -27,8 +27,9 @@
 //! domain [`DataType`] validates precision, scale, and length, reporting
 //! [`crate::error::ErrorKind::InvalidArgument`] on failure.
 
-use crate::application::{DataType, RowField, validate_data_type};
+use crate::backend::types::{DataType, RowField};
 use crate::error::GatewayError;
+use crate::protocol::rest::input_decode::validate_data_type;
 use serde::{Deserialize, Deserializer, Serialize};
 use utoipa::ToSchema;
 

@@ -46,7 +46,6 @@
 //! Each entry carries exactly one of `append`, `upsert`, or `delete`, whose value is the row object. `id` is an
 //! opaque caller correlation value that every outcome echoes back; duplicates within one request are rejected.
 
-use crate::application::{WriteEntry, WriteOperation, WriteRequest};
 use crate::auth::Principal;
 use crate::backend::model::{TableRef, WriteCompletion, WriteResult};
 use crate::error::GatewayError;
@@ -54,6 +53,7 @@ use crate::observability;
 use crate::protocol::rest::input::{WriteInputOperation, parse_write_input};
 use crate::protocol::rest::limits::ensure_json_acceptable;
 use crate::protocol::rest::openapi::ErrorEnvelopeSchema;
+use crate::protocol::rest::write_ops::{WriteEntry, WriteOperation, WriteRequest};
 use crate::protocol::rest::{
     RequestDeadline, RequestId, RestState, application_context, ensure_no_query, error_response,
     json_response, metric_cluster, validate_json_content_type,
@@ -303,7 +303,13 @@ async fn run_write(
     };
 
     let backend_started = Instant::now();
-    let result = state.application.write(&context, request).await;
+    let result = super::write_ops::write(
+        &state.clusters,
+        state.write_delivery_time,
+        &context,
+        request,
+    )
+    .await;
     observability::write_backend_duration(cluster_label, backend_started.elapsed());
     Ok(to_response(result?))
 }

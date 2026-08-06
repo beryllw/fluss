@@ -78,6 +78,25 @@ impl RequestContext {
         }
     }
 
+    /// Runs one backend operation under this request's cancellation signal and absolute deadline.
+    pub async fn run<T, F>(&self, operation: F) -> Result<T, GatewayError>
+    where
+        F: std::future::Future<Output = Result<T, GatewayError>>,
+    {
+        self.ensure_active()?;
+        let deadline = tokio::time::Instant::from_std(self.deadline());
+        tokio::select! {
+            biased;
+            _ = self.cancellation().cancelled() => {
+                Err(GatewayError::cancelled("request was cancelled"))
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                Err(GatewayError::deadline_exceeded("request deadline exceeded"))
+            }
+            result = operation => result,
+        }
+    }
+
     pub fn request_id(&self) -> &str {
         &self.request_id
     }
@@ -153,5 +172,25 @@ mod tests {
             context.ensure_active().unwrap_err().kind(),
             crate::error::ErrorKind::DeadlineExceeded
         );
+    }
+
+    #[tokio::test]
+    async fn run_enforces_the_deadline_over_a_slow_operation() {
+        use std::time::{Duration, Instant};
+        let context = RequestContext::new(
+            "request-1",
+            ClusterId::try_from("default").unwrap(),
+            Instant::now() + Duration::from_millis(20),
+            CancellationSignal::default(),
+            crate::auth::Principal::new("tester"),
+        );
+        let error = context
+            .run(async {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                Ok::<(), GatewayError>(())
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), crate::error::ErrorKind::DeadlineExceeded);
     }
 }

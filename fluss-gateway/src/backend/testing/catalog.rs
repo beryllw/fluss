@@ -20,8 +20,7 @@
 //! The fixture is deterministic: one database `fluss` containing the primary-key table `users`, the partitioned
 //! primary-key table `orders`, and the log table `events`.
 
-use crate::application::DataType;
-use crate::application::ddl::{
+use crate::backend::model::{
     AlterTableRequest, CreateDatabaseRequest, CreateTableRequest, PartitionMutationRequest,
     TableChange,
 };
@@ -30,6 +29,7 @@ use crate::backend::model::{
     TableDescription, TableKind, TableRef,
 };
 use crate::backend::testing::TestBackend;
+use crate::backend::types::DataType;
 use crate::error::GatewayError;
 use arrow::datatypes::{DataType as ArrowType, Field, Schema, SchemaRef};
 use std::collections::{BTreeMap, HashMap};

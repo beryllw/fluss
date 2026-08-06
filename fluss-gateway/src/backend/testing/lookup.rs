@@ -30,7 +30,7 @@
 //!
 //! **The prefix pre-check below emulates the Fluss client**, whose `validate_prefix_lookup` is what a real
 //! deployment consults. It is *not* gateway validation and must never be mistaken for it: the gateway itself
-//! deliberately has no copy of those rules (see [`crate::application::lookup`]), and the native backend gets its
+//! deliberately has no copy of those rules (see [`crate::protocol::rest::lookup_ops`]), and the native backend gets its
 //! verdict by building a real lookuper. The emulation exists so protocol tests can exercise the
 //! client-refusal-to-400 path without a cluster, and its messages mirror the client's wording rule by rule.
 

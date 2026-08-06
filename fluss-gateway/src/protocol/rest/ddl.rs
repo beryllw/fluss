@@ -31,12 +31,13 @@
 //! The dry run promises exactly that chain and nothing more; kernel-side conditions (an existing table, an
 //! unknown config key) still surface only on the real creation.
 
-use crate::application::ddl::{
+use crate::auth::Principal;
+use crate::backend::model::TableRef;
+use crate::backend::model::{
     AlterTableRequest, ColumnDefinition, CreateDatabaseRequest, CreateTableRequest,
     PartitionMutationRequest, PartitionSpecEntry, TableChange, TableDistributionDefinition,
 };
-use crate::application::{DataType, TableRef};
-use crate::auth::Principal;
+use crate::backend::types::DataType;
 use crate::error::GatewayError;
 use crate::observability;
 use crate::protocol::rest::datatype::DataTypeResponse;
@@ -217,17 +218,16 @@ pub(crate) async fn create_database(
             encode_segment(&body.name)
         );
         let context = application_context(&request_id, deadline, &principal, &cluster)?;
-        let database = state
-            .application
-            .create_database(
-                &context,
-                CreateDatabaseRequest {
-                    name: body.name,
-                    comment: body.comment,
-                    custom_properties: body.custom_properties,
-                },
-            )
-            .await?;
+        let database = super::catalog_ops::create_database(
+            &state.clusters,
+            &context,
+            CreateDatabaseRequest {
+                name: body.name,
+                comment: body.comment,
+                custom_properties: body.custom_properties,
+            },
+        )
+        .await?;
         created_response(&DatabaseResponse::from(database), &location)
     }
     .await;
@@ -272,7 +272,7 @@ pub(crate) async fn drop_database(
     let result = async {
         ensure_no_query(&uri)?;
         let context = application_context(&request_id, deadline, &principal, &cluster)?;
-        state.application.drop_database(&context, &database).await?;
+        super::catalog_ops::drop_database(&state.clusters, &context, &database).await?;
         Ok(StatusCode::NO_CONTENT.into_response())
     }
     .await;
@@ -340,7 +340,7 @@ pub(crate) async fn create_table(
             });
         }
         let context = application_context(&request_id, deadline, &principal, &cluster)?;
-        let created = state.application.create_table(&context, request).await?;
+        let created = super::catalog_ops::create_table(&state.clusters, &context, request).await?;
         created_response(&TableResponse::from(created.as_ref()), &location)
     }
     .await;
@@ -394,7 +394,7 @@ pub(crate) async fn alter_table(
         let body: AlterTableBody = parse_json_body(&headers, &body)?;
         let request = alter_table_request(TableRef::new(database, table), body)?;
         let context = application_context(&request_id, deadline, &principal, &cluster)?;
-        let altered = state.application.alter_table(&context, request).await?;
+        let altered = super::catalog_ops::alter_table(&state.clusters, &context, request).await?;
         json_response(&TableResponse::from(altered.as_ref()))
     }
     .await;
@@ -439,9 +439,7 @@ pub(crate) async fn drop_table(
     let result = async {
         ensure_no_query(&uri)?;
         let context = application_context(&request_id, deadline, &principal, &cluster)?;
-        state
-            .application
-            .drop_table(&context, &TableRef::new(database, table))
+        super::catalog_ops::drop_table(&state.clusters, &context, &TableRef::new(database, table))
             .await?;
         Ok(StatusCode::NO_CONTENT.into_response())
     }
@@ -490,23 +488,22 @@ pub(crate) async fn create_partition(
         let body: CreatePartitionBody = parse_json_body(&headers, &body)?;
         let table = TableRef::new(database, table);
         let context = application_context(&request_id, deadline, &principal, &cluster)?;
-        let partition = state
-            .application
-            .create_partition(
-                &context,
-                PartitionMutationRequest {
-                    table: table.clone(),
-                    spec: body
-                        .spec
-                        .into_iter()
-                        .map(|entry| PartitionSpecEntry {
-                            key: entry.key,
-                            value: entry.value,
-                        })
-                        .collect(),
-                },
-            )
-            .await?;
+        let partition = super::catalog_ops::create_partition(
+            &state.clusters,
+            &context,
+            PartitionMutationRequest {
+                table: table.clone(),
+                spec: body
+                    .spec
+                    .into_iter()
+                    .map(|entry| PartitionSpecEntry {
+                        key: entry.key,
+                        value: entry.value,
+                    })
+                    .collect(),
+            },
+        )
+        .await?;
         let location = format!(
             "{}/partitions/{}",
             table_location(&cluster, &table),
@@ -557,10 +554,13 @@ pub(crate) async fn drop_partition(
     let result = async {
         ensure_no_query(&uri)?;
         let context = application_context(&request_id, deadline, &principal, &cluster)?;
-        state
-            .application
-            .drop_partition(&context, &TableRef::new(database, table), &partition)
-            .await?;
+        super::catalog_ops::drop_partition(
+            &state.clusters,
+            &context,
+            &TableRef::new(database, table),
+            &partition,
+        )
+        .await?;
         Ok(StatusCode::NO_CONTENT.into_response())
     }
     .await;
@@ -708,7 +708,6 @@ fn encode_segment(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::application::GatewayService;
     use crate::backend::GatewayBackend;
     use crate::backend::registry::ClusterRegistry;
     use crate::backend::testing::TestBackend;
@@ -1268,8 +1267,7 @@ mod tests {
                 Some(health),
             ),
         ]));
-        let mut state = test_support::state_with_clusters(clusters.clone());
-        state.application = Arc::new(GatewayService::new(clusters));
+        let state = test_support::state_with_clusters(clusters);
         let app = crate::protocol::rest::build_router(state, &test_support::test_options());
 
         let response = send(

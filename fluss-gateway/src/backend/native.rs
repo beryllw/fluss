@@ -25,11 +25,11 @@
 //! cached, because the admin client is a thin handle over the shared RPC client. Nothing in this module outlives a
 //! request except the connection itself.
 
-use crate::application::ddl::{
+use crate::backend::GatewayBackend;
+use crate::backend::model::{
     AlterTableRequest, CreateDatabaseRequest, CreateTableRequest, PartitionMutationRequest,
     TableChange,
 };
-use crate::backend::GatewayBackend;
 use crate::backend::model::{
     ClusterHealthReport, ClusterStatus, ColumnDescription, DatabaseDescription, LookupKey,
     LookupOutcome, PartitionDescription, PrefixLookupOutcome, PrefixLookupRequest,
@@ -447,7 +447,7 @@ fn table_path(table: &TableRef) -> TablePath {
 /// Builds the native partition spec from an already validated, ordered request spec.
 ///
 /// The native type is a map, so request order is not carried through it. Ordering against the table's declared
-/// partition keys is enforced before dispatch by `crate::application::ddl::validate_partition_spec`.
+/// partition keys is enforced before dispatch by `crate::backend::model::validate_partition_spec`.
 fn partition_spec(request: &PartitionMutationRequest) -> PartitionSpec {
     PartitionSpec::new(
         request
@@ -479,7 +479,7 @@ fn to_table_description(
         .map(|column| {
             Ok(ColumnDescription {
                 name: column.name().to_string(),
-                data_type: crate::application::DataType::try_from(column.data_type())?,
+                data_type: crate::backend::types::DataType::try_from(column.data_type())?,
                 comment: column.comment().map(str::to_string),
             })
         })
@@ -763,7 +763,7 @@ fn map_fluss_error_kind(context: &str, error: FlussClientError) -> GatewayError 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::application::ddl::PartitionSpecEntry;
+    use crate::backend::model::PartitionSpecEntry;
     use crate::config::ConfigDuration;
     use crate::error::ErrorDetails;
     use fluss::metadata::{DataTypes, Schema, TableConfig};

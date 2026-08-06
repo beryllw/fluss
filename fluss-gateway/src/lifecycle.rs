@@ -310,14 +310,8 @@ pub fn rest_state(
     bind_address: std::net::SocketAddr,
 ) -> Result<RestState, RunError> {
     let authenticator = config.security.build_authenticator()?;
-    let application = Arc::new(
-        crate::application::GatewayService::with_write_delivery_time(
-            clusters.clone(),
-            config.write.max_delivery_time.get(),
-        ),
-    );
     Ok(RestState {
-        application,
+        write_delivery_time: config.write.max_delivery_time.get(),
         clusters,
         readiness: readiness.clone(),
         bind_address,

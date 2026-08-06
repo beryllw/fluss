@@ -27,10 +27,10 @@ pub mod catalog;
 pub mod lookup;
 pub mod write;
 
-use crate::application::ddl::{
+use crate::backend::GatewayBackend;
+use crate::backend::model::{
     AlterTableRequest, CreateDatabaseRequest, CreateTableRequest, PartitionMutationRequest,
 };
-use crate::backend::GatewayBackend;
 use crate::backend::model::{
     ClusterHealthReport, ClusterStatus, DatabaseDescription, LookupKey, LookupOutcome,
     PartitionDescription, PrefixLookupOutcome, PrefixLookupRequest, PreparedWriteRequest,

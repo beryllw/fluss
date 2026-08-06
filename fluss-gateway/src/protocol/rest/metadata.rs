@@ -26,9 +26,11 @@
 //!
 //! Path components arrive percent-decoded exactly once by the router and are matched as exact Fluss identifiers.
 
-use crate::application::{DatabaseDescription, PartitionDescription, TableDescription, TableKind};
 use crate::auth::Principal;
 use crate::backend::model::TableRef;
+use crate::backend::model::{
+    DatabaseDescription, PartitionDescription, TableDescription, TableKind,
+};
 use crate::error::GatewayError;
 use crate::observability;
 use crate::protocol::rest::datatype::DataTypeResponse;
@@ -408,7 +410,7 @@ pub(crate) async fn list_databases(
         let scope = PageScope::Databases;
         let page = Page::prepare(parse_query(&uri)?, &state.metadata_limits, &scope)?;
         let context = application_context(&request_id, deadline, &principal, &cluster)?;
-        let databases = state.application.list_databases(&context).await?;
+        let databases = super::catalog_ops::list_databases(&state.clusters, &context).await?;
         let (databases, next_page_token) = page.apply(databases, &scope, String::as_str)?;
         Ok(DatabasesResponse {
             databases,
@@ -459,9 +461,7 @@ pub(crate) async fn describe_database(
         ensure_json_acceptable(&headers)?;
         ensure_no_query(&uri)?;
         let context = application_context(&request_id, deadline, &principal, &cluster)?;
-        state
-            .application
-            .describe_database(&context, &database)
+        super::catalog_ops::describe_database(&state.clusters, &context, &database)
             .await
             .map(DatabaseResponse::from)
     }
@@ -511,7 +511,7 @@ pub(crate) async fn list_tables(
         let scope = PageScope::tables(&database);
         let page = Page::prepare(parse_query(&uri)?, &state.metadata_limits, &scope)?;
         let context = application_context(&request_id, deadline, &principal, &cluster)?;
-        let tables = state.application.list_tables(&context, &database).await?;
+        let tables = super::catalog_ops::list_tables(&state.clusters, &context, &database).await?;
         let (tables, next_page_token) = page.apply(tables, &scope, String::as_str)?;
         Ok(TablesResponse {
             tables,
@@ -564,9 +564,7 @@ pub(crate) async fn describe_table(
         ensure_json_acceptable(&headers)?;
         ensure_no_query(&uri)?;
         let context = application_context(&request_id, deadline, &principal, &cluster)?;
-        state
-            .application
-            .describe_table(&context, &table_ref)
+        super::catalog_ops::describe_table(&state.clusters, &context, &table_ref)
             .await
             .map(|description| TableResponse::from(description.as_ref()))
     }
@@ -618,10 +616,8 @@ pub(crate) async fn list_partitions(
         let scope = PageScope::partitions(&table_ref);
         let page = Page::prepare(parse_query(&uri)?, &state.metadata_limits, &scope)?;
         let context = application_context(&request_id, deadline, &principal, &cluster)?;
-        let partitions = state
-            .application
-            .list_partitions(&context, &table_ref)
-            .await?;
+        let partitions =
+            super::catalog_ops::list_partitions(&state.clusters, &context, &table_ref).await?;
         let (partitions, next_page_token) =
             page.apply(partitions, &scope, |partition| &partition.partition_name)?;
         Ok(PartitionsResponse {
@@ -646,8 +642,8 @@ pub(crate) async fn list_partitions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::application::CreateDatabaseRequest;
     use crate::backend::GatewayBackend;
+    use crate::backend::model::CreateDatabaseRequest;
     use crate::backend::testing::TestBackend;
     use crate::protocol::rest::test_support;
     use axum::body::Body;

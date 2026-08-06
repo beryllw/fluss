@@ -144,6 +144,18 @@ impl ClusterRegistry {
         Self { runtimes }
     }
 
+    /// Resolves the backend serving the request's principal on its cluster, after checking that
+    /// the request is still live. Under the user identity mode this may dial a new per-user
+    /// act-as connection, which is why resolution is asynchronous.
+    pub async fn backend_for_context(
+        &self,
+        context: &crate::backend::context::RequestContext,
+    ) -> Result<Arc<dyn GatewayBackend>, GatewayError> {
+        context.ensure_active()?;
+        self.backend_for_principal(context.cluster_id().as_str(), context.principal())
+            .await
+    }
+
     /// Resolves the backend serving `principal` on a configured cluster.
     ///
     /// Under the service identity mode every principal shares the supervised connection; under
@@ -437,5 +449,64 @@ mod tests {
         );
         assert!(first.any_available() && second.any_available());
         assert!(first.backend("alpha").is_ok() && second.backend("alpha").is_ok());
+    }
+
+    /// Backend resolution applies the request lifecycle before touching any connection.
+    #[tokio::test]
+    async fn backend_resolution_applies_the_request_lifecycle_first() {
+        use crate::backend::context::{CancellationSignal, RequestContext};
+        use crate::backend::types::ClusterId;
+        use std::time::{Duration, Instant};
+
+        let registry =
+            ClusterRegistry::from_test_entries(vec![("default".to_string(), None, None)]);
+        let kind_of = |result: Result<Arc<dyn GatewayBackend>, GatewayError>| match result {
+            Ok(_) => panic!("expected a failure"),
+            Err(error) => error.kind(),
+        };
+        let context = |cluster: &str, deadline: Instant| {
+            RequestContext::new(
+                "request-1",
+                ClusterId::try_from(cluster).unwrap(),
+                deadline,
+                CancellationSignal::default(),
+                crate::auth::Principal::new("tester"),
+            )
+        };
+
+        assert_eq!(
+            kind_of(
+                registry
+                    .backend_for_context(&context("default", Instant::now()))
+                    .await
+            ),
+            crate::error::ErrorKind::DeadlineExceeded
+        );
+
+        let cancellation = CancellationSignal::default();
+        cancellation.cancel();
+        let cancelled = RequestContext::new(
+            "request-1",
+            ClusterId::try_from("default").unwrap(),
+            Instant::now() + Duration::from_secs(5),
+            cancellation,
+            crate::auth::Principal::new("tester"),
+        );
+        assert_eq!(
+            kind_of(registry.backend_for_context(&cancelled).await),
+            crate::error::ErrorKind::Cancelled
+        );
+
+        // A configured but disconnected cluster is unavailable, an unconfigured one is not found.
+        let live = context("default", Instant::now() + Duration::from_secs(5));
+        assert_eq!(
+            kind_of(registry.backend_for_context(&live).await),
+            crate::error::ErrorKind::Unavailable
+        );
+        let unknown = context("missing", Instant::now() + Duration::from_secs(5));
+        assert_eq!(
+            kind_of(registry.backend_for_context(&unknown).await),
+            crate::error::ErrorKind::NotFound
+        );
     }
 }
