@@ -277,7 +277,14 @@ fn classify_rejected(error: FlussClientError) -> WriteFailure {
 ///
 /// The specific message is deliberately dropped. After ownership the only honest statement is that the outcome
 /// is unknown, and a message such as "timed out" invites a caller to assume the row was not written.
+///
+/// Storage backpressure is the one exception with a definitive outcome: the server rejected every delivery
+/// attempt before applying it, so the entry is provably not written and safe to retry individually (FIP-49
+/// `storage_backpressure`).
 fn classify_unknown(error: FlussClientError) -> WriteFailure {
+    if error.api_error() == Some(FlussError::StorageBackpressureException) {
+        return classify_rejected(error);
+    }
     let (code, _, retryable) = classify_error(&error);
     WriteFailure {
         error_code: code.to_string(),
@@ -309,6 +316,10 @@ fn classify_error(error: &FlussClientError) -> (&'static str, String, bool) {
                 ("LIMIT_EXCEEDED", "the encoded record is too large")
             }
             FlussError::RequestTimeOut => ("DEADLINE_EXCEEDED", "write delivery timed out"),
+            FlussError::StorageBackpressureException => (
+                "STORAGE_BACKPRESSURE",
+                "the KV store rejected the write under backpressure; retry the failed entries once pressure drains",
+            ),
             _ if api_error.is_retriable() => {
                 ("UNAVAILABLE", "the Fluss write service is unavailable")
             }
@@ -464,6 +475,30 @@ mod tests {
         assert_eq!(unknown.completion, WriteCompletion::Unknown);
         assert_eq!(unknown.error_code, "DEADLINE_EXCEEDED");
         assert_eq!(unknown.message, "write completion is unknown");
+    }
+
+    fn backpressure_error() -> FlussClientError {
+        FlussClientError::FlussAPIError {
+            api_error: FlussError::StorageBackpressureException
+                .to_api_error(Some("KV storage under write pressure".to_string())),
+        }
+    }
+
+    /// A storage-backpressure failure carries the FIP-49 entry-level code and is the one
+    /// post-ownership error with a definitive outcome: every attempt was rejected by the server
+    /// before being applied, so the entry is provably not written and safe to retry.
+    #[test]
+    fn storage_backpressure_is_a_retriable_rejected_entry_code() {
+        let rejected = classify_rejected(backpressure_error());
+        assert_eq!(rejected.error_code, "STORAGE_BACKPRESSURE");
+        assert_eq!(rejected.completion, WriteCompletion::Rejected);
+        assert!(rejected.retryable);
+
+        let post_ownership = classify_unknown(backpressure_error());
+        assert_eq!(post_ownership.error_code, "STORAGE_BACKPRESSURE");
+        assert_eq!(post_ownership.completion, WriteCompletion::Rejected);
+        assert!(post_ownership.retryable);
+        assert_eq!(post_ownership.message, rejected.message);
     }
 
     #[test]

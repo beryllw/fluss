@@ -155,6 +155,9 @@ pub enum WriteCompletionResponse {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct WriteFailureResponse {
     pub id: String,
+    /// A stable request-level error code, plus `STORAGE_BACKPRESSURE` — a KV write rejected by
+    /// storage backpressure after the client retry budget was exhausted. It is retriable and
+    /// occurs only at entry level, never as a whole-request HTTP status (FIP-49).
     pub error_code: String,
     pub message: String,
     pub completion: WriteCompletionResponse,
@@ -628,6 +631,39 @@ mod tests {
         assert_eq!(body["failures"][0]["completion"], "unknown");
         assert_eq!(body["failures"][0]["error_code"], "UNAVAILABLE");
         assert_eq!(body["failures"][0]["retryable"], true);
+    }
+
+    /// The FIP-49 `storage_backpressure` condition surfaces only inside `failures[]` of a 200
+    /// partial-success response — never as a whole-request HTTP status — as a retriable rejected
+    /// entry the caller retries individually once pressure drains.
+    #[tokio::test]
+    async fn storage_backpressure_is_an_entry_level_retriable_code_never_a_request_status() {
+        let backend = Arc::new(TestBackend::new());
+        backend.inject_write_failure(
+            vec![1],
+            WriteCompletion::Rejected,
+            "STORAGE_BACKPRESSURE",
+            true,
+        );
+        let (status, body) = send(
+            test_support::app(backend),
+            users(
+                r#"{"entries":[{"id":"first","upsert":{"id":1,"name":"a"}},{"id":"second","upsert":{"id":2,"name":"b"}}]}"#,
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["success_count"], 1);
+        assert_eq!(body["error_count"], 1);
+        assert_eq!(body["failures"][0]["id"], "second");
+        assert_eq!(body["failures"][0]["error_code"], "STORAGE_BACKPRESSURE");
+        assert_eq!(body["failures"][0]["completion"], "rejected");
+        assert_eq!(body["failures"][0]["retryable"], true);
+        assert!(
+            body.get("error").is_none(),
+            "no request-level error envelope"
+        );
     }
 
     #[tokio::test]
