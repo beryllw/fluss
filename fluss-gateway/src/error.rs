@@ -20,10 +20,15 @@
 //! [`ErrorKind`] represents client-visible failure conditions independently of the HTTP framework. The REST adapter
 //! obtains each status code from [`ErrorKind::http_status`].
 //!
-//! The taxonomy is deliberately closed at twelve kinds. There is no `GONE` or `CURSOR_NOT_LOCAL` because the
+//! The taxonomy is deliberately closed at fourteen kinds. There is no `GONE` or `CURSOR_NOT_LOCAL` because the
 //! gateway holds no cursors, and no `RESOURCE_EXHAUSTED` because the gateway applies no rate limiting: the only
 //! request bounds are input-validation caps, which surface as [`ErrorKind::LimitExceeded`] (413) or
 //! [`ErrorKind::InvalidArgument`] (400). No response ever carries HTTP 429.
+//!
+//! FIP-49 error-model notes: the FIP's `database_not_empty` (409) condition is carried by
+//! [`ErrorKind::FailedPrecondition`], and its `*_not_found` / `*_already_exists` families collapse onto
+//! [`ErrorKind::NotFound`] / [`ErrorKind::AlreadyExists`] with the resource named in
+//! [`ErrorDetails`], keeping one stable code per condition kind.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -33,6 +38,10 @@ use std::fmt;
 pub enum ErrorKind {
     /// The request contains malformed input, an invalid identifier, or a type mismatch. Maps to HTTP 400.
     InvalidArgument,
+    /// The request carries no usable credential, or the credential failed verification. Maps to HTTP 401.
+    Unauthenticated,
+    /// The authenticated principal is not allowed to perform the operation. Maps to HTTP 403.
+    Unauthorized,
     /// The requested database, table, or partition does not exist. Maps to HTTP 404.
     NotFound,
     /// A create operation conflicts with an existing resource. Maps to HTTP 409.
@@ -62,8 +71,10 @@ impl ErrorKind {
     ///
     /// Kept in sync with the enum by [`ErrorKind::ordinal`], whose exhaustive match stops compiling when a
     /// variant is added without extending this table.
-    pub const ALL: [ErrorKind; 12] = [
+    pub const ALL: [ErrorKind; 14] = [
         ErrorKind::InvalidArgument,
+        ErrorKind::Unauthenticated,
+        ErrorKind::Unauthorized,
         ErrorKind::NotFound,
         ErrorKind::AlreadyExists,
         ErrorKind::FailedPrecondition,
@@ -81,17 +92,19 @@ impl ErrorKind {
     pub fn ordinal(self) -> usize {
         match self {
             ErrorKind::InvalidArgument => 0,
-            ErrorKind::NotFound => 1,
-            ErrorKind::AlreadyExists => 2,
-            ErrorKind::FailedPrecondition => 3,
-            ErrorKind::Unsupported => 4,
-            ErrorKind::UnsupportedMediaType => 5,
-            ErrorKind::NotAcceptable => 6,
-            ErrorKind::LimitExceeded => 7,
-            ErrorKind::DeadlineExceeded => 8,
-            ErrorKind::Cancelled => 9,
-            ErrorKind::Unavailable => 10,
-            ErrorKind::Internal => 11,
+            ErrorKind::Unauthenticated => 1,
+            ErrorKind::Unauthorized => 2,
+            ErrorKind::NotFound => 3,
+            ErrorKind::AlreadyExists => 4,
+            ErrorKind::FailedPrecondition => 5,
+            ErrorKind::Unsupported => 6,
+            ErrorKind::UnsupportedMediaType => 7,
+            ErrorKind::NotAcceptable => 8,
+            ErrorKind::LimitExceeded => 9,
+            ErrorKind::DeadlineExceeded => 10,
+            ErrorKind::Cancelled => 11,
+            ErrorKind::Unavailable => 12,
+            ErrorKind::Internal => 13,
         }
     }
 
@@ -99,6 +112,8 @@ impl ErrorKind {
     pub fn code(self) -> &'static str {
         match self {
             ErrorKind::InvalidArgument => "INVALID_ARGUMENT",
+            ErrorKind::Unauthenticated => "UNAUTHENTICATED",
+            ErrorKind::Unauthorized => "UNAUTHORIZED",
             ErrorKind::NotFound => "NOT_FOUND",
             ErrorKind::AlreadyExists => "ALREADY_EXISTS",
             ErrorKind::FailedPrecondition => "FAILED_PRECONDITION",
@@ -120,6 +135,8 @@ impl ErrorKind {
     pub fn http_status(self) -> u16 {
         match self {
             ErrorKind::InvalidArgument => 400,
+            ErrorKind::Unauthenticated => 401,
+            ErrorKind::Unauthorized => 403,
             ErrorKind::NotFound => 404,
             ErrorKind::AlreadyExists | ErrorKind::FailedPrecondition => 409,
             ErrorKind::Unsupported => 501,
@@ -141,6 +158,8 @@ impl ErrorKind {
         match self {
             ErrorKind::DeadlineExceeded | ErrorKind::Unavailable => true,
             ErrorKind::InvalidArgument
+            | ErrorKind::Unauthenticated
+            | ErrorKind::Unauthorized
             | ErrorKind::NotFound
             | ErrorKind::AlreadyExists
             | ErrorKind::FailedPrecondition
@@ -190,6 +209,16 @@ impl GatewayError {
     /// A malformed or rejected request argument. Answered with HTTP 400.
     pub fn invalid_argument(message: impl Into<String>) -> Self {
         Self::new(ErrorKind::InvalidArgument, message)
+    }
+
+    /// A request without a usable credential, or whose credential failed verification. Answered with HTTP 401.
+    pub fn unauthenticated(message: impl Into<String>) -> Self {
+        Self::new(ErrorKind::Unauthenticated, message)
+    }
+
+    /// An operation the authenticated principal is not allowed to perform. Answered with HTTP 403.
+    pub fn unauthorized(message: impl Into<String>) -> Self {
+        Self::new(ErrorKind::Unauthorized, message)
     }
 
     /// A named database, table, or partition that does not exist. Answered with HTTP 404.
@@ -352,8 +381,10 @@ mod tests {
     use super::*;
 
     /// The frozen taxonomy. Adding a variant breaks [`ErrorKind::ordinal`] first, then this table.
-    const CONTRACT: [(ErrorKind, u16, &str, bool); 12] = [
+    const CONTRACT: [(ErrorKind, u16, &str, bool); 14] = [
         (ErrorKind::InvalidArgument, 400, "INVALID_ARGUMENT", false),
+        (ErrorKind::Unauthenticated, 401, "UNAUTHENTICATED", false),
+        (ErrorKind::Unauthorized, 403, "UNAUTHORIZED", false),
         (ErrorKind::NotFound, 404, "NOT_FOUND", false),
         (ErrorKind::AlreadyExists, 409, "ALREADY_EXISTS", false),
         (
