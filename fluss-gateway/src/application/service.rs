@@ -200,6 +200,7 @@ mod tests {
             ClusterId::try_from(cluster).unwrap(),
             deadline,
             CancellationSignal::default(),
+            crate::auth::Principal::new("tester"),
         )
     }
 
@@ -245,6 +246,7 @@ mod tests {
             ClusterId::try_from("default").unwrap(),
             Instant::now() + Duration::from_secs(5),
             cancellation,
+            crate::auth::Principal::new("tester"),
         );
         assert_eq!(kind_of(service.backend(&cancelled)), ErrorKind::Cancelled);
 

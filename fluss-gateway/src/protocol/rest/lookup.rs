@@ -42,6 +42,7 @@
 //! Neither endpoint has any 429 or capacity path. The gateway does not rate limit; these caps are input
 //! validation and nothing else.
 
+use crate::auth::Principal;
 use crate::backend::model::{
     LookupKey, LookupOutcome, LookupOutcomeKind, PrefixLookupOutcome, PrefixLookupRequest,
     PrefixOutcomeKind, TableDescription, TableKind, TableRef,
@@ -220,10 +221,12 @@ pub struct PrefixLookupResponse {
         (status = 504, description = "Request deadline exceeded", body = ErrorEnvelopeSchema)
     )
 )]
+#[allow(clippy::too_many_arguments)] // Axum extractors, one per request-scoped concern.
 pub(crate) async fn lookup(
     State(state): State<RestState>,
     Extension(request_id): Extension<RequestId>,
     Extension(deadline): Extension<RequestDeadline>,
+    Extension(principal): Extension<Principal>,
     Path((cluster, database, table)): Path<(String, String, String)>,
     uri: Uri,
     headers: HeaderMap,
@@ -234,7 +237,16 @@ pub(crate) async fn lookup(
     let parsed = ensure_no_query(&uri)
         .and_then(|()| ensure_json_acceptable(&headers))
         .and_then(|()| parse_json_body(&headers, &body));
-    let result = run_lookup(&state, &request_id, deadline, &cluster, &table_ref, parsed).await;
+    let result = run_lookup(
+        &state,
+        &request_id,
+        deadline,
+        &principal,
+        &cluster,
+        &table_ref,
+        parsed,
+    )
+    .await;
 
     let cluster = metric_cluster(&state, &cluster);
     let response = match &result {
@@ -276,10 +288,12 @@ pub(crate) async fn lookup(
         (status = 504, description = "Request deadline exceeded", body = ErrorEnvelopeSchema)
     )
 )]
+#[allow(clippy::too_many_arguments)] // Axum extractors, one per request-scoped concern.
 pub(crate) async fn prefix_lookup(
     State(state): State<RestState>,
     Extension(request_id): Extension<RequestId>,
     Extension(deadline): Extension<RequestDeadline>,
+    Extension(principal): Extension<Principal>,
     Path((cluster, database, table)): Path<(String, String, String)>,
     uri: Uri,
     headers: HeaderMap,
@@ -290,8 +304,16 @@ pub(crate) async fn prefix_lookup(
     let parsed = ensure_no_query(&uri)
         .and_then(|()| ensure_json_acceptable(&headers))
         .and_then(|()| parse_json_body(&headers, &body));
-    let result =
-        run_prefix_lookup(&state, &request_id, deadline, &cluster, &table_ref, parsed).await;
+    let result = run_prefix_lookup(
+        &state,
+        &request_id,
+        deadline,
+        &principal,
+        &cluster,
+        &table_ref,
+        parsed,
+    )
+    .await;
 
     let cluster = metric_cluster(&state, &cluster);
     let response = match &result {
@@ -361,12 +383,13 @@ async fn run_lookup(
     state: &RestState,
     request_id: &RequestId,
     deadline: RequestDeadline,
+    principal: &Principal,
     cluster: &str,
     table: &TableRef,
     request: Result<LookupRequestBody, GatewayError>,
 ) -> Result<LookupResponse, GatewayError> {
     let request = request?;
-    let context = application_context(request_id, deadline, cluster)?;
+    let context = application_context(request_id, deadline, principal, cluster)?;
     let description = state.application.describe_table(&context, table).await?;
     check_exact_lookup_supported(table, &description)?;
     check_count(
@@ -401,12 +424,13 @@ async fn run_prefix_lookup(
     state: &RestState,
     request_id: &RequestId,
     deadline: RequestDeadline,
+    principal: &Principal,
     cluster: &str,
     table: &TableRef,
     request: Result<PrefixLookupRequestBody, GatewayError>,
 ) -> Result<PrefixLookupResponse, GatewayError> {
     let request = request?;
-    let context = application_context(request_id, deadline, cluster)?;
+    let context = application_context(request_id, deadline, principal, cluster)?;
     let description = state.application.describe_table(&context, table).await?;
     check_table_has_a_primary_key(table, &description)?;
     check_count(

@@ -28,6 +28,7 @@
 
 use crate::application::pagination::{PageScope, decode_page_token, encode_page_token};
 use crate::application::{DatabaseDescription, PartitionDescription, TableDescription, TableKind};
+use crate::auth::Principal;
 use crate::backend::model::TableRef;
 use crate::error::GatewayError;
 use crate::observability;
@@ -396,6 +397,7 @@ pub(crate) async fn list_databases(
     State(state): State<RestState>,
     Extension(request_id): Extension<RequestId>,
     Extension(deadline): Extension<RequestDeadline>,
+    Extension(principal): Extension<Principal>,
     Path(cluster): Path<String>,
     headers: HeaderMap,
     uri: Uri,
@@ -405,7 +407,7 @@ pub(crate) async fn list_databases(
         ensure_json_acceptable(&headers)?;
         let scope = PageScope::Databases;
         let page = Page::prepare(parse_query(&uri)?, &state.metadata_limits, &scope)?;
-        let context = application_context(&request_id, deadline, &cluster)?;
+        let context = application_context(&request_id, deadline, &principal, &cluster)?;
         let databases = state.application.list_databases(&context).await?;
         let (databases, next_page_token) = page.apply(databases, &scope, String::as_str)?;
         Ok(DatabasesResponse {
@@ -447,6 +449,7 @@ pub(crate) async fn describe_database(
     State(state): State<RestState>,
     Extension(request_id): Extension<RequestId>,
     Extension(deadline): Extension<RequestDeadline>,
+    Extension(principal): Extension<Principal>,
     Path((cluster, database)): Path<(String, String)>,
     headers: HeaderMap,
     uri: Uri,
@@ -455,7 +458,7 @@ pub(crate) async fn describe_database(
     let result = async {
         ensure_json_acceptable(&headers)?;
         ensure_no_query(&uri)?;
-        let context = application_context(&request_id, deadline, &cluster)?;
+        let context = application_context(&request_id, deadline, &principal, &cluster)?;
         state
             .application
             .describe_database(&context, &database)
@@ -497,6 +500,7 @@ pub(crate) async fn list_tables(
     State(state): State<RestState>,
     Extension(request_id): Extension<RequestId>,
     Extension(deadline): Extension<RequestDeadline>,
+    Extension(principal): Extension<Principal>,
     Path((cluster, database)): Path<(String, String)>,
     headers: HeaderMap,
     uri: Uri,
@@ -506,7 +510,7 @@ pub(crate) async fn list_tables(
         ensure_json_acceptable(&headers)?;
         let scope = PageScope::tables(&database);
         let page = Page::prepare(parse_query(&uri)?, &state.metadata_limits, &scope)?;
-        let context = application_context(&request_id, deadline, &cluster)?;
+        let context = application_context(&request_id, deadline, &principal, &cluster)?;
         let tables = state.application.list_tables(&context, &database).await?;
         let (tables, next_page_token) = page.apply(tables, &scope, String::as_str)?;
         Ok(TablesResponse {
@@ -549,6 +553,7 @@ pub(crate) async fn describe_table(
     State(state): State<RestState>,
     Extension(request_id): Extension<RequestId>,
     Extension(deadline): Extension<RequestDeadline>,
+    Extension(principal): Extension<Principal>,
     Path((cluster, database, table)): Path<(String, String, String)>,
     headers: HeaderMap,
     uri: Uri,
@@ -558,7 +563,7 @@ pub(crate) async fn describe_table(
     let result = async {
         ensure_json_acceptable(&headers)?;
         ensure_no_query(&uri)?;
-        let context = application_context(&request_id, deadline, &cluster)?;
+        let context = application_context(&request_id, deadline, &principal, &cluster)?;
         state
             .application
             .describe_table(&context, &table_ref)
@@ -601,6 +606,7 @@ pub(crate) async fn list_partitions(
     State(state): State<RestState>,
     Extension(request_id): Extension<RequestId>,
     Extension(deadline): Extension<RequestDeadline>,
+    Extension(principal): Extension<Principal>,
     Path((cluster, database, table)): Path<(String, String, String)>,
     headers: HeaderMap,
     uri: Uri,
@@ -611,7 +617,7 @@ pub(crate) async fn list_partitions(
         ensure_json_acceptable(&headers)?;
         let scope = PageScope::partitions(&table_ref);
         let page = Page::prepare(parse_query(&uri)?, &state.metadata_limits, &scope)?;
-        let context = application_context(&request_id, deadline, &cluster)?;
+        let context = application_context(&request_id, deadline, &principal, &cluster)?;
         let partitions = state
             .application
             .list_partitions(&context, &table_ref)

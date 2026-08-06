@@ -25,10 +25,21 @@ mod support;
 use fluss_gateway::backend::testing::TestBackend;
 use serde_json::json;
 use std::sync::Arc;
-use support::{Instance, single_cluster, start_instance};
+use support::{
+    Instance, password_config, single_cluster, start_instance, start_instance_with_config,
+};
 
 async fn gateway() -> Instance {
     start_instance(single_cluster(Arc::new(TestBackend::new()))).await
+}
+
+/// A gateway enforcing password authentication with one known user, `alice:secret`.
+async fn password_gateway() -> Instance {
+    start_instance_with_config(
+        password_config("alice:secret"),
+        single_cluster(Arc::new(TestBackend::new())),
+    )
+    .await
 }
 
 #[tokio::test]
@@ -123,6 +134,103 @@ async fn every_data_plane_route_is_mounted_and_answers_with_an_error_envelope() 
     instance.shutdown().await;
 }
 
+/// The default trust mode accepts requests without credentials (principal `anonymous`) and takes a
+/// Basic username at face value, ignoring the password — matching the FIP's `curl -u alice:ignored`.
+#[tokio::test]
+async fn trust_mode_accepts_anonymous_and_basic_identities() {
+    let instance = gateway().await;
+
+    let anonymous = instance.api.get("/v1/clusters/default/databases").await;
+    assert_eq!(anonymous.status(), 200);
+
+    let named = instance
+        .api
+        .get_with_basic("/v1/clusters/default/databases", "alice", "ignored")
+        .await;
+    assert_eq!(named.status(), 200);
+
+    instance.shutdown().await;
+}
+
+/// Password mode guards every data- and control-plane route: only the health probes stay open.
+#[tokio::test]
+async fn password_mode_enforces_credentials_on_data_and_control_planes() {
+    let instance = password_gateway().await;
+    let databases = "/v1/clusters/default/databases";
+
+    // The right credential reaches the backend.
+    let authorized = instance
+        .api
+        .get_with_basic(databases, "alice", "secret")
+        .await;
+    assert_eq!(authorized.status(), 200);
+
+    // A wrong password is a 401 envelope with the challenge header and a request id.
+    let rejected = instance
+        .api
+        .get_with_basic(databases, "alice", "wrong")
+        .await;
+    assert_eq!(rejected.status(), 401);
+    assert_eq!(
+        rejected
+            .headers()
+            .get("www-authenticate")
+            .and_then(|v| v.to_str().ok()),
+        Some("Basic realm=\"fluss-gateway\"")
+    );
+    assert!(rejected.headers().contains_key("x-request-id"));
+    let body: serde_json::Value = rejected.json().await.expect("JSON body");
+    assert_eq!(body["error"]["code"], "UNAUTHENTICATED");
+    assert_eq!(body["error"]["retryable"], false);
+
+    // Anonymous and malformed credentials are rejected the same way.
+    let anonymous = instance.api.get(databases).await;
+    assert_eq!(anonymous.status(), 401);
+    assert!(anonymous.headers().contains_key("www-authenticate"));
+    let malformed = instance
+        .api
+        .get_with_header(databases, "authorization", "Basic !!!not-base64!!!")
+        .await;
+    assert_eq!(malformed.status(), 401);
+
+    // The control plane is guarded too; only the health probes stay open.
+    assert_eq!(instance.api.get("/v1/clusters").await.status(), 401);
+    assert_eq!(instance.api.get("/v1/openapi.json").await.status(), 401);
+    assert_eq!(instance.api.get("/health/live").await.status(), 200);
+    assert_eq!(instance.api.get("/health").await.status(), 200);
+
+    instance.shutdown().await;
+}
+
+/// An unknown user and a wrong password produce identical envelopes, so the API cannot be used to
+/// enumerate configured users.
+#[tokio::test]
+async fn password_mode_does_not_reveal_whether_the_user_exists() {
+    let instance = password_gateway().await;
+    let databases = "/v1/clusters/default/databases";
+
+    let unknown_user = instance
+        .api
+        .get_with_basic(databases, "mallory", "secret")
+        .await;
+    let wrong_password = instance
+        .api
+        .get_with_basic(databases, "alice", "wrong")
+        .await;
+    assert_eq!(unknown_user.status(), 401);
+    assert_eq!(wrong_password.status(), 401);
+
+    let unknown_body: serde_json::Value = unknown_user.json().await.expect("JSON body");
+    let wrong_body: serde_json::Value = wrong_password.json().await.expect("JSON body");
+    assert_eq!(unknown_body["error"]["code"], wrong_body["error"]["code"]);
+    assert_eq!(
+        unknown_body["error"]["message"],
+        wrong_body["error"]["message"]
+    );
+
+    instance.shutdown().await;
+}
+
 /// The catalog is readable and mutable end to end over the real listener, and paging is stateless.
 #[tokio::test]
 async fn the_catalog_can_be_read_and_mutated_over_the_real_listener() {
@@ -167,22 +275,44 @@ async fn the_catalog_can_be_read_and_mutated_over_the_real_listener() {
     instance.shutdown().await;
 }
 
+/// A request whose declared length exceeds the body cap is rejected from its headers alone.
+///
+/// Sent as a raw HTTP request that never writes the body: the gateway answers 413 (never 429)
+/// before any payload exists, and reading instead of writing avoids racing the early close.
 #[tokio::test]
 async fn an_oversized_body_is_rejected_with_413_and_never_429() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     let instance = gateway().await;
-    let oversized = json!({ "payload": "x".repeat(64 * 1024 * 1024) });
+    let address = instance.gateway.local_addr();
 
-    let response = instance
-        .api
-        .post_json(
-            "/v1/clusters/default/databases/fluss/tables/users/records",
-            &oversized,
-        )
-        .await;
+    let mut stream = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("connect");
+    let request = format!(
+        "POST /v1/clusters/default/databases/fluss/tables/users/records HTTP/1.1\r\n\
+         Host: {address}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         \r\n",
+        64 * 1024 * 1024
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("send headers");
 
-    assert_eq!(response.status(), 413);
-    let body: serde_json::Value = response.json().await.expect("JSON body");
-    assert_eq!(body["error"]["code"], "LIMIT_EXCEEDED");
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .await
+        .expect("read response");
+    let response = String::from_utf8_lossy(&response);
+    assert!(
+        response.starts_with("HTTP/1.1 413"),
+        "expected 413, got: {response}"
+    );
+    assert!(response.contains("LIMIT_EXCEEDED"), "got: {response}");
 
     instance.shutdown().await;
 }

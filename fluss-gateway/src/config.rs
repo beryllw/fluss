@@ -679,8 +679,16 @@ impl GatewayConfig {
     pub fn warnings(&self) -> Vec<String> {
         let mut warnings = Vec::new();
         if !self.server.rest.bind_address.ip().is_loopback() {
+            let exposure = match self.security.authentication {
+                AuthenticationMode::Trust => {
+                    "The REST listener accepts unauthenticated requests and has no TLS"
+                }
+                AuthenticationMode::Password => {
+                    "The REST listener has no TLS, so credentials cross the network unencrypted unless a fronting proxy terminates TLS"
+                }
+            };
             warnings.push(format!(
-                "server.rest.bind_address {} is not loopback. The REST listener has no authentication or TLS",
+                "server.rest.bind_address {} is not loopback. {exposure}",
                 self.server.rest.bind_address
             ));
         }
@@ -1813,8 +1821,27 @@ gateway.cluster.analytics_eu.bootstrap.servers: file:9123
         assert!(config.server.instance_id.is_none());
         assert_eq!(config.warnings().len(), 1);
         assert!(config.warnings()[0].contains("not loopback"));
+        // Trust mode: the warning calls out the unauthenticated exposure.
         assert!(
-            config.warnings()[0].contains("The REST listener has no authentication or TLS"),
+            config.warnings()[0].contains("accepts unauthenticated requests"),
+            "{:?}",
+            config.warnings()
+        );
+
+        // Password mode: authentication is enforced, so the warning is about missing TLS only.
+        let config = load_file(
+            "gateway.rest.listen: 0.0.0.0:8080\n\
+             gateway.security.authentication: password\ngateway.security.users: alice:pw\n",
+        )
+        .unwrap();
+        assert_eq!(config.warnings().len(), 1);
+        assert!(
+            !config.warnings()[0].contains("unauthenticated"),
+            "{:?}",
+            config.warnings()
+        );
+        assert!(
+            config.warnings()[0].contains("no TLS"),
             "{:?}",
             config.warnings()
         );

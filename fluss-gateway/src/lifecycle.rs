@@ -256,7 +256,7 @@ async fn start_internal(
         .map_err(|error| format!("failed to read the bound metrics listener address: {error}"))?;
 
     let readiness = Arc::new(Readiness::new());
-    let state = rest_state(&config, clusters.clone(), &readiness, local_addr);
+    let state = rest_state(&config, clusters.clone(), &readiness, local_addr)?;
     let router = rest::build_router(state, &RestOptions::from(&config.server.rest));
     let shutdown = CancellationToken::new();
     let mut tasks = JoinSet::new();
@@ -300,19 +300,23 @@ async fn start_internal(
 }
 
 /// Builds shared handler state from validated configuration and process services.
+///
+/// Fails only when the authenticator cannot be built from `gateway.security.*`, which
+/// [`crate::config::GatewayConfig::validate`] normally rejects first.
 pub fn rest_state(
     config: &GatewayConfig,
     clusters: Arc<ClusterRegistry>,
     readiness: &Arc<Readiness>,
     bind_address: std::net::SocketAddr,
-) -> RestState {
+) -> Result<RestState, RunError> {
+    let authenticator = config.security.build_authenticator()?;
     let application = Arc::new(
         crate::application::GatewayService::with_write_delivery_time(
             clusters.clone(),
             config.write.max_delivery_time.get(),
         ),
     );
-    RestState {
+    Ok(RestState {
         application,
         clusters,
         readiness: readiness.clone(),
@@ -322,7 +326,8 @@ pub fn rest_state(
         metadata_limits: MetadataLimits::from(&config.metadata),
         write_limits: WriteLimits::from(&config.write),
         openapi: Arc::new(OnceLock::new()),
-    }
+        authenticator,
+    })
 }
 
 /// Binds one configured HTTP listener and adds a contextual startup error.

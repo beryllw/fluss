@@ -18,6 +18,7 @@
 //! Request-scoped application metadata, deadlines, and cancellation.
 
 use crate::application::types::ClusterId;
+use crate::auth::Principal;
 use crate::error::GatewayError;
 use std::time::Instant;
 use tokio_util::sync::{CancellationToken, DropGuard};
@@ -57,16 +58,18 @@ pub struct RequestContext {
     cluster_id: ClusterId,
     deadline: Instant,
     cancellation: CancellationSignal,
+    principal: Principal,
 }
 
 impl RequestContext {
-    /// Creates a request context with an absolute monotonic deadline.
+    /// Creates a request context with an absolute monotonic deadline and the authenticated caller.
     pub fn new(
         request_id: impl Into<String>,
         protocol: impl Into<String>,
         cluster_id: ClusterId,
         deadline: Instant,
         cancellation: CancellationSignal,
+        principal: Principal,
     ) -> Self {
         Self {
             request_id: request_id.into(),
@@ -74,6 +77,7 @@ impl RequestContext {
             cluster_id,
             deadline,
             cancellation,
+            principal,
         }
     }
 
@@ -95,6 +99,12 @@ impl RequestContext {
 
     pub fn cancellation(&self) -> &CancellationSignal {
         &self.cancellation
+    }
+
+    /// The authenticated caller this request acts for. Identity-aware backends (per-user act-as
+    /// connections) key their connection choice on `principal().name`.
+    pub fn principal(&self) -> &Principal {
+        &self.principal
     }
 
     /// Rejects work that has already been cancelled or has no time remaining.
@@ -127,6 +137,7 @@ mod tests {
             cluster_id(),
             Instant::now() + Duration::from_secs(1),
             cancellation.clone(),
+            Principal::new("tester"),
         );
         cancellation.cancel();
 
@@ -144,6 +155,7 @@ mod tests {
             cluster_id(),
             Instant::now(),
             CancellationSignal::default(),
+            Principal::new("tester"),
         );
 
         assert_eq!(

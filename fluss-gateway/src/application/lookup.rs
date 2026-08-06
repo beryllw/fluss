@@ -156,6 +156,7 @@ mod tests {
             ClusterId::try_from("default").unwrap(),
             Instant::now() + Duration::from_secs(5),
             CancellationSignal::default(),
+            crate::auth::Principal::new("tester"),
         )
     }
 

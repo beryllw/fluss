@@ -34,6 +34,7 @@ use crate::application::ddl::{
     PartitionMutationRequest, PartitionSpecEntry, TableChange, TableDistributionDefinition,
 };
 use crate::application::{DataType, TableRef};
+use crate::auth::Principal;
 use crate::error::GatewayError;
 use crate::observability;
 use crate::protocol::rest::datatype::DataTypeResponse;
@@ -179,10 +180,12 @@ pub struct CreatePartitionBody {
         (status = 504, description = "Request deadline exceeded", body = ErrorEnvelopeSchema)
     )
 )]
+#[allow(clippy::too_many_arguments)] // Axum extractors, one per request-scoped concern.
 pub(crate) async fn create_database(
     State(state): State<RestState>,
     Extension(request_id): Extension<RequestId>,
     Extension(deadline): Extension<RequestDeadline>,
+    Extension(principal): Extension<Principal>,
     Path(cluster): Path<String>,
     uri: Uri,
     headers: HeaderMap,
@@ -198,7 +201,7 @@ pub(crate) async fn create_database(
             encode_segment(&cluster),
             encode_segment(&body.name)
         );
-        let context = application_context(&request_id, deadline, &cluster)?;
+        let context = application_context(&request_id, deadline, &principal, &cluster)?;
         let database = state
             .application
             .create_database(
@@ -246,13 +249,14 @@ pub(crate) async fn drop_database(
     State(state): State<RestState>,
     Extension(request_id): Extension<RequestId>,
     Extension(deadline): Extension<RequestDeadline>,
+    Extension(principal): Extension<Principal>,
     Path((cluster, database)): Path<(String, String)>,
     uri: Uri,
 ) -> Response {
     let started = Instant::now();
     let result = async {
         ensure_no_query(&uri)?;
-        let context = application_context(&request_id, deadline, &cluster)?;
+        let context = application_context(&request_id, deadline, &principal, &cluster)?;
         state.application.drop_database(&context, &database).await?;
         Ok(StatusCode::NO_CONTENT.into_response())
     }
@@ -289,10 +293,12 @@ pub(crate) async fn drop_database(
         (status = 504, description = "Request deadline exceeded", body = ErrorEnvelopeSchema)
     )
 )]
+#[allow(clippy::too_many_arguments)] // Axum extractors, one per request-scoped concern.
 pub(crate) async fn create_table(
     State(state): State<RestState>,
     Extension(request_id): Extension<RequestId>,
     Extension(deadline): Extension<RequestDeadline>,
+    Extension(principal): Extension<Principal>,
     Path((cluster, database)): Path<(String, String)>,
     uri: Uri,
     headers: HeaderMap,
@@ -306,7 +312,7 @@ pub(crate) async fn create_table(
         let table = TableRef::new(database, body.table_name.clone());
         let location = table_location(&cluster, &table);
         let request = create_table_request(table, body)?;
-        let context = application_context(&request_id, deadline, &cluster)?;
+        let context = application_context(&request_id, deadline, &principal, &cluster)?;
         let created = state.application.create_table(&context, request).await?;
         created_response(&TableResponse::from(created.as_ref()), &location)
     }
@@ -343,10 +349,12 @@ pub(crate) async fn create_table(
         (status = 504, description = "Request deadline exceeded", body = ErrorEnvelopeSchema)
     )
 )]
+#[allow(clippy::too_many_arguments)] // Axum extractors, one per request-scoped concern.
 pub(crate) async fn alter_table(
     State(state): State<RestState>,
     Extension(request_id): Extension<RequestId>,
     Extension(deadline): Extension<RequestDeadline>,
+    Extension(principal): Extension<Principal>,
     Path((cluster, database, table)): Path<(String, String, String)>,
     uri: Uri,
     headers: HeaderMap,
@@ -358,7 +366,7 @@ pub(crate) async fn alter_table(
         ensure_json_acceptable(&headers)?;
         let body: AlterTableBody = parse_json_body(&headers, &body)?;
         let request = alter_table_request(TableRef::new(database, table), body)?;
-        let context = application_context(&request_id, deadline, &cluster)?;
+        let context = application_context(&request_id, deadline, &principal, &cluster)?;
         let altered = state.application.alter_table(&context, request).await?;
         json_response(&TableResponse::from(altered.as_ref()))
     }
@@ -396,13 +404,14 @@ pub(crate) async fn drop_table(
     State(state): State<RestState>,
     Extension(request_id): Extension<RequestId>,
     Extension(deadline): Extension<RequestDeadline>,
+    Extension(principal): Extension<Principal>,
     Path((cluster, database, table)): Path<(String, String, String)>,
     uri: Uri,
 ) -> Response {
     let started = Instant::now();
     let result = async {
         ensure_no_query(&uri)?;
-        let context = application_context(&request_id, deadline, &cluster)?;
+        let context = application_context(&request_id, deadline, &principal, &cluster)?;
         state
             .application
             .drop_table(&context, &TableRef::new(database, table))
@@ -436,10 +445,12 @@ pub(crate) async fn drop_table(
         (status = 504, description = "Request deadline exceeded", body = ErrorEnvelopeSchema)
     )
 )]
+#[allow(clippy::too_many_arguments)] // Axum extractors, one per request-scoped concern.
 pub(crate) async fn create_partition(
     State(state): State<RestState>,
     Extension(request_id): Extension<RequestId>,
     Extension(deadline): Extension<RequestDeadline>,
+    Extension(principal): Extension<Principal>,
     Path((cluster, database, table)): Path<(String, String, String)>,
     uri: Uri,
     headers: HeaderMap,
@@ -451,7 +462,7 @@ pub(crate) async fn create_partition(
         ensure_json_acceptable(&headers)?;
         let body: CreatePartitionBody = parse_json_body(&headers, &body)?;
         let table = TableRef::new(database, table);
-        let context = application_context(&request_id, deadline, &cluster)?;
+        let context = application_context(&request_id, deadline, &principal, &cluster)?;
         let partition = state
             .application
             .create_partition(
@@ -511,13 +522,14 @@ pub(crate) async fn drop_partition(
     State(state): State<RestState>,
     Extension(request_id): Extension<RequestId>,
     Extension(deadline): Extension<RequestDeadline>,
+    Extension(principal): Extension<Principal>,
     Path((cluster, database, table, partition)): Path<(String, String, String, String)>,
     uri: Uri,
 ) -> Response {
     let started = Instant::now();
     let result = async {
         ensure_no_query(&uri)?;
-        let context = application_context(&request_id, deadline, &cluster)?;
+        let context = application_context(&request_id, deadline, &principal, &cluster)?;
         state
             .application
             .drop_partition(&context, &TableRef::new(database, table), &partition)

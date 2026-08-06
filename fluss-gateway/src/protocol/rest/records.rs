@@ -47,6 +47,7 @@
 //! opaque caller correlation value that every outcome echoes back; duplicates within one request are rejected.
 
 use crate::application::{WriteEntry, WriteOperation, WriteRequest};
+use crate::auth::Principal;
 use crate::backend::model::{TableRef, WriteCompletion, WriteResult};
 use crate::error::GatewayError;
 use crate::observability;
@@ -201,10 +202,12 @@ pub struct WriteResponse {
         (status = 504, description = "Deadline exceeded before submission", body = ErrorEnvelopeSchema)
     )
 )]
+#[allow(clippy::too_many_arguments)] // Axum extractors, one per request-scoped concern.
 pub(crate) async fn write_records(
     State(state): State<RestState>,
     Extension(request_id): Extension<RequestId>,
     Extension(deadline): Extension<RequestDeadline>,
+    Extension(principal): Extension<Principal>,
     Path((cluster, database, table)): Path<(String, String, String)>,
     uri: Uri,
     headers: HeaderMap,
@@ -216,6 +219,7 @@ pub(crate) async fn write_records(
         &state,
         &request_id,
         deadline,
+        &principal,
         &cluster,
         &cluster_label,
         database,
@@ -255,6 +259,7 @@ async fn run_write(
     state: &RestState,
     request_id: &RequestId,
     deadline: RequestDeadline,
+    principal: &Principal,
     cluster: &str,
     cluster_label: &str,
     database: String,
@@ -276,7 +281,7 @@ async fn run_write(
     }
     observability::write_accepted(cluster_label, input.entries.len(), body.len() as u64);
 
-    let context = application_context(request_id, deadline, cluster)?;
+    let context = application_context(request_id, deadline, principal, cluster)?;
     let request = WriteRequest {
         table: TableRef::new(database, table),
         partial_update_columns: input.partial_update_columns,

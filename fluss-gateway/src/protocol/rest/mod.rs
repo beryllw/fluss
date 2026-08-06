@@ -26,6 +26,7 @@
 //! per-request deadline (504). There is no concurrency permit and no 429 anywhere in the adapter — the gateway
 //! does not rate limit.
 
+pub mod auth;
 pub mod clusters;
 pub mod datatype;
 pub mod ddl;
@@ -39,6 +40,7 @@ pub mod openapi;
 pub mod records;
 
 use crate::application::{CancellationSignal, ClusterId, GatewayService, RequestContext};
+use crate::auth::{Authenticator, Principal};
 use crate::backend::registry::ClusterRegistry;
 use crate::config::{LookupConfig, MetadataConfig, RestServerConfig, WriteConfig};
 use crate::error::{ErrorEnvelope, GatewayError};
@@ -83,6 +85,8 @@ pub struct RestState {
     /// [`build_router`] fills it once, after the route modules are merged and split, so the served document is
     /// exactly the contract of the routes that are actually mounted.
     pub openapi: Arc<OnceLock<serde_json::Value>>,
+    /// The one global client-to-gateway authenticator, from `gateway.security.*`.
+    pub authenticator: Arc<dyn Authenticator>,
 }
 
 /// Returns a bounded metric label for a configured cluster, or one static value for rejected IDs.
@@ -188,6 +192,7 @@ impl RequestDeadline {
 pub(crate) fn application_context(
     request_id: &RequestId,
     deadline: RequestDeadline,
+    principal: &Principal,
     cluster: &str,
 ) -> Result<RestRequestContext, GatewayError> {
     let cluster_id = ClusterId::try_from(cluster).map_err(|_| {
@@ -203,6 +208,7 @@ pub(crate) fn application_context(
             cluster_id,
             deadline.instant(),
             cancellation.clone(),
+            principal.clone(),
         ),
         _cancellation_guard: cancellation_guard,
     })
@@ -359,26 +365,43 @@ pub fn build_router(state: RestState, options: &RestOptions) -> Router {
         .merge(lookup::routes())
         .merge(records::routes())
         .split_for_parts();
-    let (control_router, control_api) = OpenApiRouter::new()
-        .merge(health::routes())
+    let (secured_control_router, secured_control_api) = OpenApiRouter::new()
         .merge(clusters::routes())
         .merge(openapi::routes())
         .split_for_parts();
+    let (open_router, open_api) = OpenApiRouter::new()
+        .merge(health::routes())
+        .split_for_parts();
 
     let mut api = data_api;
-    api.merge(control_api);
+    api.merge(secured_control_api);
+    api.merge(open_api);
     let _ = state.openapi.set(openapi::finalize(api));
 
     let data = data_router.with_state(state.clone());
     let data = apply_data_limits(data, options);
     let data = apply_acceptance_guard(data, state.readiness.clone());
-    let control = control_router
+    let secured_control =
+        secured_control_router
+            .with_state(state.clone())
+            .layer(middleware::from_fn(assign_request_deadline(
+                options.request_timeout,
+            )));
+    // Everything except the health probes requires authentication. The 404 fallback stays outside
+    // the guard so an unknown path answers 404 rather than 401; the health router carries it.
+    let secured = data
+        .merge(secured_control)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_authentication,
+        ));
+    let open = open_router
         .fallback(unknown_route)
         .with_state(state)
         .layer(middleware::from_fn(assign_request_deadline(
             options.request_timeout,
         )));
-    apply_common_middleware(control.merge(data))
+    apply_common_middleware(open.merge(secured))
 }
 
 /// Rejects new data and metadata work after graceful draining starts while keeping health endpoints available.
@@ -664,6 +687,7 @@ pub mod test_support {
             },
             write_limits: WriteLimits { max_rows: 8 },
             openapi: Arc::new(OnceLock::new()),
+            authenticator: Arc::new(crate::auth::TrustAuthenticator::new()),
         }
     }
 
@@ -710,6 +734,7 @@ mod tests {
         let context = application_context(
             &RequestId::default(),
             RequestDeadline(Instant::now() + Duration::from_secs(1)),
+            &Principal::new("tester"),
             "default",
         )
         .unwrap();

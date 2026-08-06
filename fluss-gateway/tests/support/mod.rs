@@ -25,7 +25,7 @@
 
 use fluss_gateway::backend::registry::ClusterRegistry;
 use fluss_gateway::backend::testing::TestBackend;
-use fluss_gateway::config::{CliOverrides, GatewayConfig, load};
+use fluss_gateway::config::{AuthenticationMode, CliOverrides, GatewayConfig, load};
 use fluss_gateway::lifecycle::{RunningGateway, start_with_clusters};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -65,6 +65,31 @@ impl Api {
         let response = self.get(path).await;
         assert_eq!(response.status(), 200, "GET {path}");
         response.json().await.expect("JSON body")
+    }
+
+    /// Sends a GET request carrying HTTP basic credentials.
+    pub async fn get_with_basic(&self, path: &str, user: &str, pass: &str) -> reqwest::Response {
+        self.client
+            .get(self.url(path))
+            .basic_auth(user, Some(pass))
+            .send()
+            .await
+            .expect("GET request")
+    }
+
+    /// Sends a GET request with one explicit raw header, for malformed-credential cases.
+    pub async fn get_with_header(
+        &self,
+        path: &str,
+        name: &'static str,
+        value: &str,
+    ) -> reqwest::Response {
+        self.client
+            .get(self.url(path))
+            .header(name, value)
+            .send()
+            .await
+            .expect("GET request")
     }
 
     /// Sends a JSON POST request accepting a JSON response.
@@ -118,6 +143,15 @@ pub fn ephemeral_config() -> GatewayConfig {
     config
 }
 
+/// Ephemeral-port configuration enforcing password authentication over the given user table.
+pub fn password_config(users: &str) -> GatewayConfig {
+    let mut config = ephemeral_config();
+    config.security.authentication = AuthenticationMode::Password;
+    config.security.users = Some(users.to_string());
+    config.validate().expect("password configuration is valid");
+    config
+}
+
 /// One in-process gateway plus a client bound to its address.
 pub struct Instance {
     pub gateway: RunningGateway,
@@ -135,7 +169,15 @@ impl Instance {
 
 /// Starts one gateway over the given registry and binds a client to it.
 pub async fn start_instance(clusters: Arc<ClusterRegistry>) -> Instance {
-    let gateway = start_with_clusters(ephemeral_config(), clusters.clone())
+    start_instance_with_config(ephemeral_config(), clusters).await
+}
+
+/// Starts one gateway with explicit configuration over the given registry.
+pub async fn start_instance_with_config(
+    config: GatewayConfig,
+    clusters: Arc<ClusterRegistry>,
+) -> Instance {
+    let gateway = start_with_clusters(config, clusters.clone())
         .await
         .expect("the gateway starts");
     let api = Api::new(format!("http://{}", gateway.local_addr()));
