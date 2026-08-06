@@ -27,18 +27,19 @@
 //! for catalog reads and mutations, [`mod@write`] for the records endpoint, and [`lookup`] for the two lookup
 //! endpoints.
 
-pub mod context;
 pub mod ddl;
 pub mod input;
 pub mod input_decode;
 pub mod lookup;
-pub mod metadata_cache;
 pub mod pagination;
 pub mod service;
-pub mod types;
 pub mod write;
 
-pub use context::{CancellationSignal, RequestContext};
+pub use crate::backend::context::{CancellationSignal, RequestContext};
+pub use crate::backend::metadata_cache::{
+    DEFAULT_METADATA_CACHE_MAX_ENTRIES, DEFAULT_METADATA_CACHE_TTL, TableMetadataCache,
+};
+pub use crate::backend::types::{ClusterId, DataType, RowField};
 pub use ddl::{
     AlterTableRequest, ColumnDefinition, CreateDatabaseRequest, CreateTableRequest,
     PartitionMutationRequest, PartitionSpecEntry, TableChange, TableDistributionDefinition,
@@ -48,12 +49,8 @@ pub use input_decode::{
     DecodedRow, InputColumn, RowDecodeError, SchemaDecoder, ValidatedTableSchema,
     validate_data_type, validate_table_schema,
 };
-pub use metadata_cache::{
-    DEFAULT_METADATA_CACHE_MAX_ENTRIES, DEFAULT_METADATA_CACHE_TTL, TableMetadataCache,
-};
 pub use pagination::{PAGE_TOKEN_VERSION, PageScope, decode_page_token, encode_page_token};
 pub use service::GatewayService;
-pub use types::{ClusterId, DataType, RowField};
 pub use write::{WriteEntry, WriteOperation, WriteRequest};
 
 // The backend models are the shared vocabulary of both layers. Re-exporting them here lets the REST adapter

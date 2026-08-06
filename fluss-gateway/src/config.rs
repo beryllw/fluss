@@ -50,11 +50,11 @@
 //! the REST listener, while `FLUSS_GATEWAY__CLUSTERS__ANALYTICS_EU__BOOTSTRAP_SERVERS` overrides
 //! `[clusters.analytics_eu].bootstrap_servers`.
 
-use crate::application::types::ClusterId;
 use crate::auth::{
     Authenticator, ConfigUserStoreAuthenticator, Secret, StoredSecret, TrustAuthenticator,
     parse_user_table,
 };
+use crate::backend::types::ClusterId;
 use serde::Deserialize;
 use serde::de::{self, Deserializer};
 use std::collections::{BTreeMap, HashMap};

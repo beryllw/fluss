@@ -16,17 +16,17 @@
 
 //! Immutable registry of independently connected Fluss cluster runtimes.
 
-use crate::application::metadata_cache::TableMetadataCache;
-use crate::application::types::ClusterId;
 use crate::auth::Principal;
 use crate::backend::GatewayBackend;
 use crate::backend::identity::{IdentityConnector, IdentityPool};
+use crate::backend::metadata_cache::TableMetadataCache;
 #[cfg(any(test, feature = "test-backend"))]
 use crate::backend::model::ClusterHealthReport;
 use crate::backend::model::TableDescription;
 use crate::backend::resilient::{
     BackendHealth, BackendHealthSnapshot, ClusterSupervisor, ResilientBackend, SupervisorConfig,
 };
+use crate::backend::types::ClusterId;
 use crate::config::GatewayConfig;
 use crate::error::GatewayError;
 use futures::future::join_all;

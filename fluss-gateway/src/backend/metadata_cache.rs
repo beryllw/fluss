@@ -17,7 +17,8 @@
 
 //! Bounded, per-cluster table metadata cache with coalesced refreshes.
 
-use crate::application::{ClusterId, TableRef};
+use crate::backend::model::TableRef;
+use crate::backend::types::ClusterId;
 use crate::error::GatewayError;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;

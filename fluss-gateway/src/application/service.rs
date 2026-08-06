@@ -24,8 +24,8 @@
 //! endpoints — so that independent workstreams extend the service without sharing one file.
 
 use crate::application::RequestContext;
-use crate::application::metadata_cache::TableMetadataCache;
 use crate::backend::GatewayBackend;
+use crate::backend::metadata_cache::TableMetadataCache;
 use crate::backend::model::{TableDescription, TableRef};
 use crate::backend::registry::ClusterRegistry;
 use crate::error::{ErrorKind, GatewayError};

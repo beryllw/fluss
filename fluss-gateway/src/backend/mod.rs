@@ -25,13 +25,16 @@
 //! stream, scanner, cursor, or any other handle that would outlive the call, because the gateway keeps no
 //! request-spanning state.
 
+pub mod context;
 pub mod identity;
+pub mod metadata_cache;
 pub mod model;
 pub mod native;
 mod native_lookup;
 mod native_write;
 pub mod registry;
 pub mod resilient;
+pub mod types;
 
 #[cfg(any(test, feature = "test-backend"))]
 pub mod testing;

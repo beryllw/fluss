@@ -17,8 +17,8 @@
 
 //! Request-scoped application metadata, deadlines, and cancellation.
 
-use crate::application::types::ClusterId;
 use crate::auth::Principal;
+use crate::backend::types::ClusterId;
 use crate::error::GatewayError;
 use std::time::Instant;
 use tokio_util::sync::{CancellationToken, DropGuard};
