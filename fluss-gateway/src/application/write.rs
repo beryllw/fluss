@@ -33,7 +33,6 @@
 //! itself. Only the former is treated as a schema mismatch, which buys exactly one forced metadata refresh and
 //! one repeated preflight before the failure is returned to the caller.
 
-use crate::application::input_decode::RowDecodeError;
 use crate::application::service::resource_error;
 use crate::application::{
     GatewayService, InputColumn, InputValue, RequestContext, SchemaDecoder, TableDescription,
@@ -44,6 +43,7 @@ use crate::backend::model::{
 };
 use crate::config::WRITE_RESPONSE_BUDGET;
 use crate::error::GatewayError;
+use crate::protocol::rest::input_decode::RowDecodeError;
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 

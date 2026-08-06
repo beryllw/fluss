@@ -28,10 +28,7 @@
 //! endpoints.
 
 pub mod ddl;
-pub mod input;
-pub mod input_decode;
 pub mod lookup;
-pub mod pagination;
 pub mod service;
 pub mod write;
 
@@ -40,16 +37,18 @@ pub use crate::backend::metadata_cache::{
     DEFAULT_METADATA_CACHE_MAX_ENTRIES, DEFAULT_METADATA_CACHE_TTL, TableMetadataCache,
 };
 pub use crate::backend::types::{ClusterId, DataType, RowField};
+pub use crate::protocol::rest::input_decode::{
+    DecodedRow, InputColumn, RowDecodeError, SchemaDecoder, ValidatedTableSchema,
+    validate_data_type, validate_table_schema,
+};
+pub use crate::protocol::rest::input_value::InputValue;
+pub use crate::protocol::rest::pagination::{
+    PAGE_TOKEN_VERSION, PageScope, decode_page_token, encode_page_token,
+};
 pub use ddl::{
     AlterTableRequest, ColumnDefinition, CreateDatabaseRequest, CreateTableRequest,
     PartitionMutationRequest, PartitionSpecEntry, TableChange, TableDistributionDefinition,
 };
-pub use input::InputValue;
-pub use input_decode::{
-    DecodedRow, InputColumn, RowDecodeError, SchemaDecoder, ValidatedTableSchema,
-    validate_data_type, validate_table_schema,
-};
-pub use pagination::{PAGE_TOKEN_VERSION, PageScope, decode_page_token, encode_page_token};
 pub use service::GatewayService;
 pub use write::{WriteEntry, WriteOperation, WriteRequest};
 

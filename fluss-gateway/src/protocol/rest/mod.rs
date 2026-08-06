@@ -33,11 +33,14 @@ pub mod datatype;
 pub mod ddl;
 pub mod health;
 pub mod input;
+pub mod input_decode;
+pub mod input_value;
 pub mod json;
 pub mod limits;
 pub mod lookup;
 pub mod metadata;
 pub mod openapi;
+pub mod pagination;
 pub mod records;
 
 use crate::application::{CancellationSignal, ClusterId, GatewayService, RequestContext};

@@ -41,8 +41,9 @@
 //! Every failure names the offending column, because a decode failure is a 400 raised before anything is
 //! written: preflight is all-or-nothing, so the caller has to be able to find the value that stopped the batch.
 
-use crate::application::{DataType, InputValue, RowField};
+use crate::backend::types::{DataType, RowField};
 use crate::error::GatewayError;
+use crate::protocol::rest::input_value::InputValue;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::NaiveDate;

@@ -19,14 +19,13 @@
 //!
 //! Collections are paginated with stateless keyset tokens: the gateway fetches the full sorted name list on every
 //! page and returns the entries strictly greater than the token's last-seen name. The token itself is
-//! self-contained (see [`crate::application::pagination`]), so any instance serves any page.
+//! self-contained (see [`crate::protocol::rest::pagination`]), so any instance serves any page.
 //!
 //! Page parameters and the continuation token are validated **before** the listing request is dispatched, so a
 //! malformed or out-of-scope token is always a `400` and never depends on whether the parent resource exists.
 //!
 //! Path components arrive percent-decoded exactly once by the router and are matched as exact Fluss identifiers.
 
-use crate::application::pagination::{PageScope, decode_page_token, encode_page_token};
 use crate::application::{DatabaseDescription, PartitionDescription, TableDescription, TableKind};
 use crate::auth::Principal;
 use crate::backend::model::TableRef;
@@ -35,6 +34,7 @@ use crate::observability;
 use crate::protocol::rest::datatype::DataTypeResponse;
 use crate::protocol::rest::limits::ensure_json_acceptable;
 use crate::protocol::rest::openapi::ErrorEnvelopeSchema;
+use crate::protocol::rest::pagination::{PageScope, decode_page_token, encode_page_token};
 use crate::protocol::rest::{
     MetadataLimits, RequestDeadline, RequestId, RestState, application_context, ensure_no_query,
     error_response, json_response, metric_cluster, parse_query,
