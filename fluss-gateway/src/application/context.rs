@@ -54,7 +54,6 @@ impl CancellationSignal {
 #[derive(Debug, Clone)]
 pub struct RequestContext {
     request_id: String,
-    protocol: String,
     cluster_id: ClusterId,
     deadline: Instant,
     cancellation: CancellationSignal,
@@ -65,7 +64,6 @@ impl RequestContext {
     /// Creates a request context with an absolute monotonic deadline and the authenticated caller.
     pub fn new(
         request_id: impl Into<String>,
-        protocol: impl Into<String>,
         cluster_id: ClusterId,
         deadline: Instant,
         cancellation: CancellationSignal,
@@ -73,7 +71,6 @@ impl RequestContext {
     ) -> Self {
         Self {
             request_id: request_id.into(),
-            protocol: protocol.into(),
             cluster_id,
             deadline,
             cancellation,
@@ -83,10 +80,6 @@ impl RequestContext {
 
     pub fn request_id(&self) -> &str {
         &self.request_id
-    }
-
-    pub fn protocol(&self) -> &str {
-        &self.protocol
     }
 
     pub fn cluster_id(&self) -> &ClusterId {
@@ -133,7 +126,6 @@ mod tests {
         let cancellation = CancellationSignal::default();
         let context = RequestContext::new(
             "request-1",
-            "rest",
             cluster_id(),
             Instant::now() + Duration::from_secs(1),
             cancellation.clone(),
@@ -151,7 +143,6 @@ mod tests {
     fn rejects_expired_request() {
         let context = RequestContext::new(
             "request-1",
-            "rest",
             cluster_id(),
             Instant::now(),
             CancellationSignal::default(),

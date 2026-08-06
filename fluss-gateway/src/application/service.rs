@@ -200,7 +200,6 @@ mod tests {
     fn context(cluster: &str, deadline: Instant) -> RequestContext {
         RequestContext::new(
             "request-1",
-            "test",
             ClusterId::try_from(cluster).unwrap(),
             deadline,
             CancellationSignal::default(),
@@ -246,7 +245,6 @@ mod tests {
         cancellation.cancel();
         let cancelled = RequestContext::new(
             "request-1",
-            "test",
             ClusterId::try_from("default").unwrap(),
             Instant::now() + Duration::from_secs(5),
             cancellation,

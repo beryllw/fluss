@@ -15,10 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Protocol-neutral gateway application boundary.
+//! Gateway application boundary: the orchestration behind the REST adapter.
 //!
-//! Protocol adapters translate their wire types into the models in this module and call
-//! [`GatewayService`]. No HTTP, Axum, JSON, or OpenAPI type belongs in this layer.
+//! The REST layer translates its wire types into the models in this module and calls
+//! [`GatewayService`]. No HTTP, Axum, JSON, or OpenAPI type belongs in this layer — the split
+//! keeps request orchestration (deadlines, decoding, caching, identity resolution) testable
+//! without a listener. It is not a multi-protocol framework: the gateway serves exactly the
+//! FIP-49 REST API, and any future protocol is an evolution to design when it is needed.
 //!
 //! [`GatewayService`] is defined in [`service`] and extended by one inherent `impl` block per domain: [`ddl`]
 //! for catalog reads and mutations, [`mod@write`] for the records endpoint, and [`lookup`] for the two lookup
@@ -53,7 +56,7 @@ pub use service::GatewayService;
 pub use types::{ClusterId, DataType, RowField};
 pub use write::{WriteEntry, WriteOperation, WriteRequest};
 
-// The backend models are the shared vocabulary of both layers. Re-exporting them here lets protocol adapters
+// The backend models are the shared vocabulary of both layers. Re-exporting them here lets the REST adapter
 // depend on the application boundary alone.
 pub use crate::backend::model::{
     ClusterHealthReport, ClusterStatus, ColumnDescription, DatabaseDescription, KeyValue,

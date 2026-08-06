@@ -205,7 +205,6 @@ pub(crate) fn application_context(
     Ok(RestRequestContext {
         context: RequestContext::new(
             request_id.as_str(),
-            "rest",
             cluster_id,
             deadline.instant(),
             cancellation.clone(),

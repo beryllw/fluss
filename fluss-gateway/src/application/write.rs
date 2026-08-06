@@ -1062,7 +1062,6 @@ mod tests {
     fn context() -> RequestContext {
         RequestContext::new(
             "request-1",
-            "test",
             ClusterId::try_from("default").unwrap(),
             Instant::now() + Duration::from_secs(30),
             CancellationSignal::default(),
