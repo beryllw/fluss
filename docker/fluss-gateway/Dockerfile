@@ -59,10 +59,12 @@ COPY --from=builder /build/fluss-gateway/target/release/fluss-gateway /usr/local
 
 # Container defaults: listen on all interfaces instead of the loopback the
 # bare binary defaults to. Everything else is configured through a mounted
-# gateway.yaml (--config) or further FLUSS_GATEWAY__* overrides.
+# gateway.yaml (--config) or FLUSS_GATEWAY__* overrides. Deliberately no
+# bootstrap-servers ENV here: environment overrides beat the configuration
+# file, so baking one in would silently shadow a mounted gateway.yaml (the
+# binary's built-in default is 127.0.0.1:9123 already).
 ENV FLUSS_GATEWAY__SERVER_REST__BIND_ADDRESS=0.0.0.0:8080 \
     FLUSS_GATEWAY__SERVER_METRICS__BIND_ADDRESS=0.0.0.0:9095 \
-    FLUSS_GATEWAY__CLUSTERS__DEFAULT__BOOTSTRAP_SERVERS=127.0.0.1:9123 \
     RUST_LOG=info
 
 USER fluss
