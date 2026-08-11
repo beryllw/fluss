@@ -102,8 +102,8 @@ public class HudiLakeCommitter implements LakeCommitter<HudiWriteResult, HudiCom
             throws IOException {
         Map<String, HudiWriteStats> writeStatsByInstant = committable.getWriteStats();
         if (writeStatsByInstant.isEmpty() && committable.getCompactionWriteStats().isEmpty()) {
-            // no writer created in this round, commit an empty instant to persist the
-            // tiering progress (e.g. buckets only advanced offsets over empty WAL batches)
+            // no data or compaction result in this round, commit an empty instant to persist
+            // the tiering progress (e.g. buckets only advanced offsets over empty WAL batches)
             return commitEmptyInstant(snapshotProperties);
         }
         if (writeStatsByInstant.size() != 1) {
@@ -123,11 +123,6 @@ public class HudiLakeCommitter implements LakeCommitter<HudiWriteResult, HudiCom
         try {
             validateWriteStats(instant, writeStats);
 
-            // the committer's write client never executed a write operation, set the operation
-            // type explicitly so commitStats records it in the commit metadata
-            writeClient.setOperationType(
-                    WriteOperationType.fromValue(
-                            hudiTableInfo.getFlinkConfig().get(FlinkOptions.OPERATION)));
             LOG.info(
                     "Committing Hudi instant {} with {} write stat entries and metadata {}.",
                     instant,
@@ -260,18 +255,21 @@ public class HudiLakeCommitter implements LakeCommitter<HudiWriteResult, HudiCom
                             Collections.emptyList(),
                             Option.of(commitMetadata),
                             commitActionType);
+            if (!committed) {
+                throw new IOException("Failed to commit empty Hudi instant " + instant + ".");
+            }
             // with hoodie.allow.empty.commit=false Hudi may return true without creating a
             // completed instant, verify the timeline to avoid reporting a non-existent snapshot
             metaClient.reloadActiveTimeline();
-            if (!committed
-                    || !metaClient
-                            .getActiveTimeline()
-                            .filterCompletedInstants()
-                            .containsInstant(instant)) {
+            if (!metaClient
+                    .getActiveTimeline()
+                    .filterCompletedInstants()
+                    .containsInstant(instant)) {
                 throw new IOException(
-                        "Failed to commit empty Hudi instant "
+                        "Empty Hudi instant "
                                 + instant
-                                + ", ensure 'hoodie.allow.empty.commit' is not disabled.");
+                                + " was not completed, ensure 'hoodie.allow.empty.commit' is not "
+                                + "disabled.");
             }
             ckpMetadata.commitInstant(instant);
             LOG.info("Committed empty Hudi instant {} to persist tiering progress.", instant);

@@ -53,16 +53,7 @@ public class LanceDatasetAdapter {
         }
     }
 
-    /**
-     * @deprecated use {@link #commitFragments(LanceConfig, List, Map)} instead.
-     */
-    @Deprecated
     public static long commitAppend(
-            LanceConfig config, List<FragmentMetadata> fragments, Map<String, String> properties) {
-        return commitFragments(config, fragments, properties);
-    }
-
-    public static long commitFragments(
             LanceConfig config, List<FragmentMetadata> fragments, Map<String, String> properties) {
         String uri = config.getDatasetUri();
         ReadOptions options = LanceConfig.genReadOptionFromConfig(config);

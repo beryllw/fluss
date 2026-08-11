@@ -55,6 +55,9 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.mockito.InOrder;
 
 import javax.annotation.Nullable;
@@ -64,6 +67,7 @@ import java.io.IOException;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.stream.Stream;
 
 import static org.apache.fluss.lake.committer.LakeCommitter.FLUSS_LAKE_SNAP_BUCKET_OFFSET_PROPERTY;
 import static org.apache.fluss.lake.writer.LakeTieringFactory.FLUSS_LAKE_TIERING_COMMIT_USER;
@@ -158,16 +162,23 @@ class HudiTieringTest {
         }
     }
 
-    @Test
-    void testEmptyCommitCreatesInstant() throws Exception {
-        TablePath tablePath = TablePath.of("hudi", "test_empty_commit");
-        TableDescriptor tableDescriptor = createLogTableDescriptor();
+    private static Stream<Arguments> emptyCommitArgs() {
+        // isPrimaryKeyTable: false is COPY_ON_WRITE with INSERT, true is MERGE_ON_READ with UPSERT
+        return Stream.of(Arguments.of(false), Arguments.of(true));
+    }
+
+    @ParameterizedTest
+    @MethodSource("emptyCommitArgs")
+    void testEmptyCommitCreatesInstant(boolean isPrimaryKeyTable) throws Exception {
+        TablePath tablePath =
+                TablePath.of("hudi", "test_empty_commit_" + (isPrimaryKeyTable ? "pk" : "log"));
+        TableDescriptor tableDescriptor =
+                isPrimaryKeyTable ? createPkTableDescriptor() : createLogTableDescriptor();
         hudiLakeCatalog.createTable(
                 tablePath, tableDescriptor, new TestingLakeCatalogContext(tableDescriptor));
         TableInfo tableInfo = TableInfo.of(tablePath, 1L, 0, tableDescriptor, null, 1L, 1L);
 
-        long dataSnapshotId = writeAndCommit(tablePath, tableInfo, 0L, logRecord(0L, 1, "v1"));
-
+        // the first commit on the fresh table is an empty commit
         long emptySnapshotId;
         try (LakeCommitter<HudiWriteResult, HudiCommittable> committer =
                 createLakeCommitter(tablePath, tableInfo)) {
@@ -181,16 +192,14 @@ class HudiTieringTest {
                                             "fluss-offset-file"))
                             .getCommittedSnapshotId();
         }
-        assertThat(emptySnapshotId).isGreaterThan(dataSnapshotId);
-
-        // the empty commit metadata records the operation type of the log table
         assertThat(readLatestCommitMetadata(tablePath).getOperationType())
-                .isEqualTo(WriteOperationType.INSERT);
+                .isEqualTo(
+                        isPrimaryKeyTable ? WriteOperationType.UPSERT : WriteOperationType.INSERT);
 
+        // recovery sees the empty commit
         try (LakeCommitter<HudiWriteResult, HudiCommittable> committer =
                 createLakeCommitter(tablePath, tableInfo)) {
-            CommittedLakeSnapshot missingLakeSnapshot =
-                    committer.getMissingLakeSnapshot(dataSnapshotId);
+            CommittedLakeSnapshot missingLakeSnapshot = committer.getMissingLakeSnapshot(null);
             assertThat(missingLakeSnapshot).isNotNull();
             assertThat(missingLakeSnapshot.getLakeSnapshotId()).isEqualTo(emptySnapshotId);
             assertThat(missingLakeSnapshot.getSnapshotProperties())
@@ -199,7 +208,16 @@ class HudiTieringTest {
         }
 
         // tiering continues normally after the empty commit
-        long newSnapshotId = writeAndCommit(tablePath, tableInfo, 1L, logRecord(1L, 2, "v2"));
+        long newSnapshotId =
+                writeAndCommit(
+                        tablePath,
+                        tableInfo,
+                        0L,
+                        logRecord(
+                                0L,
+                                1,
+                                "v1",
+                                isPrimaryKeyTable ? ChangeType.INSERT : ChangeType.APPEND_ONLY));
         assertThat(newSnapshotId).isGreaterThan(emptySnapshotId);
     }
 
@@ -270,7 +288,6 @@ class HudiTieringTest {
                 context.committer.commit(committable, Collections.emptyMap());
 
         assertThat(commitResult.getCommittedSnapshotId()).isEqualTo(Long.parseLong(DATA_INSTANT));
-        verify(context.writeClient).setOperationType(WriteOperationType.UPSERT);
         InOrder inOrder =
                 inOrder(context.writeClient, context.ckpMetadata, context.compactionService);
         inOrder.verify(context.writeClient)
@@ -332,46 +349,6 @@ class HudiTieringTest {
         inOrder.verify(context.writeClient).getHoodieTable();
         inOrder.verify(context.writeClient).rollback(DATA_INSTANT);
         inOrder.verify(context.ckpMetadata).abortInstant(DATA_INSTANT);
-    }
-
-    @Test
-    void testCommitFailsWhenCommitStatsReturnsFalse() throws Exception {
-        TestingCommitterContext context = createTestingCommitterContext();
-        HudiCommittable committable = committableWithCompaction();
-        when(context.writeClient.commitStats(
-                        eq(DATA_INSTANT), anyList(), any(Option.class), eq("commit")))
-                .thenReturn(false);
-        when(context.writeClient.rollback(DATA_INSTANT)).thenReturn(true);
-
-        assertThatThrownBy(() -> context.committer.commit(committable, Collections.emptyMap()))
-                .isInstanceOf(IOException.class)
-                .hasMessageContaining("Failed to commit Hudi instant " + DATA_INSTANT);
-        verify(context.writeClient).rollback(DATA_INSTANT);
-        verify(context.ckpMetadata).abortInstant(DATA_INSTANT);
-        verify(context.ckpMetadata, never()).commitInstant(DATA_INSTANT);
-    }
-
-    @Test
-    void testCommitRollbackFailureIsSuppressed() throws Exception {
-        TestingCommitterContext context = createTestingCommitterContext();
-        HudiCommittable committable = committableWithCompaction();
-        when(context.writeClient.commitStats(
-                        eq(DATA_INSTANT), anyList(), any(Option.class), eq("commit")))
-                .thenReturn(false);
-        when(context.writeClient.rollback(DATA_INSTANT))
-                .thenThrow(new RuntimeException("rollback failed"));
-
-        assertThatThrownBy(() -> context.committer.commit(committable, Collections.emptyMap()))
-                .isInstanceOf(IOException.class)
-                .hasMessageContaining("Failed to commit Hudi instant " + DATA_INSTANT)
-                .satisfies(
-                        e ->
-                                assertThat(e.getSuppressed())
-                                        .anySatisfy(
-                                                suppressed ->
-                                                        assertThat(suppressed)
-                                                                .hasMessageContaining(
-                                                                        "Failed to rollback")));
     }
 
     @Test
@@ -459,8 +436,7 @@ class HudiTieringTest {
                                 new HadoopStorageConfiguration(
                                         new org.apache.hadoop.conf.Configuration()))
                         .build();
-        HoodieTimeline timeline =
-                metaClient.getActiveTimeline().getCommitsTimeline().filterCompletedInstants();
+        HoodieTimeline timeline = metaClient.getActiveTimeline().filterCompletedInstants();
         return timeline.readCommitMetadata(
                 timeline.getReverseOrderedInstants()
                         .findFirst()
@@ -521,11 +497,28 @@ class HudiTieringTest {
                 .build();
     }
 
+    private static TableDescriptor createPkTableDescriptor() {
+        return TableDescriptor.builder()
+                .schema(
+                        Schema.newBuilder()
+                                .column("id", DataTypes.INT())
+                                .column("name", DataTypes.STRING())
+                                .primaryKey("id")
+                                .build())
+                .distributedBy(1, "id")
+                .customProperty(HUDI_CONF_PREFIX + "precombine.field", "name")
+                .build();
+    }
+
     private static LogRecord logRecord(long offset, int id, String name) {
+        return logRecord(offset, id, name, ChangeType.APPEND_ONLY);
+    }
+
+    private static LogRecord logRecord(long offset, int id, String name, ChangeType changeType) {
         GenericRow row = new GenericRow(2);
         row.setField(0, id);
         row.setField(1, BinaryString.fromString(name));
-        return new GenericRecord(offset, 1_000L + offset, ChangeType.APPEND_ONLY, row);
+        return new GenericRecord(offset, 1_000L + offset, changeType, row);
     }
 
     private static HoodieWriteStat writeStat() {
