@@ -785,7 +785,8 @@ class TieringSourceEnumeratorTest extends TieringTestBase {
             Configuration flussConf,
             MockSplitEnumeratorContext<TieringSplit> context,
             LakeTieringFactory<?, ?> lakeTieringFactory) {
-        return new TieringSourceEnumerator(flussConf, context, lakeTieringFactory, 500);
+        return new TieringSourceEnumerator(
+                flussConf, new Configuration(), context, lakeTieringFactory, 500);
     }
 
     @Test
