@@ -246,7 +246,7 @@ class HudiTieringTest {
             HudiCommittable committable = committer.toCommittable(Collections.emptyList());
             assertThatThrownBy(() -> committer.commit(committable, Collections.emptyMap()))
                     .isInstanceOf(IOException.class)
-                    .hasMessageContaining("hoodie.allow.empty.commit");
+                    .hasMessageContaining("hudi.hoodie.allow.empty.commit");
             assertThat(committer.getMissingLakeSnapshot(null)).isNull();
         }
     }

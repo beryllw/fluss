@@ -32,6 +32,7 @@ import org.apache.hudi.common.model.WriteOperationType;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
 import org.apache.hudi.common.table.timeline.HoodieInstant;
 import org.apache.hudi.common.table.timeline.HoodieTimeline;
+import org.apache.hudi.common.util.CommitUtils;
 import org.apache.hudi.common.util.Option;
 import org.apache.hudi.configuration.FlinkOptions;
 import org.apache.hudi.exception.HoodieException;
@@ -243,7 +244,11 @@ public class HudiLakeCommitter implements LakeCommitter<HudiWriteResult, HudiCom
             // preTxn does not set the operation type on the write client, set it explicitly
             // so commitStats records it in the commit metadata
             writeClient.setOperationType(writeOperationType);
-            String commitActionType = metaClient.getCommitActionType();
+            // mirror HudiLakeWriter#initInstant to derive the action type from the operation
+            // and table type, e.g. delta commit for MERGE_ON_READ tables
+            String commitActionType =
+                    CommitUtils.getCommitActionType(
+                            writeOperationType, hudiTableInfo.getTableType());
             instant = writeClient.startCommit(commitActionType, metaClient);
             metaClient.getActiveTimeline().transitionRequestedToInflight(commitActionType, instant);
             writeClient.setWriteTimer(commitActionType);
@@ -268,8 +273,8 @@ public class HudiLakeCommitter implements LakeCommitter<HudiWriteResult, HudiCom
                 throw new IOException(
                         "Empty Hudi instant "
                                 + instant
-                                + " was not completed, ensure 'hoodie.allow.empty.commit' is not "
-                                + "disabled.");
+                                + " was not completed, ensure 'hudi.hoodie.allow.empty.commit' is "
+                                + "not disabled in the table properties.");
             }
             ckpMetadata.commitInstant(instant);
             LOG.info("Committed empty Hudi instant {} to persist tiering progress.", instant);
