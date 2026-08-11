@@ -52,6 +52,7 @@ import org.apache.arrow.vector.complex.FixedSizeListVector;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
@@ -89,6 +90,108 @@ class LanceTieringTest {
 
     private static Stream<Arguments> tieringWriteArgs() {
         return Stream.of(Arguments.of(false), Arguments.of(true));
+    }
+
+    @Test
+    void testEmptyCommitCreatesSnapshot() throws Exception {
+        TablePath tablePath = TablePath.of("lance", "empty_commit_table");
+        Map<String, String> customProperties = new HashMap<>();
+        customProperties.put(
+                "embedding" + LanceArrowUtils.FIXED_SIZE_LIST_SIZE_SUFFIX,
+                String.valueOf(EMBEDDING_LIST_SIZE));
+        LanceConfig config =
+                LanceConfig.from(
+                        configuration.toMap(),
+                        customProperties,
+                        tablePath.getDatabaseName(),
+                        tablePath.getTableName());
+        Schema schema = createTable(config, customProperties);
+        TableDescriptor descriptor =
+                TableDescriptor.builder()
+                        .schema(schema)
+                        .distributedBy(1)
+                        .property(ConfigOptions.TABLE_DATALAKE_ENABLED, true)
+                        .customProperties(customProperties)
+                        .build();
+        TableInfo tableInfo =
+                TableInfo.of(tablePath, 0, 1, descriptor, DEFAULT_REMOTE_DATA_DIR, 1L, 1L);
+
+        // normal commit as version 2 (a fresh lance dataset starts from version 1)
+        List<LogRecord> expectRecords;
+        try (LakeWriter<LanceWriteResult> lakeWriter =
+                createLakeWriter(tablePath, 0, null, tableInfo)) {
+            Tuple2<List<LogRecord>, List<LogRecord>> writeAndExpectRecords =
+                    genLogTableRecords(null, 0, 10);
+            for (LogRecord logRecord : writeAndExpectRecords.f0) {
+                lakeWriter.write(logRecord);
+            }
+            expectRecords = writeAndExpectRecords.f1;
+            try (LakeCommitter<LanceWriteResult, LanceCommittable> lakeCommitter =
+                    createLakeCommitter(tablePath, tableInfo)) {
+                long snapshotId =
+                        lakeCommitter
+                                .commit(
+                                        lakeCommitter.toCommittable(
+                                                Collections.singletonList(lakeWriter.complete())),
+                                        Collections.singletonMap(
+                                                FLUSS_LAKE_SNAP_BUCKET_OFFSET_PROPERTY, "offsets"))
+                                .getCommittedSnapshotId();
+                assertThat(snapshotId).isEqualTo(2);
+            }
+        }
+
+        // empty commit as version 3
+        try (LakeCommitter<LanceWriteResult, LanceCommittable> lakeCommitter =
+                createLakeCommitter(tablePath, tableInfo)) {
+            LanceCommittable committable = lakeCommitter.toCommittable(Collections.emptyList());
+            long snapshotId =
+                    lakeCommitter
+                            .commit(
+                                    committable,
+                                    Collections.singletonMap(
+                                            FLUSS_LAKE_SNAP_BUCKET_OFFSET_PROPERTY, "offsets-2"))
+                            .getCommittedSnapshotId();
+            assertThat(snapshotId).isEqualTo(3);
+
+            CommittedLakeSnapshot committedLakeSnapshot = lakeCommitter.getMissingLakeSnapshot(2L);
+            assertThat(committedLakeSnapshot).isNotNull();
+            assertThat(committedLakeSnapshot.getLakeSnapshotId()).isEqualTo(snapshotId);
+            assertThat(committedLakeSnapshot.getSnapshotProperties())
+                    .containsEntry(FLUSS_LAKE_SNAP_BUCKET_OFFSET_PROPERTY, "offsets-2");
+        }
+
+        // data written before the empty commit is untouched
+        try (Dataset dataset =
+                Dataset.open(
+                        new RootAllocator(),
+                        config.getDatasetUri(),
+                        LanceConfig.genReadOptionFromConfig(config))) {
+            ArrowReader reader = dataset.newScan().scanBatches();
+            VectorSchemaRoot readerRoot = reader.getVectorSchemaRoot();
+            reader.loadNextBatch();
+            verifyLogTableRecords(readerRoot, expectRecords);
+            assertThat(reader.loadNextBatch()).isFalse();
+        }
+
+        // tiering continues normally after the empty commit as version 4
+        try (LakeWriter<LanceWriteResult> lakeWriter =
+                createLakeWriter(tablePath, 0, null, tableInfo)) {
+            for (LogRecord logRecord : genLogTableRecords(null, 0, 10).f0) {
+                lakeWriter.write(logRecord);
+            }
+            try (LakeCommitter<LanceWriteResult, LanceCommittable> lakeCommitter =
+                    createLakeCommitter(tablePath, tableInfo)) {
+                long snapshotId =
+                        lakeCommitter
+                                .commit(
+                                        lakeCommitter.toCommittable(
+                                                Collections.singletonList(lakeWriter.complete())),
+                                        Collections.singletonMap(
+                                                FLUSS_LAKE_SNAP_BUCKET_OFFSET_PROPERTY, "offsets"))
+                                .getCommittedSnapshotId();
+                assertThat(snapshotId).isEqualTo(4);
+            }
+        }
     }
 
     @ParameterizedTest

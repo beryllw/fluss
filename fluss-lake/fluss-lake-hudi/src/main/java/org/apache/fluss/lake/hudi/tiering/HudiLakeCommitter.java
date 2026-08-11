@@ -29,6 +29,7 @@ import org.apache.hudi.client.HoodieFlinkWriteClient;
 import org.apache.hudi.common.model.HoodieCommitMetadata;
 import org.apache.hudi.common.model.HoodieTableType;
 import org.apache.hudi.common.model.WriteOperationType;
+import org.apache.hudi.common.table.HoodieTableMetaClient;
 import org.apache.hudi.common.table.timeline.HoodieInstant;
 import org.apache.hudi.common.table.timeline.HoodieTimeline;
 import org.apache.hudi.common.util.Option;
@@ -100,6 +101,11 @@ public class HudiLakeCommitter implements LakeCommitter<HudiWriteResult, HudiCom
             HudiCommittable committable, Map<String, String> snapshotProperties)
             throws IOException {
         Map<String, HudiWriteStats> writeStatsByInstant = committable.getWriteStats();
+        if (writeStatsByInstant.isEmpty() && committable.getCompactionWriteStats().isEmpty()) {
+            // no writer created in this round, commit an empty instant to persist the
+            // tiering progress (e.g. buckets only advanced offsets over empty WAL batches)
+            return commitEmptyInstant(snapshotProperties);
+        }
         if (writeStatsByInstant.size() != 1) {
             throw new IOException(
                     "Hudi write stats must contain exactly one instant, but got "
@@ -117,6 +123,11 @@ public class HudiLakeCommitter implements LakeCommitter<HudiWriteResult, HudiCom
         try {
             validateWriteStats(instant, writeStats);
 
+            // the committer's write client never executed a write operation, set the operation
+            // type explicitly so commitStats records it in the commit metadata
+            writeClient.setOperationType(
+                    WriteOperationType.fromValue(
+                            hudiTableInfo.getFlinkConfig().get(FlinkOptions.OPERATION)));
             LOG.info(
                     "Committing Hudi instant {} with {} write stat entries and metadata {}.",
                     instant,
@@ -218,6 +229,68 @@ public class HudiLakeCommitter implements LakeCommitter<HudiWriteResult, HudiCom
     public void close() throws Exception {
         IOUtils.closeQuietly(ckpMetadata, "hudi checkpoint metadata");
         IOUtils.closeQuietly(hudiTableInfo, "hudi table info");
+    }
+
+    private LakeCommitResult commitEmptyInstant(Map<String, String> snapshotProperties)
+            throws IOException {
+        Map<String, String> commitMetadata = new HashMap<>(snapshotProperties);
+        commitMetadata.put(COMMITTER_USER, FLUSS_LAKE_TIERING_COMMIT_USER);
+
+        String instant = null;
+        try {
+            // mirror the instant lifecycle of HudiLakeWriter#initInstant
+            HoodieTableMetaClient metaClient = hudiTableInfo.getMetaClient();
+            metaClient.reloadActiveTimeline();
+            WriteOperationType writeOperationType =
+                    WriteOperationType.fromValue(
+                            hudiTableInfo.getFlinkConfig().get(FlinkOptions.OPERATION));
+            writeClient.preTxn(writeOperationType, metaClient);
+            // preTxn does not set the operation type on the write client, set it explicitly
+            // so commitStats records it in the commit metadata
+            writeClient.setOperationType(writeOperationType);
+            String commitActionType = metaClient.getCommitActionType();
+            instant = writeClient.startCommit(commitActionType, metaClient);
+            metaClient.getActiveTimeline().transitionRequestedToInflight(commitActionType, instant);
+            writeClient.setWriteTimer(commitActionType);
+            ckpMetadata.startInstant(instant);
+
+            boolean committed =
+                    writeClient.commitStats(
+                            instant,
+                            Collections.emptyList(),
+                            Option.of(commitMetadata),
+                            commitActionType);
+            // with hoodie.allow.empty.commit=false Hudi may return true without creating a
+            // completed instant, verify the timeline to avoid reporting a non-existent snapshot
+            metaClient.reloadActiveTimeline();
+            if (!committed
+                    || !metaClient
+                            .getActiveTimeline()
+                            .filterCompletedInstants()
+                            .containsInstant(instant)) {
+                throw new IOException(
+                        "Failed to commit empty Hudi instant "
+                                + instant
+                                + ", ensure 'hoodie.allow.empty.commit' is not disabled.");
+            }
+            ckpMetadata.commitInstant(instant);
+            LOG.info("Committed empty Hudi instant {} to persist tiering progress.", instant);
+            return LakeCommitResult.committedIsReadable(parseSnapshotId(instant));
+        } catch (Exception e) {
+            IOException failure =
+                    e instanceof IOException
+                            ? (IOException) e
+                            : new IOException(
+                                    "Failed to commit empty Hudi instant " + instant + ".", e);
+            if (instant != null) {
+                try {
+                    abortInstant(instant);
+                } catch (IOException abortFailure) {
+                    failure.addSuppressed(abortFailure);
+                }
+            }
+            throw failure;
+        }
     }
 
     private void commitCompactionAndSchedule(Map<String, HudiWriteStats> compactionWriteStats)
