@@ -24,6 +24,10 @@
 //! Gated behind `integration_tests` because it needs Docker. The CI gate runs it with
 //! `cargo test --features integration_tests --test e2e_harness` and fails loudly when the fixture
 //! cannot start — a selected scenario must never skip silently.
+//!
+//! TODO: once the gateway connects to Fluss, move its integration suites onto the server image that
+//! `client-integration.yml` builds from the current source tree, so they verify the gateway against
+//! this revision of the server rather than only against a released fixture image.
 
 use fluss_test_cluster::FlussTestingClusterBuilder;
 use std::net::TcpStream;
