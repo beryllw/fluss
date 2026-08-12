@@ -89,11 +89,12 @@ impl ConfigDuration {
         let value: u64 = digits
             .parse()
             .map_err(|e| format!("invalid duration {s:?}: {e}"))?;
+        let overflow = || format!("invalid duration {s:?}: value is too large");
         let duration = match unit {
             "ms" => Duration::from_millis(value),
             "s" => Duration::from_secs(value),
-            "m" => Duration::from_secs(value.saturating_mul(60)),
-            "h" => Duration::from_secs(value.saturating_mul(3600)),
+            "m" => Duration::from_secs(value.checked_mul(60).ok_or_else(overflow)?),
+            "h" => Duration::from_secs(value.checked_mul(3600).ok_or_else(overflow)?),
             _ => {
                 return Err(format!(
                     "invalid duration {s:?}: unit must be one of ms, s, m, h"
@@ -885,6 +886,14 @@ gateway.metrics.enabled: true
                 "{bad}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn overflowing_duration_is_rejected_rather_than_saturated() {
+        // A syntactically valid but astronomically large duration must be refused at parse time,
+        // not silently clamped, so it can never reach an `Instant + Duration` overflow at runtime.
+        let error = ConfigDuration::parse("18446744073709551615h").unwrap_err();
+        assert!(error.contains("too large"), "got: {error}");
     }
 
     #[test]

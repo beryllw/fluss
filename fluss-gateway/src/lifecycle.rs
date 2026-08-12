@@ -160,7 +160,11 @@ impl RunningGateway {
 
 /// Splits one process deadline into request draining and a bounded resource-cleanup tail.
 fn shutdown_deadlines(started: Instant, timeout: Duration) -> (Instant, Instant) {
-    let deadline = started + timeout;
+    // Configuration rejects overflowing durations, so this is defence in depth: an instant that
+    // cannot represent `started + timeout` falls back to a one-hour drain rather than panicking.
+    let deadline = started
+        .checked_add(timeout)
+        .unwrap_or_else(|| started + Duration::from_secs(3600));
     let minimum_reserve = Duration::from_millis(1).min(timeout);
     let cleanup_reserve = (timeout / 4)
         .max(minimum_reserve)

@@ -128,8 +128,39 @@ jobs:
       - name: OpenAPI external validation
         run: npx --yes @redocly/cli@1 lint openapi.yaml
 
-  gateway-e2e:
-    name: "Gateway E2E (fixed-version cluster)"
+  gateway-msrv:
+    name: "Gateway MSRV (1.88)"
+    # The rust-toolchain.toml floats to stable, so a plain build never catches use of features newer
+    # than the declared rust-version. Pin the MSRV explicitly here; `+toolchain` overrides the file.
+    timeout-minutes: 60
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: fluss-gateway
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install the MSRV toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: fluss-gateway
+
+      - name: Check on the declared MSRV
+        run: cargo +1.88.0 check --all-targets
+
+  gateway-harness-self-test:
+    name: "Gateway harness self-test (fixed-version cluster)"
+    # This proves the fixed-version Fluss fixture starts and is reachable, the shared harness later
+    # capabilities reuse. It does not start the Gateway or drive Fluss through it: the Gateway-to-Fluss
+    # integration is covered by the authentication/backend issue that first connects to Fluss.
     timeout-minutes: 30
     runs-on: ubuntu-latest
     defaults:
@@ -150,13 +181,13 @@ jobs:
 
       # A selected scenario must exist: an empty test list means the suite was compiled away,
       # which is a silent skip and therefore a failure.
-      - name: Assert the E2E scenarios are selected
+      - name: Assert the harness scenarios are selected
         run: |
           count=$(cargo test --features integration_tests --test e2e_harness -- --list 2>/dev/null | grep -c ': test$')
           echo "selected scenarios: $count"
           test "$count" -ge 1
 
-      - name: Run the E2E suite
+      - name: Run the harness self-test
         run: cargo test --features integration_tests --test e2e_harness
         env:
           RUST_LOG: DEBUG
