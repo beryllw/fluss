@@ -15,20 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Stateless REST gateway for Apache Fluss.
-//!
-//! [`protocol::rest`] serves the HTTP surface — routing, JSON decoding, and the cross-cutting
-//! middleware — and [`lifecycle`] owns startup, readiness, background tasks, and graceful shutdown.
-//!
-//! # Statelessness contract
-//!
-//! The gateway keeps **no** request-spanning state. There is no session store, no cursor store, and no replay
-//! cache — deliberately, there is not even a `store` module for one to be added to. Every response is derivable
-//! from the request plus current cluster state, so any instance can serve any request and instances can be added
-//! or removed freely behind a plain load balancer.
+//! The gateway's REST API surface.
 
-pub mod config;
-pub mod error;
-pub mod lifecycle;
-pub mod observability;
-pub mod protocol;
+pub mod rest;

@@ -1,0 +1,133 @@
+components:
+  schemas:
+    ErrorBody:
+      description: Body of the shared error envelope.
+      properties:
+        code:
+          $ref: '#/components/schemas/ErrorCode'
+        details:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/ErrorDetailsSchema'
+        message:
+          type: string
+        request_id:
+          format: uuid
+          type: string
+        retryable:
+          description: Whether repeating an otherwise unchanged request may succeed.
+          type: boolean
+      required:
+      - code
+      - message
+      - request_id
+      - retryable
+      type: object
+    ErrorCode:
+      description: |-
+        Stable error codes of the gateway: the FIP-49 vocabulary, resource-specific where the error
+        names a resource, exactly as serialized on the wire.
+      enum:
+      - invalid_argument
+      - unauthenticated
+      - unauthorized
+      - not_found
+      - cluster_not_found
+      - database_not_found
+      - table_not_found
+      - partition_not_found
+      - already_exists
+      - cluster_already_exists
+      - database_already_exists
+      - table_already_exists
+      - partition_already_exists
+      - failed_precondition
+      - database_not_empty
+      - unsupported
+      - unsupported_media_type
+      - not_acceptable
+      - limit_exceeded
+      - resource_exhausted
+      - timeout
+      - cancelled
+      - unavailable
+      - backend
+      - internal
+      - storage_backpressure
+      type: string
+    ErrorDetailsSchema:
+      description: Machine-readable resource context carried by resource-naming errors.
+      properties:
+        resource_kind:
+          type:
+          - string
+          - 'null'
+        resource_name:
+          type:
+          - string
+          - 'null'
+      type: object
+    ErrorEnvelope:
+      description: The envelope every failing response uses.
+      examples:
+      - error:
+          code: table_not_found
+          details:
+            resource_kind: table
+          message: table does not exist
+          request_id: 8f6c7f4a-f9b8-4c71-91ec-6e5578d7a913
+          retryable: false
+      properties:
+        error:
+          $ref: '#/components/schemas/ErrorBody'
+      required:
+      - error
+      type: object
+    HealthResponse:
+      description: 'Response of `GET /health` (FIP-49): liveness plus process uptime.'
+      properties:
+        status:
+          type: string
+        uptime_ms:
+          description: Milliseconds since the gateway process started.
+          format: int64
+          minimum: 0
+          type: integer
+      required:
+      - status
+      - uptime_ms
+      type: object
+info:
+  description: Stateless REST gateway for Apache Fluss
+  license:
+    name: Apache-2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
+  title: fluss-gateway
+  version: 1.0.0
+openapi: 3.1.0
+paths:
+  /health:
+    get:
+      operationId: getHealth
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+          description: Gateway liveness and uptime
+      summary: 'The FIP-49 health summary: `{status, uptime_ms}`, always 200 while the process answers.'
+      tags:
+      - health
+  /v1/openapi.json:
+    get:
+      operationId: getOpenApi
+      responses:
+        '200':
+          description: OpenAPI 3.1 document
+      summary: Serves the generated OpenAPI 3.1 document as JSON.
+      tags:
+      - metadata
+security: []
+servers:
+- url: /

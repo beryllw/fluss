@@ -15,22 +15,21 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# The gateway is its own Cargo workspace and deliberately stays out of the
-# workspace rooted at ../fluss-rust so that gateway dependencies never touch
-# that workspace's lock file or its generated dependency inventories.
+# The gateway is its own Cargo workspace. It depends on the Rust client by
+# path but deliberately stays out of the workspace rooted at ../fluss-rust so
+# that gateway dependencies never touch that workspace's lock file or its
+# generated dependency inventories.
 [workspace]
-resolver = "3"
+resolver = "2"
 
 [package]
 name = "fluss-gateway"
 edition = "2024"
 version = "1.0.0"
 license = "Apache-2.0"
-# Keep in sync with the `gateway-msrv` CI job, which pins this exact toolchain.
-rust-version = "1.88"
+rust-version = "1.85"
 authors = ["Apache Fluss <dev@fluss.apache.org>"]
 repository = "https://github.com/apache/fluss"
-# The gateway ships as an executable, not a library on crates.io.
 publish = false
 description = "Stateless REST gateway for Apache Fluss"
 
@@ -38,11 +37,50 @@ description = "Stateless REST gateway for Apache Fluss"
 name = "fluss-gateway"
 path = "src/main.rs"
 
-# Internal testability boundary for the executable; this is not a published or supported Rust SDK.
 [lib]
 name = "fluss_gateway"
 
-# This change only introduces the module scaffolding: manifest, toolchain, lint
-# and license configuration, and placeholder targets, with no dependencies.
-# The runtime (configuration, lifecycle, HTTP layer, and tests) arrives with
-# the Gateway foundation change (FIP-49) and brings its dependencies with it.
+[features]
+# Compiles the end-to-end suites in tests/, which start a dockerized Fluss
+# cluster. Mirrors the `integration_tests` feature of the fluss-rs crate and
+# is never enabled by default.
+integration_tests = []
+
+[dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "matched-path", "tokio"] }
+clap = { version = "4.5.37", features = ["derive"] }
+toml = "0.8"
+futures = "0.3"
+# Process CPU/RSS/fd sampling for the FIP-49 process_* metric families.
+libc = "0.2"
+log = "0.4"
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.17", default-features = false }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# The shared query-string parser of the REST layer (`parse_query`).
+serde_urlencoded = "0.7"
+# The gateway.yaml configuration file is YAML with flat dotted keys (FIP-49).
+serde_yaml = "0.9"
+tokio = { version = "1.44.2", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+utoipa = { version = "5", features = ["axum_extras"] }
+utoipa-axum = "0.2"
+uuid = { version = "1.10", features = ["v4"] }
+
+[dev-dependencies]
+fluss-test-cluster = { path = "../fluss-rust/crates/fluss-test-cluster" }
+http-body-util = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "blocking"] }
+tempfile = "3"
+tokio = { version = "1.44.2", features = ["full", "test-util"] }
+tower = { version = "0.5", features = ["util"] }
+
+[[test]]
+name = "http_api"
+
+[[test]]
+name = "process"
+
+[[test]]
+name = "e2e_harness"

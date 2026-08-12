@@ -26,9 +26,13 @@ build:
 build-release:
     cargo build --release
 
-# Run all tests of the gateway.
+# Run all unit and protocol tests of the gateway.
 test:
     cargo test --all-targets
+
+# Run the end-to-end suite against a dockerized Fluss cluster. Requires Docker.
+test-e2e:
+    cargo test --features integration_tests --test e2e_harness
 
 # Format the gateway sources in place.
 fmt:
@@ -46,10 +50,18 @@ clippy:
 doc:
     RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 
-# Run the gateway binary, forwarding any flags, e.g. just run --version
+# Regenerate the checked-in OpenAPI 3.1 document from the typed contract.
+openapi:
+    cargo test --lib protocol::rest::openapi::tests::export_checked_in_document -- --ignored --exact
+
+# Run the gateway binary, forwarding any flags, e.g. just run --config gateway.yaml
 run *flags:
     cargo run -- {{flags}}
 
 # Check that every dependency license is compatible with the Apache License.
 licenses:
     cargo deny check licenses
+
+# Regenerate the checked-in dependency license inventory.
+deps:
+    cargo deny list -f tsv -t 0.6 > DEPENDENCIES.rust.tsv
