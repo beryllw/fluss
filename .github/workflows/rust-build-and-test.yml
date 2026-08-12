@@ -28,6 +28,7 @@ on:
       - 'fluss-rust/rust-toolchain.toml'
       - 'fluss-rust/.cargo/**'
       - 'fluss-rpc/src/main/proto/**'
+      - 'fluss-gateway/**'
       - '.github/workflows/rust-build-and-test.yml'
   pull_request:
     branches:
@@ -39,6 +40,7 @@ on:
       - 'fluss-rust/rust-toolchain.toml'
       - 'fluss-rust/.cargo/**'
       - 'fluss-rpc/src/main/proto/**'
+      - 'fluss-gateway/**'
       - '.github/workflows/rust-build-and-test.yml'
   workflow_dispatch:
 
@@ -77,6 +79,85 @@ jobs:
 
       - name: Unit Test
         run: cargo test --all-targets --workspace --exclude fluss_python --exclude fluss-cpp --exclude fluss_nif
+        env:
+          RUST_LOG: DEBUG
+          RUST_BACKTRACE: full
+
+  gateway-build-and-unit-test:
+    name: "Gateway Build and Tests"
+    timeout-minutes: 60
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+    # fluss-gateway is its own Cargo workspace, so this job must override the
+    # workflow-level fluss-rust working directory. Without this it would silently
+    # build the client workspace and pass without testing the gateway at all.
+    defaults:
+      run:
+        working-directory: fluss-gateway
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: fluss-gateway
+
+      - name: Build
+        run: cargo build --all-targets
+
+      - name: Unit Test
+        run: cargo test --all-targets
+        env:
+          RUST_LOG: DEBUG
+          RUST_BACKTRACE: full
+
+      - name: OpenAPI drift check
+        run: |
+          cargo test --lib protocol::rest::openapi::tests::export_checked_in_document -- --ignored --exact
+          git diff --exit-code openapi.yaml
+
+      - name: OpenAPI external validation
+        run: npx --yes @redocly/cli@1 lint openapi.yaml
+
+  gateway-e2e:
+    name: "Gateway E2E (fixed-version cluster)"
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: fluss-gateway
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: fluss-gateway
+
+      # A selected scenario must exist: an empty test list means the suite was compiled away,
+      # which is a silent skip and therefore a failure.
+      - name: Assert the E2E scenarios are selected
+        run: |
+          count=$(cargo test --features integration_tests --test e2e_harness -- --list 2>/dev/null | grep -c ': test$')
+          echo "selected scenarios: $count"
+          test "$count" -ge 1
+
+      - name: Run the E2E suite
+        run: cargo test --features integration_tests --test e2e_harness
         env:
           RUST_LOG: DEBUG
           RUST_BACKTRACE: full

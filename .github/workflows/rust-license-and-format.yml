@@ -31,6 +31,7 @@ on:
       - 'fluss-rust/rustfmt.toml'
       - 'fluss-rust/rust-toolchain.toml'
       - 'fluss-rpc/src/main/proto/**'
+      - 'fluss-gateway/**'
       - '.github/workflows/rust-license-and-format.yml'
   pull_request:
     branches:
@@ -45,6 +46,7 @@ on:
       - 'fluss-rust/rustfmt.toml'
       - 'fluss-rust/rust-toolchain.toml'
       - 'fluss-rpc/src/main/proto/**'
+      - 'fluss-gateway/**'
       - '.github/workflows/rust-license-and-format.yml'
   workflow_dispatch:
 
@@ -94,5 +96,52 @@ jobs:
       - name: Rustdoc
         # fluss_python is excluded: its [lib] name = "fluss" collides with fluss-rs
         run: cargo doc --workspace --no-deps --exclude fluss_python
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  gateway-check-license-and-formatting:
+    name: "Gateway License and Formatting Check"
+    runs-on: ubuntu-latest
+    # fluss-gateway is its own Cargo workspace, so this job must override the
+    # workflow-level fluss-rust working directory. Without this it would silently
+    # lint the client workspace and pass without checking the gateway at all.
+    # `uses:` step inputs stay relative to the repository root.
+    defaults:
+      run:
+        working-directory: fluss-gateway
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check License Header
+        uses: apache/skywalking-eyes/header@61275cc80d0798a405cb070f7d3a8aaf7cf2c2c1 # v0.8.0
+        with:
+          config: fluss-gateway/.licenserc.yaml
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.14.22
+
+      - name: Check dependency licenses (Apache-compatible)
+        run: cargo deny check licenses
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: fluss-gateway
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Rustdoc
+        run: cargo doc --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
