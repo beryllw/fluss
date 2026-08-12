@@ -597,17 +597,15 @@ class PaimonPartitionMarkDoneTest {
     }
 
     @Test
-    void testInvalidFormatterDisablesMarkDoneAndCarriesStateForward() throws Exception {
+    void testInvalidFormatterDisablesMarkDoneAndRecoversByColdStart() throws Exception {
         TablePath tablePath = TablePath.of(DATABASE, "test_mark_done_invalid_formatter");
         createPaimonTable(tablePath, Collections.emptyMap());
         TableInfo tableInfo = markDoneTableInfo(tablePath, false);
 
-        long snapshot1 = writeAndCommit(tablePath, tableInfo, "2024-01-01");
-        String stateJson =
-                getSnapshotProperties(tablePath, snapshot1).get(MARK_DONE_STATE_PROPERTY);
+        writeAndCommit(tablePath, tableInfo, "2024-01-01");
 
         // an invalid formatter syntax disables mark-done as a whole instead of draining the
-        // pending set partition by partition; data commits carry the old state forward
+        // pending set partition by partition; the data commit still succeeds without state
         TableInfo invalidFormatter =
                 TableInfo.of(
                         tablePath,
@@ -623,15 +621,16 @@ class PaimonPartitionMarkDoneTest {
                         1L);
         long snapshot2 = writeAndCommit(tablePath, invalidFormatter, "2024-01-02");
         assertThat(getSnapshotProperties(tablePath, snapshot2))
-                .containsEntry(MARK_DONE_STATE_PROPERTY, stateJson);
+                .doesNotContainKey(MARK_DONE_STATE_PROPERTY);
 
-        // once the formatter is fixed, mark-done resumes from the carried state
+        // once the formatter is fixed, cold start recovers all live partitions
         Thread.sleep(50);
         try (LakeCommitter<PaimonWriteResult, PaimonCommittable> lakeCommitter =
                 createLakeCommitter(tablePath, tableInfo)) {
             assertThat(commitMarkDoneMaintenance(lakeCommitter, "offsets-3")).isNotNull();
         }
         assertThat(successFile(tablePath, "2024-01-01")).exists();
+        assertThat(successFile(tablePath, "2024-01-02")).exists();
     }
 
     @Test
@@ -740,8 +739,13 @@ class PaimonPartitionMarkDoneTest {
         pending.put("20240101", 1234L);
         pending.put("2024-01-02", -1L);
         MarkDoneState state = new MarkDoneState(true, pending);
-        assertThat(MarkDoneStateJsonSerde.fromJson(MarkDoneStateJsonSerde.toJson(state)))
-                .isEqualTo(state);
+        int stateHashCode = state.hashCode();
+        String stateJson = MarkDoneStateJsonSerde.toJson(state);
+        pending.clear();
+        assertThat(state.getPendingPartitions()).hasSize(2);
+        assertThat(state.hashCode()).isEqualTo(stateHashCode);
+        assertThat(MarkDoneStateJsonSerde.toJson(state)).isEqualTo(stateJson);
+        assertThat(MarkDoneStateJsonSerde.fromJson(stateJson)).isEqualTo(state);
 
         // missing fields fall back to defaults, unknown fields are ignored
         assertThat(MarkDoneStateJsonSerde.fromJson("{}")).isEqualTo(MarkDoneState.empty());
