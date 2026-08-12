@@ -709,6 +709,8 @@ class PaimonTieringITCase extends FlinkPaimonTieringTestBase {
 
             // late data: tiering still works after the properties-only snapshot, and the
             // partition is re-tracked then marked done again
+            long snapshotBeforeLateData = table.snapshotManager().latestSnapshot().id();
+            assertThat(successFile.delete()).isTrue();
             writeRows(
                     tablePath,
                     Arrays.asList(row(4, "v4", partition), row(5, "v5", partition)),
@@ -719,10 +721,15 @@ class PaimonTieringITCase extends FlinkPaimonTieringTestBase {
                     () -> {
                         Snapshot snapshot = table.snapshotManager().latestSnapshot();
                         assertThat(snapshot).isNotNull();
+                        assertThat(snapshot.id()).isGreaterThan(snapshotBeforeLateData);
+                        assertThat(snapshot.properties()).containsKey(MARK_DONE_STATE_PROPERTY);
                         MarkDoneState state =
                                 MarkDoneStateJsonSerde.fromJson(
                                         snapshot.properties().get(MARK_DONE_STATE_PROPERTY));
                         assertThat(state.getPendingPartitions()).isEmpty();
+                        assertThat(successFile).exists();
+                        assertThat(admin.getLatestLakeSnapshot(tablePath).get().getSnapshotId())
+                                .isEqualTo(snapshot.id());
                     });
         } finally {
             jobClient.cancel().get();

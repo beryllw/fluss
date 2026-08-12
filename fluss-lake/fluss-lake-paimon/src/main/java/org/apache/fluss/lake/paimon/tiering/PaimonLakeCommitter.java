@@ -73,9 +73,6 @@ public class PaimonLakeCommitter
     private final long tableId;
     private final Configuration flussClientConfig;
     @Nullable private final PaimonPartitionMarkDone partitionMarkDone;
-    // mark-done is configured but its initialization failed: data commits keep carrying the
-    // previous state forward so it survives until the configuration is fixed
-    private final boolean carryForwardMarkDoneState;
     private TableCommitImpl tableCommit;
 
     private static final ThreadLocal<Long> currentCommitSnapshotId = new ThreadLocal<>();
@@ -98,7 +95,6 @@ public class PaimonLakeCommitter
                                         .lakeTieringConfig()
                                         .get(ConfigOptions.LAKE_TIERING_AUTO_EXPIRE_SNAPSHOT));
         PaimonPartitionMarkDone partitionMarkDone = null;
-        boolean carryForwardMarkDoneState = false;
         if (committerInitContext
                         .lakeTieringConfig()
                         .get(ConfigOptions.LAKE_TIERING_PARTITION_MARK_DONE_ENABLED)
@@ -115,11 +111,9 @@ public class PaimonLakeCommitter
                                 + "partition mark-done is disabled.",
                         tablePath,
                         e);
-                carryForwardMarkDoneState = true;
             }
         }
         this.partitionMarkDone = partitionMarkDone;
-        this.carryForwardMarkDoneState = carryForwardMarkDoneState;
     }
 
     @Override
@@ -142,8 +136,6 @@ public class PaimonLakeCommitter
         try {
             if (partitionMarkDone != null) {
                 runPartitionMarkDone(manifestCommittable);
-            } else if (carryForwardMarkDoneState) {
-                attachPreviousMarkDoneState(manifestCommittable);
             }
 
             long committedSnapshotId = commitManifest(manifestCommittable);
@@ -219,23 +211,6 @@ public class PaimonLakeCommitter
         if (stateJson != null) {
             manifestCommittable.addProperty(
                     PaimonPartitionMarkDone.MARK_DONE_STATE_PROPERTY, stateJson);
-        }
-    }
-
-    /** Carries the previous state forward unchanged while mark-done is disabled by a failure. */
-    private void attachPreviousMarkDoneState(ManifestCommittable manifestCommittable) {
-        try {
-            String stateJson = getLatestMarkDoneStateJson();
-            if (stateJson != null) {
-                manifestCommittable.addProperty(
-                        PaimonPartitionMarkDone.MARK_DONE_STATE_PROPERTY, stateJson);
-            }
-        } catch (Exception e) {
-            LOG.warn(
-                    "Failed to carry the mark-done state of table {} forward, zero-file "
-                            + "pending partitions may be lost in the cold-start recovery.",
-                    tablePath,
-                    e);
         }
     }
 

@@ -132,6 +132,19 @@ public class TieringSourceEnumerator
 
     public TieringSourceEnumerator(
             Configuration flussConf,
+            SplitEnumeratorContext<TieringSplit> context,
+            LakeTieringFactory<?, ?> lakeTieringFactory,
+            long pollTieringTableIntervalMs) {
+        this(
+                flussConf,
+                new Configuration(),
+                context,
+                lakeTieringFactory,
+                pollTieringTableIntervalMs);
+    }
+
+    public TieringSourceEnumerator(
+            Configuration flussConf,
             Configuration lakeTieringConfig,
             SplitEnumeratorContext<TieringSplit> context,
             LakeTieringFactory<?, ?> lakeTieringFactory,
