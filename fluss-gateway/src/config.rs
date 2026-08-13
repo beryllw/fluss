@@ -15,57 +15,35 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Gateway configuration for the REST service.
+//! Gateway configuration loaded with precedence CLI > environment > YAML file > defaults.
 //!
-//! One `gateway.yaml` file plus complete env overrides plus targeted CLI overrides. Precedence:
-//! CLI > env > file > defaults. Parsing is strict: unknown keys (file or env) are rejected, durations must be
-//! `<int><ms|s|m|h>`, byte sizes are plain integers or `<int><B|KB|KiB|MB|MiB|GB|GiB>`, and both reject zero.
-//!
-//! # Schema shape
-//!
-//! The file is YAML whose top level is a mapping of **flat dotted keys**, exactly as documented by FIP-49
-//! §Gateway Configuration and aligned with the Fluss `server.yaml` convention:
+//! YAML uses the flat dotted keys documented by FIP-49:
 //!
 //! ```yaml
 //! gateway.rest.listen: 0.0.0.0:8080
 //! gateway.rest.write.max-request-bytes: 32MiB
 //! ```
 //!
-//! Keys named by the FIP keep their FIP spelling; internal keys the FIP does not cover (shutdown draining)
-//! follow the same `gateway.<area>.<kebab-key>` style. Each flat key is
-//! translated to a field of the typed sections below before deserialization, so `deny_unknown_fields` stays
-//! meaningful per subsystem and an unrecognised flat key is rejected with the exact name the operator wrote.
-//! This supersedes the earlier sectioned TOML schema by explicit user decision: the REST contract and the
-//! configuration surface should quote one vocabulary, the FIP's.
-//!
-//! There is deliberately **no TLS section**: transport
-//! security terminates at a fronting proxy.
-//!
-//! Env override convention (unchanged): `FLUSS_GATEWAY__<SECTION>__<KEY>`, with `__` separating path
-//! components of the *internal* sections. For example, `FLUSS_GATEWAY__SERVER_REST__BIND_ADDRESS` overrides
-//! the REST listener.
+//! Environment variable names are derived from these public keys; for example,
+//! `gateway.rest.listen` becomes `FLUSS_GATEWAY__REST__LISTEN`.
 
 use serde::Deserialize;
 use serde::de::{self, Deserializer};
+use serde_yaml_ng::{Mapping, Value};
 use std::collections::BTreeMap;
 use std::fmt;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::time::Duration;
-use toml::Value;
 
 /// Environment variable prefix for overrides.
 pub const ENV_PREFIX: &str = "FLUSS_GATEWAY__";
 
-/// A strictly parsed duration: `<integer><ms|s|m|h>` (e.g. `"60s"`, `"15m"`). No floats, no whitespace, no
-/// compound values. Deserialization rejects zero because every configured duration is a deadline or an interval,
-/// and rejects anything above [`MAX_CONFIG_DURATION`] because such a value is a configuration mistake that would
-/// otherwise overflow the instant arithmetic every deadline performs.
+/// A duration written as `<integer><ms|s|m|h>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConfigDuration(Duration);
 
-/// The upper bound of any configured duration: one year, far beyond any meaningful gateway deadline or
-/// interval, and small enough that adding it to an [`std::time::Instant`] can never overflow.
+/// Maximum configured duration, bounded to keep deadline arithmetic safe.
 pub const MAX_CONFIG_DURATION: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
 impl ConfigDuration {
@@ -129,9 +107,7 @@ impl<'de> Deserialize<'de> for ConfigDuration {
     }
 }
 
-/// A strictly parsed byte size: a plain integer, or an integer with one of the suffixes `B`, `KB`, `KiB`, `MB`,
-/// `MiB`, `GB`, `GiB` (e.g. `4194304` or `"4MiB"`). Deserialization rejects zero because every configured size is
-/// a budget that must admit at least one byte.
+/// A positive byte size with an optional decimal or binary unit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ByteSize(u64);
 
@@ -175,13 +151,11 @@ impl ByteSize {
         Self::checked(bytes).ok_or_else(|| format!("invalid byte size {s:?}: must be non-zero"))
     }
 
-    /// Returns the size unless it is zero.
     fn checked(bytes: u64) -> Option<Self> {
         (bytes != 0).then_some(Self(bytes))
     }
 }
 
-/// Splits a strictly formatted numeric value from its optional unit suffix.
 fn split_number_and_unit(value: &str) -> (&str, &str) {
     let split = value
         .char_indices()
@@ -218,7 +192,59 @@ impl<'de> Deserialize<'de> for ByteSize {
     }
 }
 
-/// `[server]` table.
+const INSTANCE_ID_KEY: &str = "gateway.instance-id";
+const REST_LISTEN_KEY: &str = "gateway.rest.listen";
+const REST_REQUEST_TIMEOUT_KEY: &str = "gateway.rest.write.request-timeout";
+const REST_MAX_REQUEST_BYTES_KEY: &str = "gateway.rest.write.max-request-bytes";
+const METRICS_ENABLED_KEY: &str = "gateway.metrics.enabled";
+const METRICS_LISTEN_KEY: &str = "gateway.metrics.exporter.prometheus.listen";
+const SHUTDOWN_DRAIN_TIMEOUT_KEY: &str = "gateway.shutdown.drain-timeout";
+
+const DEFAULT_REST_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
+const DEFAULT_REST_REQUEST_TIMEOUT: ConfigDuration = ConfigDuration::from_secs(30);
+const DEFAULT_REST_MAX_REQUEST_BYTES: ByteSize = ByteSize::new(32 * 1024 * 1024);
+const DEFAULT_METRICS_ENABLED: bool = true;
+const DEFAULT_METRICS_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9095);
+const DEFAULT_SHUTDOWN_DRAIN_TIMEOUT: ConfigDuration = ConfigDuration::from_secs(30);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ConfigEntry {
+    key: &'static str,
+    internal_path: &'static str,
+}
+
+const CONFIG_ENTRIES: &[ConfigEntry] = &[
+    ConfigEntry {
+        key: INSTANCE_ID_KEY,
+        internal_path: "server.instance_id",
+    },
+    ConfigEntry {
+        key: REST_LISTEN_KEY,
+        internal_path: "server.rest.bind_address",
+    },
+    ConfigEntry {
+        key: REST_REQUEST_TIMEOUT_KEY,
+        internal_path: "server.rest.request_timeout",
+    },
+    ConfigEntry {
+        key: REST_MAX_REQUEST_BYTES_KEY,
+        internal_path: "server.rest.max_body_bytes",
+    },
+    ConfigEntry {
+        key: METRICS_ENABLED_KEY,
+        internal_path: "server.metrics.enabled",
+    },
+    ConfigEntry {
+        key: METRICS_LISTEN_KEY,
+        internal_path: "server.metrics.bind_address",
+    },
+    ConfigEntry {
+        key: SHUTDOWN_DRAIN_TIMEOUT_KEY,
+        internal_path: "shutdown.drain_timeout",
+    },
+];
+
+/// Gateway listeners and instance identity.
 #[derive(Debug, Clone, PartialEq, Deserialize, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct ServerConfig {
@@ -231,7 +257,7 @@ pub struct ServerConfig {
     pub metrics: MetricsServerConfig,
 }
 
-/// `[server.rest]`, the REST listener and its input-validation limits.
+/// REST listener and request limits.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct RestServerConfig {
@@ -246,14 +272,29 @@ pub struct RestServerConfig {
 impl Default for RestServerConfig {
     fn default() -> Self {
         Self {
-            bind_address: "127.0.0.1:8080".parse().expect("valid default"),
-            request_timeout: ConfigDuration::from_secs(30),
-            max_body_bytes: ByteSize::new(32 * 1024 * 1024),
+            bind_address: DEFAULT_REST_LISTEN,
+            request_timeout: DEFAULT_REST_REQUEST_TIMEOUT,
+            max_body_bytes: DEFAULT_REST_MAX_REQUEST_BYTES,
         }
     }
 }
 
-/// `[server.metrics]`, the internal Prometheus listener.
+impl RestServerConfig {
+    fn validate(&self, problems: &mut Vec<String>) {
+        validate_duration(
+            REST_REQUEST_TIMEOUT_KEY,
+            self.request_timeout.get(),
+            problems,
+        );
+        if self.max_body_bytes.bytes() == 0 {
+            problems.push(format!(
+                "{REST_MAX_REQUEST_BYTES_KEY} must be greater than zero"
+            ));
+        }
+    }
+}
+
+/// Prometheus listener configuration.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct MetricsServerConfig {
@@ -264,13 +305,13 @@ pub struct MetricsServerConfig {
 impl Default for MetricsServerConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
-            bind_address: "127.0.0.1:9095".parse().expect("valid default"),
+            enabled: DEFAULT_METRICS_ENABLED,
+            bind_address: DEFAULT_METRICS_LISTEN,
         }
     }
 }
 
-/// `[shutdown]`, which configures the graceful-shutdown drain deadline.
+/// Graceful-shutdown configuration.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ShutdownConfig {
@@ -280,8 +321,18 @@ pub struct ShutdownConfig {
 impl Default for ShutdownConfig {
     fn default() -> Self {
         Self {
-            drain_timeout: ConfigDuration::from_secs(30),
+            drain_timeout: DEFAULT_SHUTDOWN_DRAIN_TIMEOUT,
         }
+    }
+}
+
+impl ShutdownConfig {
+    fn validate(&self, problems: &mut Vec<String>) {
+        validate_duration(
+            SHUTDOWN_DRAIN_TIMEOUT_KEY,
+            self.drain_timeout.get(),
+            problems,
+        );
     }
 }
 
@@ -294,10 +345,11 @@ pub struct GatewayConfig {
 }
 
 impl GatewayConfig {
-    /// Checks the invariants that span more than one field. Single-field syntax and non-zero rules are enforced
-    /// while deserializing. Called by [`load`] and exposed for tests and programmatic construction.
+    /// Checks invariants, including values supplied programmatically.
     pub fn validate(&self) -> Result<(), ConfigError> {
         let mut problems = Vec::new();
+        self.server.rest.validate(&mut problems);
+        self.shutdown.validate(&mut problems);
         self.validate_identity(&mut problems);
         if problems.is_empty() {
             Ok(())
@@ -320,16 +372,22 @@ impl GatewayConfig {
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
             if !valid {
-                problems.push(
-                    "server.instance_id must be 1-128 ASCII letters, digits, dots, underscores, or hyphens"
-                        .to_string(),
-                );
+                problems.push(format!(
+                    "{} must be 1-128 ASCII letters, digits, dots, underscores, or hyphens",
+                    INSTANCE_ID_KEY
+                ));
             }
         }
-        if server.metrics.enabled && server.metrics.bind_address == rest_address {
-            problems.push(
-                "server.metrics.bind_address must differ from server.rest.bind_address".to_string(),
-            );
+        // Port 0 asks the OS for a free port, so two ephemeral listeners never collide even though the
+        // configured addresses are equal.
+        if server.metrics.enabled
+            && server.metrics.bind_address == rest_address
+            && rest_address.port() != 0
+        {
+            problems.push(format!(
+                "{} must differ from {}",
+                METRICS_LISTEN_KEY, REST_LISTEN_KEY
+            ));
         }
     }
 
@@ -338,19 +396,31 @@ impl GatewayConfig {
         let mut warnings = Vec::new();
         if !self.server.rest.bind_address.ip().is_loopback() {
             warnings.push(format!(
-                "server.rest.bind_address {} is not loopback. The REST listener accepts \
+                "{} {} is not loopback. The REST listener accepts \
                  unauthenticated requests and has no TLS",
-                self.server.rest.bind_address
+                REST_LISTEN_KEY, self.server.rest.bind_address
             ));
         }
         warnings
     }
 }
 
+fn validate_duration(key: &str, duration: Duration, problems: &mut Vec<String>) {
+    if duration.is_zero() {
+        problems.push(format!("{key} must be greater than zero"));
+    } else if duration > MAX_CONFIG_DURATION {
+        problems.push(format!(
+            "{} must not exceed {} seconds",
+            key,
+            MAX_CONFIG_DURATION.as_secs()
+        ));
+    }
+}
+
 /// Targeted CLI overrides (highest precedence).
 #[derive(Debug, Clone, Default)]
 pub struct CliOverrides {
-    /// Overrides `server.rest.bind_address`.
+    /// Overrides `gateway.rest.listen`.
     pub bind_address: Option<String>,
 }
 
@@ -385,141 +455,121 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
-/// Translates one `FLUSS_GATEWAY__` suffix into a dotted configuration path. Only the section, which is the first
-/// segment, may spell a nested table with an underscore, so `SERVER_REST__BIND_ADDRESS` addresses
-/// `server.rest.bind_address` while the key keeps its underscores.
-fn env_suffix_to_path(suffix: &str) -> String {
-    let lowered = suffix.to_ascii_lowercase();
-    match lowered.split_once("__") {
-        Some((section, key)) => format!("{}.{}", section.replace('_', "."), key.replace("__", ".")),
-        None => lowered,
-    }
-}
-
-/// Reads one override value the way a TOML right-hand side would be read, so an operator can write an array, a
-/// quoted string, a number, or a boolean. A bare value that is not valid TOML stays text, except that an unquoted
-/// comma makes it a list, which is how a list-valued key is written outside a file.
-fn coerce_override(raw: &str) -> Value {
-    if let Ok(mut table) = format!("x = {raw}").parse::<toml::Table>()
-        && let Some(value) = table.remove("x")
-    {
-        return value;
-    }
-    if raw.contains(',') {
-        return Value::Array(
-            raw.split(',')
-                .map(|entry| Value::String(entry.trim().to_string()))
-                .collect(),
-        );
-    }
-    Value::String(raw.to_string())
-}
-
-/// Writes `value` at a dotted path, creating the tables along the way and replacing whatever sat there before.
-fn insert_path(table: &mut toml::Table, path: &str, value: Value) {
+/// Writes `value` at a dotted path, creating mappings along the way and replacing whatever sat there before.
+fn insert_path(table: &mut Mapping, path: &str, value: Value) {
     let mut current = table;
     let mut segments = path.split('.').peekable();
     while let Some(segment) = segments.next() {
+        let key = Value::String(segment.to_string());
         if segments.peek().is_none() {
-            current.insert(segment.to_string(), value);
+            current.insert(key, value);
             return;
         }
         let entry = current
-            .entry(segment.to_string())
-            .or_insert_with(|| Value::Table(toml::Table::new()));
-        if !entry.is_table() {
-            *entry = Value::Table(toml::Table::new());
+            .entry(key)
+            .or_insert_with(|| Value::Mapping(Mapping::new()));
+        if !entry.is_mapping() {
+            *entry = Value::Mapping(Mapping::new());
         }
-        current = entry.as_table_mut().expect("table inserted above");
+        current = entry.as_mapping_mut().expect("mapping inserted above");
     }
 }
 
-/// Turns a deserialization failure into an error that names the override responsible for it, if one is. Each
-/// override is replayed on its own against the defaults, so only the override that actually carries the offending
-/// key is blamed and a bad key in the file is never attributed to an unrelated override.
-fn attribute(message: String, overrides: &[(String, String, Value)]) -> ConfigError {
-    for (path, origin, value) in overrides {
-        let mut probe = toml::Table::new();
-        insert_path(&mut probe, path, value.clone());
-        let Err(error) = GatewayConfig::deserialize(Value::Table(probe)) else {
-            continue;
-        };
-        let reason = error.to_string();
-        if reason.contains("unknown field") && origin.starts_with(ENV_PREFIX) {
-            return ConfigError::UnknownEnvKey(origin.clone());
+/// Attributes a typed error to the override that supplied the failing option.
+fn attribute(
+    message: String,
+    overrides: &[(&'static str, &'static str, String, Value)],
+) -> ConfigError {
+    for (_, key, origin, _) in overrides.iter().rev() {
+        if message.starts_with(key) {
+            return ConfigError::Parse(format!("{origin}: {message}"));
         }
-        return ConfigError::Parse(format!("{origin}: {reason}"));
     }
     ConfigError::Parse(message)
 }
 
-/// The flat `gateway.*` file vocabulary, mapped to the dotted paths of the typed sections. FIP-named keys keep
-/// their FIP spelling; the remaining internal keys follow the same `gateway.<area>.<kebab-key>` style.
-///
-/// `gateway.rest.write.request-timeout` maps to the shared REST deadline: the gateway runs every request,
-/// not only writes, under that server-side budget.
-const FLAT_FILE_KEYS: &[(&str, &str)] = &[
-    ("gateway.instance-id", "server.instance_id"),
-    ("gateway.rest.listen", "server.rest.bind_address"),
-    (
-        "gateway.rest.write.request-timeout",
-        "server.rest.request_timeout",
-    ),
-    (
-        "gateway.rest.write.max-request-bytes",
-        "server.rest.max_body_bytes",
-    ),
-    ("gateway.metrics.enabled", "server.metrics.enabled"),
-    (
-        "gateway.metrics.exporter.prometheus.listen",
-        "server.metrics.bind_address",
-    ),
-    ("gateway.shutdown.drain-timeout", "shutdown.drain_timeout"),
-];
-
-/// Resolves one flat file key against the vocabulary, or rejects it with the exact name the operator wrote.
-fn resolve_flat_key(key: &str) -> Result<String, ConfigError> {
-    if let Some((_, path)) = FLAT_FILE_KEYS.iter().find(|(flat, _)| *flat == key) {
-        return Ok((*path).to_string());
-    }
-    Err(ConfigError::Parse(format!(
-        "unknown configuration key: {key}"
-    )))
+/// Deserializes the merged YAML value while retaining the nested field path in any error.
+fn deserialize_config(value: Value) -> Result<GatewayConfig, ConfigError> {
+    serde_path_to_error::deserialize(value)
+        .map_err(|error| ConfigError::Parse(publicize_error_path(error.to_string())))
 }
 
-/// Converts one YAML scalar or sequence into the internal TOML value model. Nested mappings are rejected
-/// because the file contract is flat dotted keys.
-fn yaml_to_toml(value: &serde_yaml::Value, key: &str) -> Result<Value, ConfigError> {
-    match value {
-        serde_yaml::Value::Bool(v) => Ok(Value::Boolean(*v)),
-        serde_yaml::Value::Number(v) => {
-            if let Some(int) = v.as_i64() {
-                Ok(Value::Integer(int))
-            } else if let Some(float) = v.as_f64() {
-                Ok(Value::Float(float))
-            } else {
-                Err(ConfigError::Parse(format!("{key}: unsupported number")))
-            }
+/// Rewrites Serde's internal typed path to the stable public option name used by operators.
+fn publicize_error_path(message: String) -> String {
+    for entry in CONFIG_ENTRIES {
+        if let Some(reason) = message.strip_prefix(entry.internal_path) {
+            return format!("{}{reason}", entry.key);
         }
-        serde_yaml::Value::String(v) => Ok(Value::String(v.clone())),
-        serde_yaml::Value::Sequence(items) => Ok(Value::Array(
-            items
-                .iter()
-                .map(|item| yaml_to_toml(item, key))
-                .collect::<Result<_, _>>()?,
-        )),
-        serde_yaml::Value::Null => Err(ConfigError::Parse(format!("{key}: value is missing"))),
-        serde_yaml::Value::Mapping(_) | serde_yaml::Value::Tagged(_) => Err(ConfigError::Parse(
-            format!("{key}: nested values are not allowed, configuration keys are flat"),
-        )),
+    }
+    message
+}
+
+fn config_entry(key: &str) -> Option<&'static ConfigEntry> {
+    CONFIG_ENTRIES.iter().find(|entry| entry.key == key)
+}
+
+fn environment_variable(key: &str) -> String {
+    let suffix = key
+        .strip_prefix("gateway.")
+        .expect("configuration keys use the gateway prefix")
+        .split('.')
+        .map(|segment| segment.replace('-', "_").to_ascii_uppercase())
+        .collect::<Vec<_>>()
+        .join("__");
+    format!("{ENV_PREFIX}{suffix}")
+}
+
+fn environment_entry(variable: &str) -> Option<&'static ConfigEntry> {
+    CONFIG_ENTRIES
+        .iter()
+        .find(|entry| environment_variable(entry.key) == variable)
+}
+
+fn convert_environment_value(entry: &ConfigEntry, raw: &str) -> Result<Value, String> {
+    match entry.key {
+        METRICS_ENABLED_KEY => raw
+            .parse::<bool>()
+            .map(Value::Bool)
+            .map_err(|_| "expected true or false".to_string()),
+        _ => Ok(Value::String(raw.to_string())),
     }
 }
 
-/// Parses the flat-key YAML file into the internal table model.
-fn read_config_file(contents: &str) -> Result<toml::Table, ConfigError> {
-    let document: serde_yaml::Value =
-        serde_yaml::from_str(contents).map_err(|e| ConfigError::Parse(e.to_string()))?;
-    let mut table = toml::Table::new();
+fn convert_file_value(entry: &ConfigEntry, value: &Value) -> Result<Value, String> {
+    match entry.key {
+        METRICS_ENABLED_KEY => scalar(value).cloned(),
+        REST_MAX_REQUEST_BYTES_KEY => match scalar(value)? {
+            Value::Number(_) | Value::String(_) => Ok(value.clone()),
+            _ => Err("expected an integer or byte-size string".to_string()),
+        },
+        _ => scalar_text(value).map(Value::String),
+    }
+}
+
+fn scalar(value: &Value) -> Result<&Value, String> {
+    match value {
+        Value::Bool(_) | Value::Number(_) | Value::String(_) => Ok(value),
+        Value::Null => Err("value is missing".to_string()),
+        Value::Sequence(_) | Value::Mapping(_) | Value::Tagged(_) => {
+            Err("expected a scalar value".to_string())
+        }
+    }
+}
+
+fn scalar_text(value: &Value) -> Result<String, String> {
+    match scalar(value)? {
+        Value::Bool(value) => Ok(value.to_string()),
+        Value::Number(value) => Ok(value.to_string()),
+        Value::String(value) => Ok(value.clone()),
+        _ => unreachable!("scalar rejects compound values"),
+    }
+}
+
+/// Parses the flat-key YAML file into the nested mapping deserialized by [`GatewayConfig`].
+fn read_config_file(contents: &str) -> Result<Mapping, ConfigError> {
+    let document: Value =
+        serde_yaml_ng::from_str(contents).map_err(|e| ConfigError::Parse(e.to_string()))?;
+    let mut table = Mapping::new();
     if document.is_null() {
         return Ok(table);
     }
@@ -533,22 +583,24 @@ fn read_config_file(contents: &str) -> Result<toml::Table, ConfigError> {
         let key = key
             .as_str()
             .ok_or_else(|| ConfigError::Parse("configuration keys must be strings".to_string()))?;
-        let path = resolve_flat_key(key)?;
-        insert_path(&mut table, &path, yaml_to_toml(value, key)?);
+        let entry = config_entry(key)
+            .ok_or_else(|| ConfigError::Parse(format!("unknown configuration key: {key}")))?;
+        let value = convert_file_value(entry, value)
+            .map_err(|reason| ConfigError::Parse(format!("{key}: {reason}")))?;
+        insert_path(&mut table, entry.internal_path, value);
     }
     Ok(table)
 }
 
 /// Loads configuration from all sources with precedence CLI > env > file > defaults.
 ///
-/// `env` is passed explicitly (rather than read from the process environment) so loading is deterministic and
-/// testable.
+/// `env` is explicit so loading remains deterministic and testable.
 pub fn load(
     path: Option<&Path>,
     env: &BTreeMap<String, String>,
     cli: &CliOverrides,
 ) -> Result<GatewayConfig, ConfigError> {
-    let mut table = toml::Table::new();
+    let mut table = Mapping::new();
     if let Some(path) = path {
         let contents = std::fs::read_to_string(path)
             .map_err(|e| ConfigError::Io(format!("{}: {e}", path.display())))?;
@@ -556,41 +608,42 @@ pub fn load(
     }
 
     // Each override is kept with the source that wrote it, so a failure names what the operator wrote.
-    let mut overrides: Vec<(String, String, Value)> = Vec::new();
+    let mut overrides: Vec<(&'static str, &'static str, String, Value)> = Vec::new();
     for (key, raw) in env {
-        let Some(suffix) = key.strip_prefix(ENV_PREFIX) else {
+        if !key.starts_with(ENV_PREFIX) {
             continue;
-        };
-        if suffix.is_empty() {
-            return Err(ConfigError::UnknownEnvKey(key.clone()));
         }
+        let entry =
+            environment_entry(key).ok_or_else(|| ConfigError::UnknownEnvKey(key.clone()))?;
         overrides.push((
-            env_suffix_to_path(suffix),
+            entry.internal_path,
+            entry.key,
             key.clone(),
-            coerce_override(raw),
+            convert_environment_value(entry, raw)
+                .map_err(|reason| ConfigError::Parse(format!("{key}: {}: {reason}", entry.key)))?,
         ));
     }
 
-    for (path, flag, value) in [(
-        "server.rest.bind_address",
-        "--bind-address",
-        cli.bind_address.as_ref(),
-    )] {
-        if let Some(value) = value {
-            overrides.push((
-                path.to_string(),
-                flag.to_string(),
-                Value::String(value.clone()),
-            ));
-        }
+    if let Some(value) = &cli.bind_address {
+        let entry = config_entry(REST_LISTEN_KEY).expect("REST listen option is registered");
+        overrides.push((
+            entry.internal_path,
+            entry.key,
+            "--bind-address".to_string(),
+            Value::String(value.clone()),
+        ));
     }
 
-    for (path, _, value) in &overrides {
+    for (path, _, _, value) in &overrides {
         insert_path(&mut table, path, value.clone());
     }
 
-    let config = GatewayConfig::deserialize(Value::Table(table))
-        .map_err(|error| attribute(error.to_string(), &overrides))?;
+    let config = deserialize_config(Value::Mapping(table)).map_err(|error| {
+        let ConfigError::Parse(message) = error else {
+            unreachable!("deserialization only creates parse errors")
+        };
+        attribute(message, &overrides)
+    })?;
 
     config.validate()?;
     Ok(config)
@@ -635,45 +688,30 @@ mod tests {
             config.server.rest.request_timeout.get(),
             Duration::from_secs(30)
         );
+        assert!(config.server.metrics.enabled);
+        assert_eq!(
+            config.server.metrics.bind_address,
+            "127.0.0.1:9095".parse().unwrap()
+        );
         assert_eq!(config.shutdown.drain_timeout.get(), Duration::from_secs(30));
         assert!(config.warnings().is_empty());
     }
 
     #[test]
-    fn file_overrides_defaults() {
+    fn public_yaml_options_are_loaded() {
         let config = load_file(
             r#"
-gateway.rest.listen: 127.0.0.1:18080
-gateway.rest.write.request-timeout: 5s
-gateway.rest.write.max-request-bytes: 2MiB
-"#,
+    gateway.instance-id: gateway-1
+    gateway.rest.listen: 0.0.0.0:8080
+    gateway.rest.write.max-request-bytes: 32MiB
+    gateway.rest.write.request-timeout: 30s
+    gateway.metrics.enabled: true
+    gateway.metrics.exporter.prometheus.listen: 0.0.0.0:9095
+    gateway.shutdown.drain-timeout: 10s
+    "#,
         )
         .unwrap();
-        assert_eq!(
-            config.server.rest.bind_address,
-            "127.0.0.1:18080".parse().unwrap()
-        );
-        assert_eq!(
-            config.server.rest.request_timeout.get(),
-            Duration::from_secs(5)
-        );
-        assert_eq!(config.server.rest.max_body_bytes.bytes(), 2 * 1024 * 1024);
-    }
-
-    /// The configuration surface documented by FIP-49 §Gateway Configuration, restricted to the keys the
-    /// gateway implements today, parses as one flat dotted-key YAML document.
-    #[test]
-    fn fip_yaml_example_parses_with_flat_dotted_keys() {
-        let config = load_file(
-            r#"
-gateway.rest.listen: 0.0.0.0:8080
-gateway.rest.write.max-request-bytes: 32MiB
-gateway.rest.write.request-timeout: 30s
-gateway.metrics.enabled: true
-gateway.metrics.exporter.prometheus.listen: 0.0.0.0:9095
-"#,
-        )
-        .unwrap();
+        assert_eq!(config.server.instance_id.as_deref(), Some("gateway-1"));
         assert_eq!(
             config.server.rest.bind_address,
             "0.0.0.0:8080".parse().unwrap()
@@ -688,16 +726,17 @@ gateway.metrics.exporter.prometheus.listen: 0.0.0.0:9095
             config.server.metrics.bind_address,
             "0.0.0.0:9095".parse().unwrap()
         );
+        assert_eq!(config.shutdown.drain_timeout.get(), Duration::from_secs(10));
     }
 
-    /// A key outside the documented vocabulary is rejected with the exact flat name the operator wrote,
-    /// not a translated internal path.
     #[test]
-    fn unknown_flat_key_is_rejected_with_its_original_name() {
+    fn unknown_file_keys_name_the_original_key() {
         for contents in [
             "gateway.rest.listenn: 0.0.0.0:8080\n",
             "rest.listen: 0.0.0.0:8080\n",
             "gateway.rest.lookup.max-keyz: 5\n",
+            "gateway.scan.cursor-ttl: 1m\n",
+            "gateway.tls.cert: /etc/tls.pem\n",
         ] {
             let error = load_file(contents).unwrap_err();
             assert!(matches!(error, ConfigError::Parse(_)), "got: {error:?}");
@@ -707,48 +746,37 @@ gateway.metrics.exporter.prometheus.listen: 0.0.0.0:9095
     }
 
     #[test]
-    fn env_overrides_file() {
+    fn source_precedence_is_cli_then_env_then_file_then_defaults() {
         let file = write_temp_config(
             r#"
-gateway.rest.listen: 127.0.0.1:18080
-gateway.metrics.enabled: true
-"#,
+    gateway.rest.listen: 127.0.0.1:18080
+    gateway.metrics.enabled: true
+    "#,
         );
         let mut env = no_env();
         env.insert(
-            "FLUSS_GATEWAY__SERVER_REST__BIND_ADDRESS".to_string(),
+            "FLUSS_GATEWAY__REST__LISTEN".to_string(),
             "127.0.0.1:28080".to_string(),
         );
         env.insert(
-            "FLUSS_GATEWAY__SERVER_METRICS__ENABLED".to_string(),
+            "FLUSS_GATEWAY__METRICS__ENABLED".to_string(),
             "false".to_string(),
         );
         env.insert("PATH".to_string(), "/usr/bin".to_string());
 
-        let config = load(Some(file.path()), &env, &CliOverrides::default()).unwrap();
-        assert_eq!(
-            config.server.rest.bind_address,
-            "127.0.0.1:28080".parse().unwrap()
-        );
-        assert!(!config.server.metrics.enabled);
-    }
-
-    #[test]
-    fn cli_overrides_env_and_file() {
-        let file = write_temp_config("gateway.rest.listen: 127.0.0.1:18080\n");
-        let mut env = no_env();
-        env.insert(
-            "FLUSS_GATEWAY__SERVER_REST__BIND_ADDRESS".to_string(),
-            "127.0.0.1:28080".to_string(),
-        );
-        let cli = CliOverrides {
-            bind_address: Some("127.0.0.1:38080".to_string()),
-        };
-        let config = load(Some(file.path()), &env, &cli).unwrap();
+        let config = load(
+            Some(file.path()),
+            &env,
+            &CliOverrides {
+                bind_address: Some("127.0.0.1:38080".to_string()),
+            },
+        )
+        .unwrap();
         assert_eq!(
             config.server.rest.bind_address,
             "127.0.0.1:38080".parse().unwrap()
         );
+        assert!(!config.server.metrics.enabled);
     }
 
     #[test]
@@ -760,16 +788,6 @@ gateway.metrics.enabled: true
         )
         .unwrap_err();
         assert!(matches!(error, ConfigError::Io(_)), "got: {error:?}");
-    }
-
-    #[test]
-    fn unknown_file_field_rejected() {
-        let error = load_file("gateway.rest.listenn: 127.0.0.1:8080\n").unwrap_err();
-        assert!(matches!(error, ConfigError::Parse(_)), "got: {error:?}");
-        assert!(
-            error.to_string().contains("gateway.rest.listenn"),
-            "got: {error}"
-        );
     }
 
     #[test]
@@ -789,38 +807,21 @@ gateway.metrics.enabled: true
     }
 
     #[test]
-    fn unknown_section_rejected() {
-        let error = load_file("gateway.query.max-concurrent: 32\n").unwrap_err();
-        assert!(matches!(error, ConfigError::Parse(_)), "got: {error:?}");
-        assert!(error.to_string().contains("query"), "got: {error}");
-    }
-
-    #[test]
-    fn unknown_env_key_rejected() {
-        let mut env = no_env();
-        env.insert(
-            "FLUSS_GATEWAY__SERVER_REST__BIND_ADDRES".to_string(),
-            "127.0.0.1:8080".to_string(),
-        );
-        let error = load(None, &env, &CliOverrides::default()).unwrap_err();
-        let ConfigError::UnknownEnvKey(key) = &error else {
-            panic!("expected UnknownEnvKey, got: {error:?}");
-        };
-        assert_eq!(key, "FLUSS_GATEWAY__SERVER_REST__BIND_ADDRES");
-    }
-
-    #[test]
-    fn unknown_env_section_rejected() {
-        let mut env = no_env();
-        env.insert(
-            "FLUSS_GATEWAY__QUERY__ENABLED".to_string(),
-            "true".to_string(),
-        );
-        let error = load(None, &env, &CliOverrides::default()).unwrap_err();
-        assert!(
-            matches!(error, ConfigError::UnknownEnvKey(_)),
-            "got: {error:?}"
-        );
+    fn unknown_environment_variables_are_rejected() {
+        for key in [
+            "FLUSS_GATEWAY__REST__LISTENN",
+            "FLUSS_GATEWAY__QUERY__ENABLED",
+            "FLUSS_GATEWAY__SERVER_REST__BIND_ADDRESS",
+        ] {
+            let mut env = no_env();
+            env.insert(key.to_string(), "value".to_string());
+            let error = load(None, &env, &CliOverrides::default()).unwrap_err();
+            assert!(
+                matches!(error, ConfigError::UnknownEnvKey(_)),
+                "{key}: {error:?}"
+            );
+            assert!(error.to_string().contains(key), "{key}: {error}");
+        }
     }
 
     #[test]
@@ -828,12 +829,15 @@ gateway.metrics.enabled: true
         let file = write_temp_config("gateway.shutdown.drain-timeout: 0s\n");
         let mut env = no_env();
         env.insert(
-            "FLUSS_GATEWAY__SERVER_REST__BIND_ADDRESS".to_string(),
+            "FLUSS_GATEWAY__REST__LISTEN".to_string(),
             "127.0.0.1:28080".to_string(),
         );
         let error = load(Some(file.path()), &env, &CliOverrides::default()).unwrap_err();
         assert!(matches!(error, ConfigError::Parse(_)), "got: {error:?}");
-        assert!(error.to_string().contains("drain_timeout"), "got: {error}");
+        assert!(
+            error.to_string().contains("gateway.shutdown.drain-timeout"),
+            "got: {error}"
+        );
         assert!(
             !error.to_string().contains("FLUSS_GATEWAY__"),
             "file problem misattributed to the env override: {error}"
@@ -841,41 +845,66 @@ gateway.metrics.enabled: true
     }
 
     #[test]
-    fn env_string_values_keep_commas_outside_list_keys() {
-        let mut env = no_env();
-        env.insert(
-            "FLUSS_GATEWAY__SERVER__INSTANCE_ID".to_string(),
-            "gateway-a".to_string(),
-        );
-        let config = load(None, &env, &CliOverrides::default()).unwrap();
-        assert_eq!(config.server.instance_id.as_deref(), Some("gateway-a"));
+    fn public_environment_options_are_loaded_by_type() {
+        let env = BTreeMap::from([
+            ("FLUSS_GATEWAY__INSTANCE_ID".to_string(), "123".to_string()),
+            (
+                "FLUSS_GATEWAY__REST__LISTEN".to_string(),
+                "127.0.0.1:18080".to_string(),
+            ),
+            (
+                "FLUSS_GATEWAY__REST__WRITE__REQUEST_TIMEOUT".to_string(),
+                "5s".to_string(),
+            ),
+            (
+                "FLUSS_GATEWAY__REST__WRITE__MAX_REQUEST_BYTES".to_string(),
+                "2MiB".to_string(),
+            ),
+            (
+                "FLUSS_GATEWAY__METRICS__ENABLED".to_string(),
+                "false".to_string(),
+            ),
+            (
+                "FLUSS_GATEWAY__METRICS__EXPORTER__PROMETHEUS__LISTEN".to_string(),
+                "127.0.0.1:19095".to_string(),
+            ),
+            (
+                "FLUSS_GATEWAY__SHUTDOWN__DRAIN_TIMEOUT".to_string(),
+                "10s".to_string(),
+            ),
+        ]);
 
-        env.insert(
-            "FLUSS_GATEWAY__SERVER__INSTANCE_ID".to_string(),
-            "a,b".to_string(),
+        let config = load(None, &env, &CliOverrides::default()).unwrap();
+        assert_eq!(config.server.instance_id.as_deref(), Some("123"));
+        assert_eq!(
+            config.server.rest.bind_address,
+            "127.0.0.1:18080".parse().unwrap()
         );
-        let error = load(None, &env, &CliOverrides::default()).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("FLUSS_GATEWAY__SERVER__INSTANCE_ID")
-                || error.to_string().contains("instance_id"),
-            "got: {error}"
+        assert_eq!(
+            config.server.rest.request_timeout.get(),
+            Duration::from_secs(5)
         );
+        assert_eq!(config.server.rest.max_body_bytes.bytes(), 2 * 1024 * 1024);
+        assert!(!config.server.metrics.enabled);
+        assert_eq!(
+            config.server.metrics.bind_address,
+            "127.0.0.1:19095".parse().unwrap()
+        );
+        assert_eq!(config.shutdown.drain_timeout.get(), Duration::from_secs(10));
     }
 
     #[test]
     fn invalid_env_value_names_the_variable() {
         let mut env = no_env();
         env.insert(
-            "FLUSS_GATEWAY__SERVER_REST__MAX_BODY_BYTES".to_string(),
+            "FLUSS_GATEWAY__REST__WRITE__MAX_REQUEST_BYTES".to_string(),
             "many".to_string(),
         );
         let error = load(None, &env, &CliOverrides::default()).unwrap_err();
         assert!(
             error
                 .to_string()
-                .contains("FLUSS_GATEWAY__SERVER_REST__MAX_BODY_BYTES"),
+                .contains("FLUSS_GATEWAY__REST__WRITE__MAX_REQUEST_BYTES"),
             "got: {error}"
         );
     }
@@ -891,12 +920,12 @@ gateway.metrics.enabled: true
 
     #[test]
     fn invalid_duration_rejected() {
-        for bad in ["60", "60 s", "6.5s", "s", "60d", "-1s"] {
+        for bad in ["0ms", "60", "60 s", "6.5s", "s", "60d", "-1s"] {
             let error =
                 load_file(&format!("gateway.shutdown.drain-timeout: \"{bad}\"\n")).unwrap_err();
             assert!(matches!(error, ConfigError::Parse(_)), "{bad}: {error:?}");
             assert!(
-                error.to_string().contains("drain_timeout"),
+                error.to_string().contains("gateway.shutdown.drain-timeout"),
                 "{bad}: {error}"
             );
         }
@@ -904,9 +933,6 @@ gateway.metrics.enabled: true
 
     #[test]
     fn overflowing_duration_is_rejected_rather_than_saturated() {
-        // Syntactically valid but astronomically large durations must be refused at parse time, not
-        // silently clamped, so they can never reach an `Instant + Duration` overflow at runtime. Every
-        // unit needs its own case: the unmultiplied ones overflow without any arithmetic at all.
         for bad in [
             "18446744073709551615ms",
             "18446744073709551615s",
@@ -916,7 +942,6 @@ gateway.metrics.enabled: true
             let error = ConfigDuration::parse(bad).unwrap_err();
             assert!(error.contains("must not exceed"), "{bad}: {error}");
         }
-        // The bound itself is accepted, one second past it is not.
         assert_eq!(
             ConfigDuration::parse("31536000s").unwrap().get(),
             MAX_CONFIG_DURATION
@@ -925,43 +950,51 @@ gateway.metrics.enabled: true
     }
 
     #[test]
+    fn programmatically_constructed_durations_are_validated() {
+        let mut config = GatewayConfig::default();
+        config.server.rest.request_timeout = ConfigDuration::from_millis(0);
+        config.shutdown.drain_timeout =
+            ConfigDuration::from_secs(MAX_CONFIG_DURATION.as_secs() + 1);
+
+        let errors = problems(config.validate().unwrap_err());
+        assert!(
+            errors.iter().any(|error| {
+                error == "gateway.rest.write.request-timeout must be greater than zero"
+            }),
+            "got: {errors:?}"
+        );
+        assert!(
+            errors.iter().any(|error| {
+                error == "gateway.shutdown.drain-timeout must not exceed 31536000 seconds"
+            }),
+            "got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn programmatically_constructed_zero_byte_limit_is_validated() {
+        let mut config = GatewayConfig::default();
+        config.server.rest.max_body_bytes = ByteSize::new(0);
+
+        let errors = problems(config.validate().unwrap_err());
+        assert_eq!(
+            errors,
+            vec!["gateway.rest.write.max-request-bytes must be greater than zero"]
+        );
+    }
+
+    #[test]
     fn invalid_byte_size_rejected() {
-        for bad in ["\"4Mb\"", "\"MiB\"", "-1", "\"1.5MiB\""] {
+        for bad in ["0", "\"4Mb\"", "\"MiB\"", "-1", "\"1.5MiB\""] {
             let error =
                 load_file(&format!("gateway.rest.write.max-request-bytes: {bad}\n")).unwrap_err();
             assert!(matches!(error, ConfigError::Parse(_)), "{bad}: {error:?}");
             assert!(
-                error.to_string().contains("max_body_bytes"),
+                error
+                    .to_string()
+                    .contains("gateway.rest.write.max-request-bytes"),
                 "{bad}: {error}"
             );
-        }
-    }
-
-    #[test]
-    fn zero_durations_and_sizes_rejected_while_parsing() {
-        for (key, contents) in [
-            ("drain_timeout", "gateway.shutdown.drain-timeout: 0ms\n"),
-            (
-                "max_body_bytes",
-                "gateway.rest.write.max-request-bytes: 0\n",
-            ),
-        ] {
-            let error = load_file(contents).unwrap_err();
-            assert!(matches!(error, ConfigError::Parse(_)), "{key}: {error:?}");
-            assert!(error.to_string().contains(key), "{key}: {error}");
-        }
-    }
-
-    #[test]
-    fn removed_and_out_of_scope_configuration_keys_are_rejected() {
-        for contents in [
-            // Scan and cursor state, dropped with the stateless contract.
-            "gateway.scan.max-open-global: 8\n",
-            "gateway.scan.cursor-ttl: 1m\n",
-            // Transport security, out of scope (TLS terminates at a fronting proxy).
-            "gateway.tls.cert: /etc/tls.pem\n",
-        ] {
-            assert!(load_file(contents).is_err(), "accepted: {contents}");
         }
     }
 
@@ -971,11 +1004,21 @@ gateway.metrics.enabled: true
             "gateway.rest.listen: 127.0.0.1:9095\ngateway.metrics.exporter.prometheus.listen: 127.0.0.1:9095\n",
         )
         .unwrap_err();
-        assert!(
-            problems(error)
-                .iter()
-                .any(|p| p.contains("server.metrics.bind_address must differ"))
-        );
+        assert!(problems(error).iter().any(|problem| {
+            problem.contains(
+                "gateway.metrics.exporter.prometheus.listen must differ from gateway.rest.listen",
+            )
+        }));
+    }
+
+    /// Two ephemeral listeners are not a clash: the OS hands out a different port to each.
+    #[test]
+    fn both_listeners_may_ask_for_an_ephemeral_port() {
+        let config = load_file(
+            "gateway.rest.listen: 127.0.0.1:0\ngateway.metrics.exporter.prometheus.listen: 127.0.0.1:0\n",
+        )
+        .unwrap();
+        assert_eq!(config.server.rest.bind_address.port(), 0);
     }
 
     #[test]
@@ -984,7 +1027,6 @@ gateway.metrics.enabled: true
         assert!(config.server.instance_id.is_none());
         assert_eq!(config.warnings().len(), 1);
         assert!(config.warnings()[0].contains("not loopback"));
-        // The warning calls out the unauthenticated exposure.
         assert!(
             config.warnings()[0].contains("accepts unauthenticated requests"),
             "{:?}",
@@ -998,7 +1040,7 @@ gateway.metrics.enabled: true
         assert!(
             problems(error)
                 .iter()
-                .any(|p| p.contains("server.instance_id must be 1-128 ASCII"))
+                .any(|problem| problem.contains("gateway.instance-id must be 1-128 ASCII"))
         );
     }
 
@@ -1031,18 +1073,30 @@ gateway.metrics.enabled: true
     }
 
     #[test]
-    fn env_suffix_paths() {
-        assert_eq!(
-            env_suffix_to_path("SERVER_REST__BIND_ADDRESS"),
-            "server.rest.bind_address"
-        );
-        assert_eq!(
-            env_suffix_to_path("SERVER__INSTANCE_ID"),
-            "server.instance_id"
-        );
-        assert_eq!(
-            env_suffix_to_path("SHUTDOWN__DRAIN_TIMEOUT"),
-            "shutdown.drain_timeout"
-        );
+    fn options_are_complete_and_unambiguous() {
+        let mut public_keys = std::collections::BTreeSet::new();
+        let mut internal_paths = std::collections::BTreeSet::new();
+        let mut environment_variables = std::collections::BTreeSet::new();
+
+        for entry in CONFIG_ENTRIES {
+            assert!(entry.key.starts_with("gateway."), "{entry:?}");
+            assert!(
+                public_keys.insert(entry.key),
+                "duplicate key: {}",
+                entry.key
+            );
+            assert!(
+                internal_paths.insert(entry.internal_path),
+                "duplicate path: {}",
+                entry.internal_path
+            );
+            assert!(
+                environment_variables.insert(environment_variable(entry.key)),
+                "duplicate environment variable for {}",
+                entry.key
+            );
+        }
+
+        assert_eq!(CONFIG_ENTRIES.len(), 7);
     }
 }

@@ -1,82 +1,58 @@
 components:
   schemas:
     ErrorBody:
-      description: Body of the shared error envelope.
+      description: Body of the REST error envelope.
       properties:
         code:
           $ref: '#/components/schemas/ErrorCode'
-        details:
-          oneOf:
-          - type: 'null'
-          - $ref: '#/components/schemas/ErrorDetailsSchema'
         message:
           type: string
         request_id:
+          description: Correlates the response with the `x-request-id` header and the access log.
           format: uuid
           type: string
-        retryable:
-          description: Whether repeating an otherwise unchanged request may succeed.
-          type: boolean
       required:
       - code
       - message
       - request_id
-      - retryable
       type: object
     ErrorCode:
-      description: |-
-        Stable error codes of the gateway: the FIP-49 vocabulary, resource-specific where the error
-        names a resource, exactly as serialized on the wire.
+      description: Stable error code, resource-specific where the error names a resource.
       enum:
+      - already_exists
+      - backend
+      - cancelled
+      - cluster_already_exists
+      - cluster_not_found
+      - database_already_exists
+      - database_not_empty
+      - database_not_found
+      - failed_precondition
+      - internal
       - invalid_argument
+      - limit_exceeded
+      - method_not_allowed
+      - not_acceptable
+      - not_found
+      - partition_already_exists
+      - partition_not_found
+      - resource_exhausted
+      - table_already_exists
+      - table_not_found
+      - timeout
       - unauthenticated
       - unauthorized
-      - not_found
-      - cluster_not_found
-      - database_not_found
-      - table_not_found
-      - partition_not_found
-      - already_exists
-      - cluster_already_exists
-      - database_already_exists
-      - table_already_exists
-      - partition_already_exists
-      - failed_precondition
-      - database_not_empty
+      - unavailable
       - unsupported
       - unsupported_media_type
-      - not_acceptable
-      - limit_exceeded
-      - resource_exhausted
-      - timeout
-      - cancelled
-      - unavailable
-      - backend
-      - internal
-      - storage_backpressure
       type: string
-    ErrorDetailsSchema:
-      description: Machine-readable resource context carried by resource-naming errors.
-      properties:
-        resource_kind:
-          type:
-          - string
-          - 'null'
-        resource_name:
-          type:
-          - string
-          - 'null'
-      type: object
     ErrorEnvelope:
-      description: The envelope every failing response uses.
+      description: 'REST error envelope: `{"error": {"code", "message", "request_id"}}`.'
       examples:
       - error:
           code: table_not_found
-          details:
-            resource_kind: table
-          message: table does not exist
+          message: table `mydb.orders` does not exist
           request_id: 8f6c7f4a-f9b8-4c71-91ec-6e5578d7a913
-          retryable: false
       properties:
         error:
           $ref: '#/components/schemas/ErrorBody'
@@ -116,6 +92,12 @@ paths:
               schema:
                 $ref: '#/components/schemas/HealthResponse'
           description: Gateway liveness and uptime
+        '405':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Wrong method for this route
       summary: 'The FIP-49 health summary: `{status, uptime_ms}`, always 200 while the process answers.'
       tags:
       - health
@@ -125,6 +107,30 @@ paths:
       responses:
         '200':
           description: OpenAPI 3.1 document
+        '405':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Wrong method for this route
+        '413':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Request body above the configured limit
+        '503':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Gateway starting or shutting down
+        '504':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Request deadline exceeded
       summary: Serves the generated OpenAPI 3.1 document as JSON.
       tags:
       - metadata

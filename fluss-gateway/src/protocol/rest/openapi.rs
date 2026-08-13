@@ -19,100 +19,22 @@
 //!
 //! The document is derived from the routers themselves by
 //! [`utoipa_axum::router::OpenApiRouter::split_for_parts`] — there is no hand-maintained list of paths or
-//! schemas anywhere in the crate, so the served contract cannot drift from the mounted routes. This module owns
-//! only the shared error schemas, the serve handler, and the post-pass hooks applied to the generated value.
+//! schemas anywhere in the crate, so the served contract cannot drift from the mounted routes. The error
+//! schemas are the live wire types from [`crate::error`], and the `ErrorCode` vocabulary is generated from
+//! the taxonomy, so the contract cannot drift from the implementation either.
 
+use crate::error::{ErrorCode, ErrorEnvelope};
 use crate::protocol::rest::{RestState, json_response};
 use axum::extract::State;
 use axum::response::Response;
-use serde::Serialize;
-use serde_json::{Value, json};
-use utoipa::{OpenApi, ToSchema};
+use serde_json::Value;
+use utoipa::{OpenApi, openapi::OpenApiBuilder};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-/// Stable error codes of the gateway: the FIP-49 vocabulary, resource-specific where the error
-/// names a resource, exactly as serialized on the wire.
-#[derive(Debug, Serialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-#[schema(as = ErrorCode)]
-#[allow(dead_code)] // Schema-only enum; real errors use the HTTP-independent ErrorKind.
-pub(crate) enum ErrorCodeSchema {
-    InvalidArgument,
-    Unauthenticated,
-    Unauthorized,
-    NotFound,
-    ClusterNotFound,
-    DatabaseNotFound,
-    TableNotFound,
-    PartitionNotFound,
-    AlreadyExists,
-    ClusterAlreadyExists,
-    DatabaseAlreadyExists,
-    TableAlreadyExists,
-    PartitionAlreadyExists,
-    FailedPrecondition,
-    DatabaseNotEmpty,
-    Unsupported,
-    UnsupportedMediaType,
-    NotAcceptable,
-    LimitExceeded,
-    ResourceExhausted,
-    Timeout,
-    Cancelled,
-    Unavailable,
-    Backend,
-    Internal,
-    /// Entry-level only: a KV write rejected by storage backpressure (never a request status).
-    StorageBackpressure,
-}
-
-/// Machine-readable resource context carried by resource-naming errors.
-#[derive(Debug, Serialize, ToSchema)]
-pub(crate) struct ErrorDetailsSchema {
-    pub resource_kind: Option<String>,
-    pub resource_name: Option<String>,
-}
-
-/// Body of the shared error envelope.
-#[derive(Debug, Serialize, ToSchema)]
-#[schema(as = ErrorBody)]
-pub(crate) struct ErrorBodySchema {
-    pub code: ErrorCodeSchema,
-    pub message: String,
-    #[schema(value_type = String, format = "uuid")]
-    pub request_id: String,
-    /// Whether repeating an otherwise unchanged request may succeed.
-    pub retryable: bool,
-    pub details: Option<ErrorDetailsSchema>,
-}
-
-/// The envelope every failing response uses.
-#[derive(Debug, Serialize, ToSchema)]
-#[schema(
-    as = ErrorEnvelope,
-    examples(json!({
-        "error": {
-            "code": "table_not_found",
-            "message": "table does not exist",
-            "request_id": "8f6c7f4a-f9b8-4c71-91ec-6e5578d7a913",
-            "retryable": false,
-            "details": {"resource_kind": "table"}
-        }
-    }))
-)]
-pub(crate) struct ErrorEnvelopeSchema {
-    pub error: ErrorBodySchema,
-}
-
-/// Seeds the generated document with the schemas that no single handler owns.
+/// Seeds the generated document with the shared error schemas, which no single handler owns.
 #[derive(OpenApi)]
-#[openapi(components(schemas(
-    ErrorCodeSchema,
-    ErrorDetailsSchema,
-    ErrorBodySchema,
-    ErrorEnvelopeSchema
-)))]
+#[openapi(components(schemas(ErrorCode, ErrorEnvelope)))]
 struct SharedSchemas;
 
 /// OpenAPI routes, merged into the main router by [`crate::protocol::rest::build_router`].
@@ -120,50 +42,35 @@ pub fn routes() -> OpenApiRouter<RestState> {
     OpenApiRouter::with_openapi(SharedSchemas::openapi()).routes(routes!(serve))
 }
 
-/// Applies the gateway's post-passes to the router-generated document.
+/// Applies the gateway's own metadata to the router-generated document.
 ///
-/// Called once by [`crate::protocol::rest::build_router`]. The passes are deliberately separate so that
-/// documentation work can extend them without touching router assembly.
+/// Called once by [`crate::protocol::rest::build_router`].
 pub(crate) fn finalize(api: utoipa::openapi::OpenApi) -> Value {
-    let mut document = serde_json::to_value(api).expect("generated OpenAPI is serializable");
-    apply_info(&mut document);
-    apply_servers(&mut document);
-    apply_security(&mut document);
-    apply_tags(&mut document);
-    apply_response_headers(&mut document);
-    document
+    let api = OpenApiBuilder::from(api)
+        .info(
+            utoipa::openapi::InfoBuilder::new()
+                .title("fluss-gateway")
+                .description(Some("Stateless REST gateway for Apache Fluss"))
+                .version(env!("CARGO_PKG_VERSION"))
+                .license(Some(
+                    utoipa::openapi::LicenseBuilder::new()
+                        .name("Apache-2.0")
+                        .url(Some("https://www.apache.org/licenses/LICENSE-2.0"))
+                        .build(),
+                ))
+                .build(),
+        )
+        // The gateway serves the API at the listener root; a relative server keeps the document
+        // host-agnostic.
+        .servers(Some([utoipa::openapi::ServerBuilder::new()
+            .url("/")
+            .build()]))
+        // An explicit empty root security array: honest for this PR — no authentication exists yet. The
+        // authentication capability adds securitySchemes and per-operation requirements.
+        .security(Some(Vec::new()))
+        .build();
+    serde_json::to_value(api).expect("generated OpenAPI is serializable")
 }
-
-/// Replaces the utoipa-axum library defaults in `info` with this crate's own metadata.
-fn apply_info(document: &mut Value) {
-    document["info"] = json!({
-        "title": "fluss-gateway",
-        "description": "Stateless REST gateway for Apache Fluss",
-        "version": env!("CARGO_PKG_VERSION"),
-        "license": {
-            "name": "Apache-2.0",
-            "url": "https://www.apache.org/licenses/LICENSE-2.0"
-        }
-    });
-}
-
-/// The gateway serves the API at the listener root; a relative server keeps the document
-/// host-agnostic.
-fn apply_servers(document: &mut Value) {
-    document["servers"] = json!([{"url": "/"}]);
-}
-
-/// An explicit empty root security array: honest for this PR — no authentication exists yet.
-/// The authentication capability PR will introduce securitySchemes and per-operation requirements.
-fn apply_security(document: &mut Value) {
-    document["security"] = json!([]);
-}
-
-/// Post-pass hook for tag descriptions. Intentionally empty until the documentation pass lands.
-fn apply_tags(_document: &mut Value) {}
-
-/// Post-pass hook for shared response headers. Intentionally empty until the documentation pass lands.
-fn apply_response_headers(_document: &mut Value) {}
 
 /// Serves the generated OpenAPI 3.1 document as JSON.
 #[utoipa::path(
@@ -171,11 +78,20 @@ fn apply_response_headers(_document: &mut Value) {}
     path = "/v1/openapi.json",
     operation_id = "getOpenApi",
     tag = "metadata",
-    responses((status = 200, description = "OpenAPI 3.1 document"))
+    responses(
+        (status = 200, description = "OpenAPI 3.1 document"),
+        (status = 405, description = "Wrong method for this route", body = ErrorEnvelope),
+        (status = 413, description = "Request body above the configured limit", body = ErrorEnvelope),
+        (status = 503, description = "Gateway starting or shutting down", body = ErrorEnvelope),
+        (status = 504, description = "Request deadline exceeded", body = ErrorEnvelope),
+    )
 )]
 pub(crate) async fn serve(State(state): State<RestState>) -> Response {
-    let document = state.openapi.get().cloned().unwrap_or_else(|| json!({}));
-    json_response(&document).expect("OpenAPI JSON is serializable")
+    let document = state
+        .openapi
+        .get()
+        .expect("build_router fills the document before the router serves");
+    json_response(document).expect("OpenAPI JSON is serializable")
 }
 
 #[cfg(test)]
@@ -216,7 +132,7 @@ mod tests {
     #[ignore = "rewrites openapi.yaml in the working tree; run via `just openapi`"]
     async fn export_checked_in_document() {
         let yaml =
-            serde_yaml::to_string(&served_document().await).expect("the document serializes");
+            serde_yaml_ng::to_string(&served_document().await).expect("the document serializes");
         std::fs::write(checked_in_path(), yaml).expect("openapi.yaml is writable");
     }
 
@@ -227,7 +143,7 @@ mod tests {
         let checked_in = std::fs::read_to_string(checked_in_path())
             .expect("openapi.yaml is checked in; regenerate it with `just openapi`");
         let checked_in: Value =
-            serde_yaml::from_str(&checked_in).expect("openapi.yaml parses as YAML");
+            serde_yaml_ng::from_str(&checked_in).expect("openapi.yaml parses as YAML");
         assert_eq!(
             checked_in,
             served_document().await,
@@ -270,9 +186,25 @@ mod tests {
             "the shared error envelope is registered"
         );
         assert_eq!(
-            document["components"]["schemas"]["ErrorBody"]["properties"]["retryable"]["type"],
-            "boolean"
+            document["components"]["schemas"]["ErrorBody"]["properties"]["code"]["$ref"],
+            "#/components/schemas/ErrorCode",
+            "the envelope code refers to the generated vocabulary: {}",
+            document["components"]["schemas"]["ErrorBody"]
         );
+    }
+
+    /// The published `ErrorCode` vocabulary is generated from the taxonomy, so adding an [`ErrorKind`]
+    /// without regenerating the document fails here rather than shipping a stale contract.
+    #[tokio::test]
+    async fn the_published_vocabulary_is_the_taxonomy() {
+        let document = served_document().await;
+        let published: Vec<&str> = document["components"]["schemas"]["ErrorCode"]["enum"]
+            .as_array()
+            .expect("ErrorCode enum values")
+            .iter()
+            .map(|value| value.as_str().expect("code is a string"))
+            .collect();
+        assert_eq!(published, crate::error::wire_codes());
     }
 
     #[tokio::test]

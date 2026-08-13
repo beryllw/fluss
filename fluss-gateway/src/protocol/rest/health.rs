@@ -20,11 +20,11 @@
 //! `GET /health` returns the FIP-49 `{status, uptime_ms}` shape and answers from the event loop
 //! without a backend RPC; deeper diagnostics live in the Prometheus metrics, not in this payload.
 
+use crate::error::ErrorEnvelope;
 use crate::protocol::rest::{RestState, json_response};
 use axum::extract::State;
 use axum::response::Response;
 use serde::Serialize;
-use serde_json::json;
 use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
@@ -37,7 +37,7 @@ pub fn routes() -> OpenApiRouter<RestState> {
 /// Response of `GET /health` (FIP-49): liveness plus process uptime.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct HealthResponse {
-    pub status: String,
+    pub status: &'static str,
     /// Milliseconds since the gateway process started.
     pub uptime_ms: u64,
 }
@@ -48,14 +48,18 @@ pub struct HealthResponse {
     path = "/health",
     operation_id = "getHealth",
     tag = "health",
-    responses((status = 200, description = "Gateway liveness and uptime", body = HealthResponse))
+    responses(
+        (status = 200, description = "Gateway liveness and uptime", body = HealthResponse),
+        (status = 405, description = "Wrong method for this route", body = ErrorEnvelope),
+    )
 )]
 pub(crate) async fn health(State(state): State<RestState>) -> Response {
-    json_response(&json!({
-        "status": "ok",
-        "uptime_ms": u64::try_from(state.started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
-    }))
-    .expect("static JSON value is serializable")
+    // The response type is the documented schema, so the payload cannot drift from the contract.
+    json_response(&HealthResponse {
+        status: "ok",
+        uptime_ms: u64::try_from(state.started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+    })
+    .expect("the health response is serializable")
 }
 
 #[cfg(test)]
@@ -121,7 +125,7 @@ mod tests {
     async fn health_stays_200_during_shutdown() {
         let state = test_support::test_state();
         state.readiness.set_serving();
-        state.readiness.begin_shutdown();
+        state.readiness.begin_quiescing();
         let app = crate::protocol::rest::build_router(state, &test_support::test_options());
         let response = get(app, "/health").await;
         assert_eq!(response.status(), StatusCode::OK);

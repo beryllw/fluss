@@ -15,10 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Stateless REST gateway for Apache Fluss.
+//! Internal implementation of the stateless REST gateway for Apache Fluss.
 //!
-//! [`protocol::rest`] serves the HTTP surface — routing, JSON decoding, and the cross-cutting
-//! middleware — and [`lifecycle`] owns startup, readiness, background tasks, and graceful shutdown.
+//! The library target keeps the executable entry point thin and lets integration tests exercise the production
+//! router and lifecycle in process. The package is not published as a reusable crate and makes no public API
+//! compatibility commitment.
 //!
 //! # Statelessness contract
 //!

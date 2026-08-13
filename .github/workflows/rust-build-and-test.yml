@@ -101,6 +101,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # The dockerized cluster fixture is an unconditional dev-dependency, so it is part of the
+      # `--all-targets` graph and its proto codegen runs even when the e2e suites are compiled away.
       - name: Install protoc
         uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
@@ -156,11 +158,13 @@ jobs:
       - name: Check on the declared MSRV
         run: cargo +1.88.0 check --all-targets
 
-  gateway-harness-self-test:
-    name: "Gateway harness self-test (fixed-version cluster)"
-    # This proves the fixed-version Fluss fixture starts and is reachable, the shared harness later
-    # capabilities reuse. It does not start the Gateway or drive Fluss through it: the Gateway-to-Fluss
-    # integration is covered by the authentication/backend issue that first connects to Fluss.
+  gateway-e2e-cluster:
+    name: "Gateway E2E (dockerized Fluss cluster)"
+    # Not a pull-request gate yet: the gateway does not talk to Fluss until the FlussBackend capability
+    # lands, so the suite would spend minutes pulling a Docker image to check the startup and draining the
+    # process suite already covers without one. Run it from the Actions tab meanwhile; to make it a
+    # required gate later, delete the `if:` below.
+    if: github.event_name == 'workflow_dispatch'
     timeout-minutes: 30
     runs-on: ubuntu-latest
     defaults:
@@ -179,16 +183,16 @@ jobs:
         with:
           workspaces: fluss-gateway
 
-      # A selected scenario must exist: an empty test list means the suite was compiled away,
-      # which is a silent skip and therefore a failure.
-      - name: Assert the harness scenarios are selected
+      # A selected scenario must exist: an empty test list means the suite was compiled away, which is a
+      # silent skip and therefore a failure.
+      - name: Assert the cluster scenarios are selected
         run: |
-          count=$(cargo test --features integration_tests --test e2e_harness -- --list 2>/dev/null | grep -c ': test$')
+          count=$(cargo test --features integration_tests --test e2e_cluster -- --list 2>/dev/null | grep -c ': test$')
           echo "selected scenarios: $count"
           test "$count" -ge 1
 
-      - name: Run the harness self-test
-        run: cargo test --features integration_tests --test e2e_harness
+      - name: Run the cluster suite
+        run: cargo test --features integration_tests --test e2e_cluster
         env:
           RUST_LOG: DEBUG
           RUST_BACKTRACE: full

@@ -28,7 +28,7 @@ pub mod health;
 pub mod openapi;
 
 use crate::config::RestServerConfig;
-use crate::error::{ErrorEnvelope, GatewayError};
+use crate::error::{ErrorEnvelope, ErrorKind, GatewayError};
 use crate::lifecycle::Readiness;
 use crate::observability;
 use axum::Router;
@@ -114,7 +114,7 @@ impl From<&RestServerConfig> for RestOptions {
 struct ShapedResponse;
 
 /// Renders the error envelope with the status its kind maps to, marks the response as already shaped, and adds
-/// `Retry-After` to the kinds that are worth retrying after a short pause.
+/// `Retry-After` where the taxonomy calls for it.
 pub fn error_response(error: &GatewayError, request_id: &RequestId) -> Response {
     let status = StatusCode::from_u16(error.kind().http_status())
         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -122,10 +122,7 @@ pub fn error_response(error: &GatewayError, request_id: &RequestId) -> Response 
         json_response_with_status(status, &ErrorEnvelope::new(error, request_id.as_str()))
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
     response.extensions_mut().insert(ShapedResponse);
-    if matches!(
-        error.kind(),
-        crate::error::ErrorKind::Unavailable | crate::error::ErrorKind::ResourceExhausted
-    ) {
+    if error.kind().retry_after() {
         response
             .headers_mut()
             .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
@@ -201,12 +198,6 @@ pub fn ensure_no_query(uri: &Uri) -> Result<(), GatewayError> {
         ));
     }
     Ok(())
-}
-
-/// Deserializes the URI query string. Unknown or malformed parameters are rejected as invalid arguments.
-pub fn parse_query<T: DeserializeOwned>(uri: &Uri) -> Result<T, GatewayError> {
-    serde_urlencoded::from_str(uri.query().unwrap_or_default())
-        .map_err(|error| GatewayError::invalid_argument(format!("invalid query: {error}")))
 }
 
 /// Marks a response as final so the error-normalising middleware does not rewrite its body. Use it for handler
@@ -317,7 +308,6 @@ fn apply_data_limits(router: Router, options: &RestOptions) -> Router {
 
         let oversized = declared_content_length(&request).filter(|length| *length > max_body_bytes);
         if let Some(length) = oversized {
-            observability::http_rejection("body_size");
             log::warn!(
                 "request_id={} rejecting body of {} bytes above {} bytes",
                 request_id.as_str(),
@@ -332,13 +322,12 @@ fn apply_data_limits(router: Router, options: &RestOptions) -> Router {
             );
         }
 
-        observability::http_inflight(1);
+        // Rejections are not counted separately: they leave through the access-log layer above, which
+        // records them in `fluss_gateway_rest_requests_total` under their status code.
         let result = tokio::time::timeout(request_timeout, next.run(request)).await;
-        observability::http_inflight(-1);
         match result {
             Ok(response) => response,
             Err(_) => {
-                observability::http_rejection("timeout");
                 log::warn!(
                     "request_id={} deadline exceeded after {:?}",
                     request_id.as_str(),
@@ -419,6 +408,33 @@ async fn request_context(mut request: Request, next: Next) -> Response {
     response
 }
 
+/// Classifies a status the framework produced on its own — a rejected extractor, a route that exists for
+/// another method — so it can be answered with the same envelope as a handler failure.
+fn framework_error_kind(status: StatusCode) -> ErrorKind {
+    match status.as_u16() {
+        400 | 422 => ErrorKind::InvalidArgument,
+        404 => ErrorKind::NotFound,
+        405 => ErrorKind::MethodNotAllowed,
+        406 => ErrorKind::NotAcceptable,
+        408 | 504 => ErrorKind::DeadlineExceeded,
+        413 => ErrorKind::LimitExceeded,
+        415 => ErrorKind::UnsupportedMediaType,
+        429 => ErrorKind::ResourceExhausted,
+        501 => ErrorKind::Unsupported,
+        503 => ErrorKind::Unavailable,
+        server_error if server_error >= 500 => ErrorKind::Internal,
+        _ => ErrorKind::InvalidArgument,
+    }
+}
+
+/// The reason phrase of the status a kind maps to, so this layer keeps no message table of its own.
+fn framework_error_message(kind: ErrorKind) -> &'static str {
+    StatusCode::from_u16(kind.http_status())
+        .ok()
+        .and_then(|status| status.canonical_reason())
+        .unwrap_or("request failed")
+}
+
 fn normalize_error(response: Response, request_id: &RequestId) -> Response {
     let status = response.status();
     if !(status.is_client_error() || status.is_server_error()) {
@@ -428,39 +444,11 @@ fn normalize_error(response: Response, request_id: &RequestId) -> Response {
         return response;
     }
 
-    let (status, code, message, retryable) = match status.as_u16() {
-        400 | 422 => (400, "invalid_argument", "invalid request", false),
-        404 => (404, "not_found", "resource not found", false),
-        405 => (405, "method_not_allowed", "method not allowed", false),
-        406 => (406, "not_acceptable", "unacceptable accept header", false),
-        408 | 504 => (504, "timeout", "request deadline exceeded", true),
-        413 => (413, "limit_exceeded", "request body too large", false),
-        415 => (
-            415,
-            "unsupported_media_type",
-            "unsupported media type",
-            false,
-        ),
-        501 => (501, "unsupported", "unsupported operation", false),
-        503 => (503, "unavailable", "service unavailable", true),
-        other => (
-            other,
-            if other >= 500 {
-                "internal"
-            } else {
-                "invalid_argument"
-            },
-            "request failed",
-            false,
-        ),
-    };
-
-    let envelope = ErrorEnvelope::from_parts(code, message, request_id.as_str(), retryable);
-    json_response_with_status(
-        StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-        &envelope,
+    let kind = framework_error_kind(status);
+    error_response(
+        &GatewayError::new(kind, framework_error_message(kind)),
+        request_id,
     )
-    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 async fn unknown_route(method: Method, uri: Uri, request: Request) -> Response {
@@ -522,13 +510,6 @@ mod tests {
         value: u32,
     }
 
-    #[derive(Debug, Deserialize, PartialEq)]
-    #[serde(deny_unknown_fields)]
-    struct QueryFixture {
-        spec: String,
-        bucket: i32,
-    }
-
     async fn body_json(response: Response) -> serde_json::Value {
         let bytes = response
             .into_body()
@@ -568,22 +549,6 @@ mod tests {
         assert!(parse_json_body::<BodyFixture>(&headers, &Bytes::new()).is_err());
     }
 
-    #[test]
-    fn shared_query_parser_decodes_and_rejects_duplicates() {
-        let uri: Uri = "/?spec=hello%20world&bucket=7".parse().unwrap();
-        assert_eq!(
-            parse_query::<QueryFixture>(&uri).unwrap(),
-            QueryFixture {
-                spec: "hello world".to_string(),
-                bucket: 7,
-            }
-        );
-        let repeated: Uri = "/?spec=a&spec=b&bucket=7".parse().unwrap();
-        assert!(parse_query::<QueryFixture>(&repeated).is_err());
-        let unknown: Uri = "/?spec=a&bucket=7&extra=1".parse().unwrap();
-        assert!(parse_query::<QueryFixture>(&unknown).is_err());
-    }
-
     #[tokio::test]
     async fn unknown_route_yields_404_envelope() {
         let app = build_router(test_support::test_state(), &test_support::test_options());
@@ -603,7 +568,6 @@ mod tests {
         let json = body_json(response).await;
         assert_eq!(json["error"]["code"], "not_found");
         assert_eq!(json["error"]["request_id"], header_id.as_str());
-        assert_eq!(json["error"]["retryable"], false);
         assert!(
             json["error"]["message"].as_str().unwrap().contains("/nope"),
             "message names the missing route: {json}"
@@ -654,7 +618,31 @@ mod tests {
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
         let json = body_json(response).await;
         assert_eq!(json["error"]["code"], "timeout");
-        assert_eq!(json["error"]["retryable"], true);
+    }
+
+    /// A route that exists for another method answers the shared envelope with a code the published
+    /// vocabulary contains.
+    #[tokio::test]
+    async fn wrong_method_yields_a_405_envelope() {
+        let app = build_router(test_support::test_state(), &test_support::test_options());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        let json = body_json(response).await;
+        assert_eq!(json["error"]["code"], "method_not_allowed");
+        assert!(
+            crate::error::wire_codes().contains(&"method_not_allowed"),
+            "the published vocabulary declares every code the gateway emits"
+        );
     }
 
     #[tokio::test]
@@ -671,7 +659,7 @@ mod tests {
         let request = || Request::builder().uri("/slow").body(Body::empty()).unwrap();
 
         let responses =
-            futures::future::join_all((0..16).map(|_| app.clone().oneshot(request()))).await;
+            futures_util::future::join_all((0..16).map(|_| app.clone().oneshot(request()))).await;
 
         for response in responses {
             assert_eq!(response.unwrap().status(), StatusCode::OK);

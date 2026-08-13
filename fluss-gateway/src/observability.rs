@@ -15,20 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Process logging and the complete gateway metric inventory.
+//! Process logging and the gateway metric inventory.
 //!
-//! [`METRIC_DEFINITIONS`] is the cardinality contract: every gateway-owned metric family is declared here once,
-//! with its kind, unit, description, and label set. Emission goes exclusively through the typed helpers in this
-//! module so no call site can invent a family or a label that the inventory does not know about.
+//! [`METRIC_DEFINITIONS`] tracks the FIP-49 metric table: every family declared here is one the
+//! specification names, with its kind, unit, description, and label set. Families the FIP defines for
+//! capabilities that do not exist yet — the backend write and connection-pool families, the re-exported
+//! client backpressure families — arrive with those capabilities. The inventory never grows a family of its
+//! own; the tests below enforce that against the table.
 //!
 //! Labels describe an operation or a bounded outcome. `cluster`, sourced from validated configuration, is the
-//! only resource-name label; database, table, and partition names are never labels.
+//! only resource-name label the gateway itself emits.
 
 use log::{LevelFilter, Log, Metadata, Record};
 use metrics::Unit;
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use std::sync::OnceLock;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 /// Logger that writes one line per record to standard error, with no filtering beyond the global level.
 struct StderrLogger;
@@ -53,6 +55,16 @@ impl Log for StderrLogger {
 static LOGGER: StderrLogger = StderrLogger;
 static METRICS_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
 
+/// Buckets for the duration histograms, spanning a fast local answer to a request that runs into the
+/// configured deadline.
+///
+/// Without explicit buckets `metrics-exporter-prometheus` renders every histogram as a summary with
+/// pre-computed quantiles, which cannot be aggregated across gateway instances — and FIP-49 asks for a
+/// histogram.
+const DURATION_BUCKETS: &[f64] = &[
+    0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
+];
+
 /// Which Prometheus instrument a metric family uses.
 #[derive(Clone, Copy)]
 pub enum MetricKind {
@@ -72,46 +84,11 @@ pub struct MetricDefinition {
     pub labels: &'static [&'static str],
 }
 
-/// The complete inventory of gateway-owned metric families.
+/// The gateway's slice of the FIP-49 metric table.
 ///
-/// Adding an emission site means adding its family here first. Nothing in the gateway emits a family absent from
-/// this table, and the tests below enforce the label-cardinality rules.
+/// Adding an emission site means adding its family here first, and a family may only be added if the FIP
+/// declares it.
 pub const METRIC_DEFINITIONS: &[MetricDefinition] = &[
-    metric(
-        "fluss_gateway_process_start_time_seconds",
-        MetricKind::Gauge,
-        Some(Unit::Seconds),
-        "Gateway process start time since the Unix epoch.",
-        &[],
-    ),
-    metric(
-        "fluss_gateway_process_ready",
-        MetricKind::Gauge,
-        None,
-        "Whether the gateway accepts requests.",
-        &[],
-    ),
-    metric(
-        "fluss_gateway_process_shutting_down",
-        MetricKind::Gauge,
-        None,
-        "Whether graceful shutdown has begun.",
-        &[],
-    ),
-    metric(
-        "fluss_gateway_process_shutdown_total",
-        MetricKind::Counter,
-        None,
-        "Gateway shutdown outcomes: success, task_error, or cleanup_error.",
-        &["result"],
-    ),
-    metric(
-        "fluss_gateway_process_shutdown_duration_seconds",
-        MetricKind::Histogram,
-        Some(Unit::Seconds),
-        "Gateway graceful-shutdown duration by success, task_error, or cleanup_error.",
-        &["result"],
-    ),
     metric(
         "fluss_gateway_rest_requests_total",
         MetricKind::Counter,
@@ -128,26 +105,10 @@ pub const METRIC_DEFINITIONS: &[MetricDefinition] = &[
         "REST request duration.",
         &["cluster", "method", "operation"],
     ),
-    metric(
-        "fluss_gateway_rest_inflight_requests",
-        MetricKind::Gauge,
-        None,
-        "REST requests currently executing.",
-        &[],
-    ),
-    metric(
-        "fluss_gateway_rest_rejections_total",
-        MetricKind::Counter,
-        None,
-        "REST requests rejected by an input-validation limit or the request deadline.",
-        &["reason"],
-    ),
     // FIP-49 process and Tokio runtime families, sampled periodically by the runtime sampler.
-    // `process_cpu_seconds_total` is monotonic but published through the gauge instrument because
-    // the `metrics` counter API is integral; the exposition value is the standard fractional total.
     metric(
         "process_cpu_seconds_total",
-        MetricKind::Gauge,
+        MetricKind::Counter,
         Some(Unit::Seconds),
         "Total user and system CPU time spent by the gateway process.",
         &[],
@@ -164,6 +125,13 @@ pub const METRIC_DEFINITIONS: &[MetricDefinition] = &[
         MetricKind::Gauge,
         None,
         "Open file descriptors of the gateway process.",
+        &[],
+    ),
+    metric(
+        "process_max_fds",
+        MetricKind::Gauge,
+        None,
+        "File descriptor limit of the gateway process.",
         &[],
     ),
     metric(
@@ -216,42 +184,16 @@ pub fn init_metrics(enabled: bool) -> Result<(), String> {
     if !enabled || METRICS_HANDLE.get().is_some() {
         return Ok(());
     }
-    let recorder = PrometheusBuilder::new().build_recorder();
+    let recorder = PrometheusBuilder::new()
+        .set_buckets(DURATION_BUCKETS)
+        .map_err(|error| format!("failed to configure histogram buckets: {error}"))?
+        .build_recorder();
     let handle = recorder.handle();
     metrics::set_global_recorder(recorder)
         .map_err(|error| format!("failed to install Prometheus recorder: {error}"))?;
     let _ = METRICS_HANDLE.set(handle);
     describe_metrics();
     Ok(())
-}
-
-/// Initializes process series after the recorder is installed.
-pub fn register_process_metrics() {
-    let started = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64();
-    metrics::gauge!("fluss_gateway_process_start_time_seconds").set(started);
-    metrics::gauge!("fluss_gateway_process_ready").set(0.0);
-    metrics::gauge!("fluss_gateway_process_shutting_down").set(0.0);
-}
-
-/// Records that startup completed and request listeners accept work.
-pub fn process_ready() {
-    metrics::gauge!("fluss_gateway_process_ready").set(1.0);
-}
-
-/// Records the start of graceful shutdown before listeners stop accepting.
-pub fn process_draining() {
-    metrics::gauge!("fluss_gateway_process_ready").set(0.0);
-    metrics::gauge!("fluss_gateway_process_shutting_down").set(1.0);
-}
-
-/// Records one terminal graceful-shutdown outcome and its bounded duration.
-pub fn process_stopped(result: &'static str, duration: Duration) {
-    metrics::counter!("fluss_gateway_process_shutdown_total", "result" => result).increment(1);
-    metrics::histogram!("fluss_gateway_process_shutdown_duration_seconds", "result" => result)
-        .record(duration.as_secs_f64());
 }
 
 /// Records one completed REST request against the matched route template, never the raw URI.
@@ -278,21 +220,6 @@ pub fn http_request(cluster: &str, method: &str, operation: &str, code: u16, dur
     .record(duration.as_secs_f64());
 }
 
-/// Adjusts the in-flight request gauge by one in either direction.
-pub fn http_inflight(delta: i8) {
-    let gauge = metrics::gauge!("fluss_gateway_rest_inflight_requests");
-    if delta >= 0 {
-        gauge.increment(f64::from(delta));
-    } else {
-        gauge.decrement(f64::from(-delta));
-    }
-}
-
-/// Records one request rejected before reaching a handler, such as `body_size` or `timeout`.
-pub fn http_rejection(reason: &'static str) {
-    metrics::counter!("fluss_gateway_rest_rejections_total", "reason" => reason).increment(1);
-}
-
 /// Returns the installed recorder handle for the dedicated metrics listener.
 pub fn metrics_handle() -> Option<PrometheusHandle> {
     METRICS_HANDLE.get().cloned()
@@ -309,13 +236,19 @@ pub fn sample_runtime_metrics() {
         metrics::gauge!("tokio_global_queue_depth").set(runtime.global_queue_depth() as f64);
     }
     if let Some(cpu_seconds) = process_cpu_seconds() {
-        metrics::gauge!("process_cpu_seconds_total").set(cpu_seconds);
+        // Whole seconds: the `metrics` counter API is integral, and a `_total` family must keep counter
+        // semantics so `rate()` and the Prometheus/OTLP conversion stay correct. The sub-second remainder
+        // is carried into the next sample rather than lost, since the source is an absolute total.
+        metrics::counter!("process_cpu_seconds_total").absolute(cpu_seconds as u64);
     }
     if let Some(resident) = process_resident_memory_bytes() {
         metrics::gauge!("process_resident_memory_bytes").set(resident);
     }
     if let Some(fds) = process_open_fds() {
         metrics::gauge!("process_open_fds").set(fds);
+    }
+    if let Some(limit) = process_max_fds() {
+        metrics::gauge!("process_max_fds").set(limit);
     }
 }
 
@@ -369,6 +302,26 @@ fn process_open_fds() -> Option<f64> {
 
 #[cfg(not(unix))]
 fn process_open_fds() -> Option<f64> {
+    None
+}
+
+/// The soft file descriptor limit, from `getrlimit(2)`. FIP-49 pairs it with `process_open_fds` so the count
+/// can be read against its ceiling.
+#[cfg(unix)]
+fn process_max_fds() -> Option<f64> {
+    let mut limit = std::mem::MaybeUninit::<libc::rlimit>::zeroed();
+    // SAFETY: `getrlimit` fills the buffer we own; a non-zero return leaves it unread.
+    let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+    // SAFETY: `getrlimit` returned 0, so the buffer is initialized.
+    let limit = unsafe { limit.assume_init() };
+    Some(limit.rlim_cur as f64)
+}
+
+#[cfg(not(unix))]
+fn process_max_fds() -> Option<f64> {
     None
 }
 
@@ -426,25 +379,47 @@ mod tests {
         assert_eq!(parse_level("module=debug"), LevelFilter::Info);
     }
 
+    /// The FIP-49 metric table, verbatim. The gateway may implement a subset of it and nothing outside it.
+    const FIP_49_FAMILIES: &[&str] = &[
+        "fluss_gateway_rest_requests_total",
+        "fluss_gateway_rest_request_duration_seconds",
+        "fluss_gateway_backend_write_rows_total",
+        "fluss_gateway_backend_write_bytes_total",
+        "fluss_gateway_connections_active",
+        "fluss_gateway_connections_created_total",
+        "fluss_gateway_connections_closed_total",
+        "fluss_client_writer_kv_backpressure_pressure",
+        "fluss_client_writer_kv_backpressure_throttle_seconds_total",
+        "process_cpu_seconds_total",
+        "process_resident_memory_bytes",
+        "process_open_fds",
+        "process_max_fds",
+        "tokio_alive_tasks",
+        "tokio_global_queue_depth",
+        "tokio_worker_busy_seconds_total",
+    ];
+
+    /// Every declared family is one FIP-49 names — the inventory tracks the specification instead of
+    /// growing families of its own.
     #[test]
-    fn metric_inventory_covers_every_required_subsystem() {
-        for prefix in ["fluss_gateway_process_", "fluss_gateway_rest_"] {
+    fn the_inventory_declares_nothing_the_fip_does_not() {
+        for definition in METRIC_DEFINITIONS {
             assert!(
-                METRIC_DEFINITIONS
-                    .iter()
-                    .any(|definition| definition.name.starts_with(prefix)),
-                "missing metric family for {prefix}"
+                FIP_49_FAMILIES.contains(&definition.name),
+                "{} is not in the FIP-49 metric table",
+                definition.name
             );
         }
     }
 
+    /// A `_total` family must be a counter, or `rate()` and the Prometheus/OTLP conversion misread it.
     #[test]
-    fn inventory_declares_no_scan_or_cursor_family() {
+    fn total_families_are_counters() {
         for definition in METRIC_DEFINITIONS {
-            for forbidden in ["fluss_gateway_scan_", "fluss_gateway_cursor_"] {
+            if definition.name.ends_with("_total") {
                 assert!(
-                    !definition.name.starts_with(forbidden),
-                    "stateless gateway must not declare {}",
+                    matches!(definition.kind, MetricKind::Counter),
+                    "{} carries the _total suffix without counter semantics",
                     definition.name
                 );
             }
@@ -463,6 +438,9 @@ mod tests {
         assert_eq!(names.len(), total, "duplicate metric family declared");
     }
 
+    /// Gateway-owned families keep their label sets bounded. The FIP's re-exported
+    /// `fluss_client_writer_kv_backpressure_*` families do carry `database` / `table`; they come from the
+    /// client recorder, not from here, and this rule is relaxed for them when they arrive.
     #[test]
     fn metric_labels_cannot_contain_unbounded_resource_names() {
         const FORBIDDEN: &[&str] = &[

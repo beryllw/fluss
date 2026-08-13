@@ -15,18 +15,21 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# The gateway is its own Cargo workspace. It depends on the Rust client by
-# path but deliberately stays out of the workspace rooted at ../fluss-rust so
-# that gateway dependencies never touch that workspace's lock file or its
-# generated dependency inventories.
+# The gateway is its own Cargo workspace and deliberately stays out of the
+# workspace rooted at ../fluss-rust so that gateway dependencies never touch
+# that workspace's lock file or its generated dependency inventories.
 [workspace]
-resolver = "2"
+resolver = "3"
 
 [package]
 name = "fluss-gateway"
 edition = "2024"
 version = "1.0.0"
 license = "Apache-2.0"
+# The shipped dependency set only needs 1.85, the same floor as fluss-rust. The declared MSRV is 1.88
+# because the dockerized cluster fixture used by the `integration_tests` suites depends on
+# testcontainers, which requires 1.88; dev-dependencies cannot be made optional, so they are part of the
+# `--all-targets` graph. Dropping back to 1.85 means isolating that fixture, not changing the gateway.
 rust-version = "1.88"
 authors = ["Apache Fluss <dev@fluss.apache.org>"]
 repository = "https://github.com/apache/fluss"
@@ -41,20 +44,21 @@ description = "Stateless REST gateway for Apache Fluss"
 name = "fluss-gateway"
 path = "src/main.rs"
 
+# Internal testability boundary for the executable; this is not a published or supported Rust SDK.
 [lib]
 name = "fluss_gateway"
 
 [features]
-# Compiles the end-to-end suites in tests/, which start a dockerized Fluss
-# cluster. Mirrors the `integration_tests` feature of the fluss-rs crate and
-# is never enabled by default.
+# Compiles the end-to-end suites that drive a dockerized Fluss cluster. Mirrors the `integration_tests`
+# feature of the fluss-rs crate and the name FIP-49's test plan uses, and is never enabled by default:
+# the suites need Docker, so CI runs them on demand rather than on every pull request.
 integration_tests = []
 
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "matched-path", "tokio"] }
 clap = { version = "4.5.37", features = ["derive"] }
-toml = "0.8"
-futures = "0.3"
+# Only FutureExt/join_all are used; avoid the larger futures facade crate.
+futures-util = "0.3"
 # Process CPU/RSS/fd sampling for the FIP-49 process_* metric families.
 libc = "0.2"
 log = "0.4"
@@ -62,22 +66,27 @@ metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.17", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-# The shared query-string parser of the REST layer (`parse_query`).
-serde_urlencoded = "0.7"
+# Preserves the nested typed field path after file, env, and CLI values are merged.
+serde_path_to_error = "0.1"
 # The gateway.yaml configuration file is YAML with flat dotted keys (FIP-49).
-serde_yaml = "0.9"
-tokio = { version = "1.44.2", features = ["full"] }
+# serde_yaml_ng is the maintained, API-compatible fork of the archived serde_yaml crate.
+serde_yaml_ng = "0.10"
+# Runtime capabilities used by the server; test-only I/O/time controls are enabled below.
+tokio = { version = "1.44.2", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 utoipa = { version = "5", features = ["axum_extras"] }
 utoipa-axum = "0.2"
 uuid = { version = "1.10", features = ["v4"] }
 
 [dev-dependencies]
+# The dockerized fixed-version Fluss cluster of the Rust client, reused as-is so the gateway's end-to-end
+# suites and the client's own agree on how a test cluster is started.
 fluss-test-cluster = { path = "../fluss-rust/crates/fluss-test-cluster" }
 http-body-util = "0.1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "blocking"] }
+# No `blocking`: every suite is async, and the blocking client panics when dropped inside a tokio context.
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
 tempfile = "3"
-tokio = { version = "1.44.2", features = ["full", "test-util"] }
+tokio = { version = "1.44.2", features = ["io-util", "test-util"] }
 tower = { version = "0.5", features = ["util"] }
 
 [[test]]
@@ -87,4 +96,4 @@ name = "http_api"
 name = "process"
 
 [[test]]
-name = "e2e_harness"
+name = "e2e_cluster"

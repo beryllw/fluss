@@ -65,8 +65,42 @@ async fn an_unknown_route_returns_the_shared_error_envelope() {
     assert!(response.headers().contains_key("x-request-id"));
     let body: serde_json::Value = response.json().await.expect("JSON body");
     assert_eq!(body["error"]["code"], "not_found");
-    assert_eq!(body["error"]["retryable"], false);
     assert!(body["error"]["request_id"].as_str().is_some());
+    assert_eq!(
+        body["error"].as_object().expect("error object").len(),
+        3,
+        "the FIP-49 envelope carries code, message, and the correlating request id: {body}"
+    );
+
+    gateway.shutdown().await.expect("clean shutdown");
+}
+
+/// The duration families are exported as Prometheus histograms, which aggregate across gateway instances.
+/// Without explicit buckets the exporter emits pre-computed summary quantiles instead, which do not.
+#[tokio::test]
+async fn request_durations_are_exported_as_histograms() {
+    let gateway = support::start_gateway_with_metrics().await;
+    let api = Api::new(format!("http://{}", gateway.local_addr()));
+    let metrics_address = gateway
+        .metrics_addr()
+        .expect("the metrics listener is bound");
+
+    api.get_ok("/health").await;
+    let exposition = Api::new(format!("http://{metrics_address}"))
+        .get("/metrics")
+        .await
+        .text()
+        .await
+        .expect("metrics body");
+
+    assert!(
+        exposition.contains("# TYPE fluss_gateway_rest_request_duration_seconds histogram"),
+        "duration is a histogram: {exposition}"
+    );
+    assert!(
+        exposition.contains("fluss_gateway_rest_request_duration_seconds_bucket"),
+        "histogram buckets are exported: {exposition}"
+    );
 
     gateway.shutdown().await.expect("clean shutdown");
 }

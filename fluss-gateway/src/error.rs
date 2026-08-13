@@ -17,199 +17,222 @@
 
 //! Gateway error taxonomy and the REST error envelope.
 //!
-//! [`ErrorKind`] represents client-visible failure conditions independently of the HTTP framework. The REST adapter
-//! obtains each status code from [`ErrorKind::http_status`].
+//! [`ErrorKind`] represents client-visible failure conditions. Its variants, HTTP statuses, wire codes, and
+//! `Retry-After` rule are declared once by the `error_kinds!` table below — the table-driven form
+//! `http::StatusCode` uses for the same problem — so a new condition cannot be added to one mapping and
+//! forgotten in another.
 //!
-//! The taxonomy is deliberately closed at fifteen kinds. There is no `GONE` or `CURSOR_NOT_LOCAL` because the
-//! gateway holds no cursors. The gateway applies no request rate limiting — the only per-request bounds are
-//! input-validation caps, surfacing as [`ErrorKind::LimitExceeded`] (413) or
-//! [`ErrorKind::InvalidArgument`] (400) — but per-user act-as connections are a bounded resource, so
-//! [`ErrorKind::ResourceExhausted`] (429, with a `Retry-After` header per FIP-49) reports connection-capacity
-//! exhaustion under the user identity mode.
+//! The wire vocabulary has a single source too: [`wire_codes`] enumerates every code the gateway can emit,
+//! and the OpenAPI `ErrorCode` schema is generated from it, so the published contract cannot drift from the
+//! taxonomy.
 //!
 //! FIP-49 error-model notes: the FIP's `database_not_empty` (409) condition is carried by
-//! [`ErrorKind::FailedPrecondition`], and its `*_not_found` / `*_already_exists` families collapse onto
-//! [`ErrorKind::NotFound`] / [`ErrorKind::AlreadyExists`] with the resource named in
-//! [`ErrorDetails`], keeping one stable code per condition kind.
+//! [`ErrorKind::FailedPrecondition`], and its `*_not_found` / `*_already_exists` families are the
+//! [`ErrorKind::NotFound`] / [`ErrorKind::AlreadyExists`] kinds qualified by a [`Resource`], keeping one
+//! stable code per condition.
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::fmt;
+use utoipa::openapi::schema::Type;
+use utoipa::openapi::{ObjectBuilder, RefOr, Schema};
+use utoipa::{PartialSchema, ToSchema};
 
-/// Client-visible condition kinds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ErrorKind {
-    /// The request contains malformed input, an invalid identifier, or a type mismatch. Maps to HTTP 400.
-    InvalidArgument,
-    /// The request carries no usable credential, or the credential failed verification. Maps to HTTP 401.
-    Unauthenticated,
-    /// The authenticated principal is not allowed to perform the operation. Maps to HTTP 403.
-    Unauthorized,
-    /// The requested database, table, or partition does not exist. Maps to HTTP 404.
-    NotFound,
-    /// A create operation conflicts with an existing resource. Maps to HTTP 409.
-    AlreadyExists,
-    /// Current resource state prevents the requested operation. Maps to HTTP 409.
-    FailedPrecondition,
-    /// The operation or table format is not supported. Maps to HTTP 501.
-    Unsupported,
-    /// The request media type is not supported. Maps to HTTP 415.
-    UnsupportedMediaType,
-    /// The `Accept` header does not allow a supported response type. Maps to HTTP 406.
-    NotAcceptable,
-    /// The request exceeds a configured input-validation size limit. Maps to HTTP 413.
-    LimitExceeded,
-    /// A bounded resource (per-user act-as connections) is at capacity. Maps to HTTP 429.
-    ResourceExhausted,
-    /// The request exceeded its deadline. Maps to HTTP 504.
-    DeadlineExceeded,
-    /// Work was cancelled by the caller or by shutdown. Maps to HTTP 499.
-    Cancelled,
-    /// The backend is unavailable or the gateway is not ready. Maps to HTTP 503.
-    Unavailable,
-    /// The Fluss backend failed in a way the gateway cannot classify further. Maps to HTTP 500
-    /// with the FIP-49 `backend` code, distinguishable from a gateway-internal failure.
-    Backend,
-    /// An unexpected internal failure occurred. Maps to HTTP 500.
-    Internal,
-}
-
-impl ErrorKind {
-    /// Every kind in declaration order.
-    ///
-    /// Kept in sync with the enum by [`ErrorKind::ordinal`], whose exhaustive match stops compiling when a
-    /// variant is added without extending this table.
-    pub const ALL: [ErrorKind; 16] = [
-        ErrorKind::InvalidArgument,
-        ErrorKind::Unauthenticated,
-        ErrorKind::Unauthorized,
-        ErrorKind::NotFound,
-        ErrorKind::AlreadyExists,
-        ErrorKind::FailedPrecondition,
-        ErrorKind::Unsupported,
-        ErrorKind::UnsupportedMediaType,
-        ErrorKind::NotAcceptable,
-        ErrorKind::LimitExceeded,
-        ErrorKind::ResourceExhausted,
-        ErrorKind::DeadlineExceeded,
-        ErrorKind::Cancelled,
-        ErrorKind::Unavailable,
-        ErrorKind::Backend,
-        ErrorKind::Internal,
-    ];
-
-    /// Position of this kind within [`ErrorKind::ALL`].
-    pub fn ordinal(self) -> usize {
-        match self {
-            ErrorKind::InvalidArgument => 0,
-            ErrorKind::Unauthenticated => 1,
-            ErrorKind::Unauthorized => 2,
-            ErrorKind::NotFound => 3,
-            ErrorKind::AlreadyExists => 4,
-            ErrorKind::FailedPrecondition => 5,
-            ErrorKind::Unsupported => 6,
-            ErrorKind::UnsupportedMediaType => 7,
-            ErrorKind::NotAcceptable => 8,
-            ErrorKind::LimitExceeded => 9,
-            ErrorKind::ResourceExhausted => 10,
-            ErrorKind::DeadlineExceeded => 11,
-            ErrorKind::Cancelled => 12,
-            ErrorKind::Unavailable => 13,
-            ErrorKind::Backend => 14,
-            ErrorKind::Internal => 15,
+/// Declares the error taxonomy: one row per condition, carrying its HTTP status, its stable wire code, and
+/// whether a response advertises `Retry-After`.
+///
+/// Generating [`ErrorKind`] and its mappings from the same rows keeps them in step by construction: the
+/// generated matches are exhaustive, so a row is the only way to add a variant.
+macro_rules! error_kinds {
+    (
+        $(
+            $(#[$docs:meta])*
+            $variant:ident => $status:literal, $code:literal, retry_after: $retry_after:literal;
+        )+
+    ) => {
+        /// Client-visible condition kinds, ordered by HTTP status.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum ErrorKind {
+            $(
+                $(#[$docs])*
+                $variant,
+            )+
         }
-    }
 
-    /// Stable machine-readable code carried in the error envelope, for example `not_found`.
-    pub fn code(self) -> &'static str {
-        match self {
-            ErrorKind::InvalidArgument => "invalid_argument",
-            ErrorKind::Unauthenticated => "unauthenticated",
-            ErrorKind::Unauthorized => "unauthorized",
-            ErrorKind::NotFound => "not_found",
-            ErrorKind::AlreadyExists => "already_exists",
-            ErrorKind::FailedPrecondition => "failed_precondition",
-            ErrorKind::Unsupported => "unsupported",
-            ErrorKind::UnsupportedMediaType => "unsupported_media_type",
-            ErrorKind::NotAcceptable => "not_acceptable",
-            ErrorKind::LimitExceeded => "limit_exceeded",
-            ErrorKind::ResourceExhausted => "resource_exhausted",
-            ErrorKind::DeadlineExceeded => "timeout",
-            ErrorKind::Cancelled => "cancelled",
-            ErrorKind::Unavailable => "unavailable",
-            ErrorKind::Backend => "backend",
-            ErrorKind::Internal => "internal",
-        }
-    }
+        impl ErrorKind {
+            /// Every kind, in declaration order.
+            pub const ALL: &'static [ErrorKind] = &[$( ErrorKind::$variant, )+];
 
-    /// The REST HTTP mapping table.
-    ///
-    /// Kept as a plain `u16` so this module stays free of HTTP framework types. The REST adapter converts to its own
-    /// status type.
-    pub fn http_status(self) -> u16 {
-        match self {
-            ErrorKind::InvalidArgument => 400,
-            ErrorKind::Unauthenticated => 401,
-            ErrorKind::Unauthorized => 403,
-            ErrorKind::NotFound => 404,
-            ErrorKind::AlreadyExists | ErrorKind::FailedPrecondition => 409,
-            ErrorKind::Unsupported => 501,
-            ErrorKind::UnsupportedMediaType => 415,
-            ErrorKind::NotAcceptable => 406,
-            ErrorKind::LimitExceeded => 413,
-            ErrorKind::ResourceExhausted => 429,
-            ErrorKind::DeadlineExceeded => 504,
-            ErrorKind::Cancelled => 499,
-            ErrorKind::Unavailable => 503,
-            ErrorKind::Backend | ErrorKind::Internal => 500,
-        }
-    }
-
-    /// Whether repeating an otherwise unchanged request may succeed.
-    ///
-    /// This is the default for a kind. A native failure whose `FlussError::is_retriable()` disagrees overrides it
-    /// per error through [`GatewayError::with_retryable`].
-    pub fn default_retryable(self) -> bool {
-        match self {
-            ErrorKind::DeadlineExceeded | ErrorKind::Unavailable | ErrorKind::ResourceExhausted => {
-                true
+            /// Stable machine-readable code carried in the error envelope, for example `not_found`.
+            pub fn code(self) -> &'static str {
+                match self {
+                    $( Self::$variant => $code, )+
+                }
             }
-            ErrorKind::InvalidArgument
-            | ErrorKind::Unauthenticated
-            | ErrorKind::Unauthorized
-            | ErrorKind::NotFound
-            | ErrorKind::AlreadyExists
-            | ErrorKind::FailedPrecondition
-            | ErrorKind::Unsupported
-            | ErrorKind::UnsupportedMediaType
-            | ErrorKind::NotAcceptable
-            | ErrorKind::LimitExceeded
-            | ErrorKind::Cancelled
-            | ErrorKind::Backend
-            | ErrorKind::Internal => false,
+
+            /// The REST HTTP mapping.
+            ///
+            /// Kept as a plain `u16` so this module stays free of HTTP framework types. The REST adapter
+            /// converts to its own status type.
+            pub fn http_status(self) -> u16 {
+                match self {
+                    $( Self::$variant => $status, )+
+                }
+            }
+
+            /// Whether a response carrying this kind advertises `Retry-After`, which FIP-49 requires of
+            /// every 429 and which the gateway also sends for a transient backend outage.
+            pub fn retry_after(self) -> bool {
+                match self {
+                    $( Self::$variant => $retry_after, )+
+                }
+            }
         }
+    };
+}
+
+error_kinds! {
+    /// The request contains malformed input, an invalid identifier, or a type mismatch.
+    InvalidArgument => 400, "invalid_argument", retry_after: false;
+    /// The request carries no usable credential, or the credential failed verification.
+    Unauthenticated => 401, "unauthenticated", retry_after: false;
+    /// The authenticated principal is not allowed to perform the operation.
+    Unauthorized => 403, "unauthorized", retry_after: false;
+    /// The requested cluster, database, table, or partition does not exist.
+    NotFound => 404, "not_found", retry_after: false;
+    /// The route exists but not for the request method.
+    MethodNotAllowed => 405, "method_not_allowed", retry_after: false;
+    /// The `Accept` header does not allow a supported response type.
+    NotAcceptable => 406, "not_acceptable", retry_after: false;
+    /// A create operation conflicts with an existing resource.
+    AlreadyExists => 409, "already_exists", retry_after: false;
+    /// Current resource state prevents the requested operation.
+    FailedPrecondition => 409, "failed_precondition", retry_after: false;
+    /// The request exceeds a configured input-validation size limit.
+    LimitExceeded => 413, "limit_exceeded", retry_after: false;
+    /// The request media type is not supported.
+    UnsupportedMediaType => 415, "unsupported_media_type", retry_after: false;
+    /// A bounded resource (per-user act-as connections) is at capacity.
+    ResourceExhausted => 429, "resource_exhausted", retry_after: true;
+    /// Work was cancelled by the caller or by shutdown.
+    Cancelled => 499, "cancelled", retry_after: false;
+    /// The Fluss backend failed in a way the gateway cannot classify further, distinguishable from a
+    /// gateway-internal failure.
+    Backend => 500, "backend", retry_after: false;
+    /// An unexpected internal failure occurred.
+    Internal => 500, "internal", retry_after: false;
+    /// The operation or table format is not supported.
+    Unsupported => 501, "unsupported", retry_after: false;
+    /// The backend is unavailable or the gateway is not ready.
+    Unavailable => 503, "unavailable", retry_after: true;
+    /// The request exceeded its deadline.
+    DeadlineExceeded => 504, "timeout", retry_after: false;
+}
+
+/// A resource a failure can name, selecting the FIP-49 resource-specific wire code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Resource {
+    Cluster,
+    Database,
+    Table,
+    Partition,
+}
+
+/// The FIP-49 resource-specific codes.
+///
+/// Only the combinations the FIP names appear here; any other kind/resource pair keeps the kind's generic
+/// code, so the gateway never invents a code for a condition the contract does not describe.
+const RESOURCE_CODES: &[(ErrorKind, Resource, &str)] = &[
+    (ErrorKind::NotFound, Resource::Cluster, "cluster_not_found"),
+    (
+        ErrorKind::NotFound,
+        Resource::Database,
+        "database_not_found",
+    ),
+    (ErrorKind::NotFound, Resource::Table, "table_not_found"),
+    (
+        ErrorKind::NotFound,
+        Resource::Partition,
+        "partition_not_found",
+    ),
+    (
+        ErrorKind::AlreadyExists,
+        Resource::Cluster,
+        "cluster_already_exists",
+    ),
+    (
+        ErrorKind::AlreadyExists,
+        Resource::Database,
+        "database_already_exists",
+    ),
+    (
+        ErrorKind::AlreadyExists,
+        Resource::Table,
+        "table_already_exists",
+    ),
+    (
+        ErrorKind::AlreadyExists,
+        Resource::Partition,
+        "partition_already_exists",
+    ),
+    // The one precondition the FIP names: dropping a non-empty database.
+    (
+        ErrorKind::FailedPrecondition,
+        Resource::Database,
+        "database_not_empty",
+    ),
+];
+
+fn resource_code(kind: ErrorKind, resource: Resource) -> Option<&'static str> {
+    RESOURCE_CODES
+        .iter()
+        .find(|(row_kind, row_resource, _)| *row_kind == kind && *row_resource == resource)
+        .map(|(_, _, code)| *code)
+}
+
+/// Every code the gateway can put on the wire, sorted and deduplicated.
+///
+/// The OpenAPI `ErrorCode` schema is built from this, so the published vocabulary is the taxonomy itself
+/// rather than a hand-maintained copy of it.
+pub fn wire_codes() -> Vec<&'static str> {
+    let mut codes: Vec<&'static str> = ErrorKind::ALL.iter().map(|kind| kind.code()).collect();
+    codes.extend(RESOURCE_CODES.iter().map(|(_, _, code)| *code));
+    codes.sort_unstable();
+    codes.dedup();
+    codes
+}
+
+/// Schema handle for the `code` field: a string restricted to [`wire_codes`].
+///
+/// A marker type rather than a mirrored enum, so the documented vocabulary is generated from the taxonomy
+/// and cannot fall behind it.
+#[derive(Debug)]
+pub struct ErrorCode;
+
+impl PartialSchema for ErrorCode {
+    fn schema() -> RefOr<Schema> {
+        ObjectBuilder::new()
+            .schema_type(Type::String)
+            .description(Some(
+                "Stable error code, resource-specific where the error names a resource.",
+            ))
+            .enum_values(Some(wire_codes()))
+            .into()
     }
 }
+
+impl ToSchema for ErrorCode {}
 
 /// Gateway-internal error: a condition kind plus a client-safe message.
 ///
-/// Messages must never contain stack traces, internal addresses, or wire payloads. Operational detail belongs in
-/// the log.
+/// Messages must never contain stack traces, internal addresses, or wire payloads. Operational detail belongs
+/// in the log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayError {
     kind: ErrorKind,
     message: String,
-    details: Option<ErrorDetails>,
-    /// Overrides [`ErrorKind::default_retryable`] when the native layer knows better.
-    retryable: Option<bool>,
-}
-
-/// Optional protocol-neutral structured context for a public error.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ErrorDetails {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub resource_kind: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub resource_name: Option<String>,
+    /// Selects the resource-specific wire code. Never serialized: the resource is already named in the
+    /// message, and FIP-49's envelope carries no structured details.
+    resource: Option<Resource>,
 }
 
 impl GatewayError {
@@ -218,8 +241,7 @@ impl GatewayError {
         Self {
             kind,
             message: message.into(),
-            details: None,
-            retryable: None,
+            resource: None,
         }
     }
 
@@ -307,64 +329,20 @@ impl GatewayError {
 
     /// Stable code carried in the error envelope.
     ///
-    /// Per FIP-49 the vocabulary is resource-specific where a resource is known: an error whose
-    /// kind names a resource and that carries machine-readable resource context answers
-    /// `database_not_found`, `table_already_exists`, `database_not_empty`, and so on. `cluster`
-    /// follows the same `*_not_found` pattern as a natural extension — the FIP table predates the
-    /// multi-cluster path segment. An error without resource context keeps its kind's generic
-    /// code, so the gateway never guesses which resource a bare failure was about.
+    /// An error that names a resource answers the resource-specific code that FIP-49 defines for the pair;
+    /// any other error keeps its kind's generic code.
     pub fn code(&self) -> &'static str {
-        let resource = self
-            .details
-            .as_ref()
-            .and_then(|details| details.resource_kind.as_deref());
-        match (self.kind, resource) {
-            (ErrorKind::NotFound, Some("cluster")) => "cluster_not_found",
-            (ErrorKind::NotFound, Some("database")) => "database_not_found",
-            (ErrorKind::NotFound, Some("table")) => "table_not_found",
-            (ErrorKind::NotFound, Some("partition")) => "partition_not_found",
-            (ErrorKind::AlreadyExists, Some("cluster")) => "cluster_already_exists",
-            (ErrorKind::AlreadyExists, Some("database")) => "database_already_exists",
-            (ErrorKind::AlreadyExists, Some("table")) => "table_already_exists",
-            (ErrorKind::AlreadyExists, Some("partition")) => "partition_already_exists",
-            // The one precondition the FIP names: dropping a non-empty database. Every other
-            // precondition failure (e.g. a table changing during write preflight) keeps the
-            // generic code.
-            (ErrorKind::FailedPrecondition, Some("database")) => "database_not_empty",
-            _ => self.kind.code(),
-        }
+        self.resource
+            .and_then(|resource| resource_code(self.kind, resource))
+            .unwrap_or_else(|| self.kind.code())
     }
 
-    /// Whether repeating an otherwise unchanged request may succeed.
+    /// Names the resource this error is about, selecting the resource-specific code.
     ///
-    /// Defaults to [`ErrorKind::default_retryable`] unless an explicit verdict was recorded.
-    pub fn retryable(&self) -> bool {
-        self.retryable
-            .unwrap_or_else(|| self.kind.default_retryable())
-    }
-
-    /// Records an explicit retry verdict, typically `FlussError::is_retriable()` from the native layer.
-    pub fn with_retryable(mut self, retryable: bool) -> Self {
-        self.retryable = Some(retryable);
+    /// The metadata and DDL capabilities are the first emitters; the vocabulary ships with the wire contract.
+    pub fn with_resource(mut self, resource: Resource) -> Self {
+        self.resource = Some(resource);
         self
-    }
-
-    /// Adds machine-readable resource context without changing the stable error code.
-    pub fn with_resource(
-        mut self,
-        resource_kind: impl Into<String>,
-        resource_name: Option<impl Into<String>>,
-    ) -> Self {
-        self.details = Some(ErrorDetails {
-            resource_kind: Some(resource_kind.into()),
-            resource_name: resource_name.map(Into::into),
-        });
-        self
-    }
-
-    /// Returns optional machine-readable context for protocol adapters.
-    pub fn details(&self) -> Option<&ErrorDetails> {
-        self.details.as_ref()
     }
 }
 
@@ -376,22 +354,28 @@ impl fmt::Display for GatewayError {
 
 impl std::error::Error for GatewayError {}
 
-/// REST error envelope: `{"error": {"code", "message", "request_id", "retryable", "details"?}}`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// REST error envelope: `{"error": {"code", "message", "request_id"}}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+#[schema(examples(json!({
+    "error": {
+        "code": "table_not_found",
+        "message": "table `mydb.orders` does not exist",
+        "request_id": "8f6c7f4a-f9b8-4c71-91ec-6e5578d7a913"
+    }
+})))]
 pub struct ErrorEnvelope {
     pub error: ErrorBody,
 }
 
 /// Body of the REST error envelope.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
 pub struct ErrorBody {
+    #[schema(value_type = ErrorCode)]
     pub code: String,
     pub message: String,
+    /// Correlates the response with the `x-request-id` header and the access log.
+    #[schema(value_type = String, format = "uuid")]
     pub request_id: String,
-    /// Machine-readable retry guidance, derived from the error kind or from `FlussError::is_retriable()`.
-    pub retryable: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub details: Option<ErrorDetails>,
 }
 
 impl ErrorEnvelope {
@@ -402,260 +386,154 @@ impl ErrorEnvelope {
                 code: error.code().to_string(),
                 message: error.message().to_string(),
                 request_id: request_id.into(),
-                retryable: error.retryable(),
-                details: error.details().cloned(),
             },
         }
     }
-
-    /// Builds an envelope for a failure that never had a [`GatewayError`], such as a framework-produced status.
-    ///
-    /// Routing every construction through a constructor keeps callers from leaving a stale struct literal behind
-    /// when the envelope gains a field.
-    pub fn from_parts(
-        code: impl Into<String>,
-        message: impl Into<String>,
-        request_id: impl Into<String>,
-        retryable: bool,
-    ) -> Self {
-        Self {
-            error: ErrorBody {
-                code: code.into(),
-                message: message.into(),
-                request_id: request_id.into(),
-                retryable,
-                details: None,
-            },
-        }
-    }
-}
-
-/// Attaches machine-readable resource context to the error kinds that name a resource.
-#[allow(dead_code)] // The resource-naming emitters arrive with the capability PRs; the wire contract ships now.
-pub(crate) fn resource_error(
-    error: GatewayError,
-    resource_kind: &'static str,
-    resource_name: impl Into<String>,
-) -> GatewayError {
-    if error.details().is_some()
-        || !matches!(
-            error.kind(),
-            ErrorKind::NotFound | ErrorKind::AlreadyExists | ErrorKind::FailedPrecondition
-        )
-    {
-        return error;
-    }
-    error.with_resource(resource_kind, Some(resource_name.into()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The frozen taxonomy. Adding a variant breaks [`ErrorKind::ordinal`] first, then this table.
-    const CONTRACT: [(ErrorKind, u16, &str, bool); 16] = [
-        (ErrorKind::InvalidArgument, 400, "invalid_argument", false),
-        (ErrorKind::Unauthenticated, 401, "unauthenticated", false),
-        (ErrorKind::Unauthorized, 403, "unauthorized", false),
-        (ErrorKind::NotFound, 404, "not_found", false),
-        (ErrorKind::AlreadyExists, 409, "already_exists", false),
-        (
-            ErrorKind::FailedPrecondition,
-            409,
-            "failed_precondition",
-            false,
-        ),
-        (ErrorKind::Unsupported, 501, "unsupported", false),
-        (
-            ErrorKind::UnsupportedMediaType,
-            415,
-            "unsupported_media_type",
-            false,
-        ),
-        (ErrorKind::NotAcceptable, 406, "not_acceptable", false),
-        (ErrorKind::LimitExceeded, 413, "limit_exceeded", false),
-        (
-            ErrorKind::ResourceExhausted,
-            429,
-            "resource_exhausted",
-            true,
-        ),
-        (ErrorKind::DeadlineExceeded, 504, "timeout", true),
-        (ErrorKind::Cancelled, 499, "cancelled", false),
-        (ErrorKind::Unavailable, 503, "unavailable", true),
-        (ErrorKind::Backend, 500, "backend", false),
-        (ErrorKind::Internal, 500, "internal", false),
-    ];
-
+    /// The mappings FIP-49 pins down. The table generates every accessor, so this guards the table's own
+    /// rows against an accidental edit.
     #[test]
-    fn taxonomy_is_frozen_and_exhaustively_mapped() {
-        assert_eq!(ErrorKind::ALL.len(), CONTRACT.len());
-        for (index, (kind, status, code, retryable)) in CONTRACT.into_iter().enumerate() {
-            assert_eq!(kind.ordinal(), index, "{code} is out of declaration order");
-            assert_eq!(ErrorKind::ALL[index], kind, "ALL disagrees for {code}");
+    fn the_fip_mappings_are_frozen() {
+        for (kind, status, code) in [
+            (ErrorKind::InvalidArgument, 400, "invalid_argument"),
+            (ErrorKind::Unauthenticated, 401, "unauthenticated"),
+            (ErrorKind::Unauthorized, 403, "unauthorized"),
+            (ErrorKind::NotFound, 404, "not_found"),
+            (ErrorKind::MethodNotAllowed, 405, "method_not_allowed"),
+            (ErrorKind::LimitExceeded, 413, "limit_exceeded"),
+            (ErrorKind::ResourceExhausted, 429, "resource_exhausted"),
+            (ErrorKind::Cancelled, 499, "cancelled"),
+            (ErrorKind::Backend, 500, "backend"),
+            (ErrorKind::Internal, 500, "internal"),
+            (ErrorKind::Unsupported, 501, "unsupported"),
+            (ErrorKind::Unavailable, 503, "unavailable"),
+            (ErrorKind::DeadlineExceeded, 504, "timeout"),
+        ] {
             assert_eq!(kind.http_status(), status, "status for {code}");
             assert_eq!(kind.code(), code);
-            assert_eq!(kind.default_retryable(), retryable, "retryable for {code}");
         }
     }
 
     #[test]
-    fn only_connection_capacity_maps_to_429_and_nothing_maps_to_a_cursor_status() {
-        for kind in ErrorKind::ALL {
-            let status = kind.http_status();
-            assert_eq!(
-                status == 429,
-                kind == ErrorKind::ResourceExhausted,
-                "{} unexpectedly maps to 429",
-                kind.code()
+    fn the_taxonomy_table_is_well_formed() {
+        let mut codes: Vec<&str> = Vec::new();
+        for kind in ErrorKind::ALL.iter().copied() {
+            let code = kind.code();
+            assert!(
+                (400..=599).contains(&kind.http_status()),
+                "{code} maps to {}",
+                kind.http_status()
             );
-            assert_ne!(status, 410, "{} maps to a cursor status", kind.code());
+            assert!(
+                code.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "{code} is not snake_case"
+            );
+            // `Retry-After` is meaningful only where the caller is meant to come back.
+            assert_eq!(
+                kind.retry_after(),
+                matches!(kind, ErrorKind::ResourceExhausted | ErrorKind::Unavailable),
+                "retry_after for {code}"
+            );
+            codes.push(code);
         }
+        let total = codes.len();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(codes.len(), total, "duplicate wire code declared");
     }
 
     #[test]
     fn envelope_shape() {
-        let err = GatewayError::not_found("table `db.missing` does not exist");
-        let envelope = ErrorEnvelope::new(&err, "req-123");
-        let json = serde_json::to_value(&envelope).unwrap();
+        let error = GatewayError::not_found("table `db.missing` does not exist");
+        let envelope = ErrorEnvelope::new(&error, "req-123");
         assert_eq!(
-            json,
+            serde_json::to_value(&envelope).unwrap(),
             serde_json::json!({
                 "error": {
                     "code": "not_found",
                     "message": "table `db.missing` does not exist",
                     "request_id": "req-123",
-                    "retryable": false,
                 }
             })
         );
     }
 
-    #[test]
-    fn explicit_retry_verdict_overrides_the_kind_default() {
-        let derived = GatewayError::unavailable("Fluss is unavailable");
-        assert!(derived.retryable());
-
-        let overridden = GatewayError::internal("decode failed").with_retryable(true);
-        assert!(overridden.retryable());
-        assert!(
-            !GatewayError::unavailable("permanently gone")
-                .with_retryable(false)
-                .retryable()
-        );
-        assert_eq!(
-            serde_json::to_value(ErrorEnvelope::new(&overridden, "req-1")).unwrap()["error"]["retryable"],
-            serde_json::json!(true)
-        );
-    }
-
-    #[test]
-    fn retains_protocol_neutral_resource_details() {
-        let error = GatewayError::not_found("table does not exist")
-            .with_resource("table", Some("fluss.missing"));
-
-        assert_eq!(
-            error.details(),
-            Some(&ErrorDetails {
-                resource_kind: Some("table".to_string()),
-                resource_name: Some("fluss.missing".to_string()),
-            })
-        );
-        assert_eq!(
-            serde_json::to_value(ErrorEnvelope::new(&error, "request-7")).unwrap(),
-            serde_json::json!({
-                "error": {
-                    "code": "table_not_found",
-                    "message": "table does not exist",
-                    "request_id": "request-7",
-                    "retryable": false,
-                    "details": {
-                        "resource_kind": "table",
-                        "resource_name": "fluss.missing"
-                    }
-                }
-            })
-        );
-    }
-
-    #[test]
-    fn framework_failures_get_an_envelope_without_a_gateway_error() {
-        let envelope = ErrorEnvelope::from_parts(
-            "method_not_allowed",
-            "method not allowed",
-            "request-9",
-            false,
-        );
-        assert_eq!(
-            serde_json::to_value(&envelope).unwrap(),
-            serde_json::json!({
-                "error": {
-                    "code": "method_not_allowed",
-                    "message": "method not allowed",
-                    "request_id": "request-9",
-                    "retryable": false,
-                }
-            })
-        );
-    }
-
-    #[test]
-    fn resource_context_is_added_only_to_resource_naming_kinds() {
-        let named = resource_error(GatewayError::not_found("gone"), "table", "db.t");
-        assert_eq!(
-            named.details().and_then(|d| d.resource_name.clone()),
-            Some("db.t".to_string())
-        );
-        let untouched = resource_error(GatewayError::internal("boom"), "table", "db.t");
-        assert!(untouched.details().is_none());
-    }
-
-    /// The FIP-49 vocabulary: an error carrying resource context answers the resource-specific
-    /// code; one without context keeps its kind's generic code.
+    /// The FIP-49 vocabulary: an error naming a resource answers the resource-specific code; one without a
+    /// resource keeps its kind's generic code.
     #[test]
     fn resource_context_specialises_the_wire_code() {
-        let cases: [(GatewayError, &str, &str); 5] = [
-            (GatewayError::not_found("x"), "cluster", "cluster_not_found"),
+        let cases: [(GatewayError, Resource, &str); 5] = [
             (
                 GatewayError::not_found("x"),
-                "database",
+                Resource::Cluster,
+                "cluster_not_found",
+            ),
+            (
+                GatewayError::not_found("x"),
+                Resource::Database,
                 "database_not_found",
             ),
-            (GatewayError::not_found("x"), "table", "table_not_found"),
+            (
+                GatewayError::not_found("x"),
+                Resource::Table,
+                "table_not_found",
+            ),
             (
                 GatewayError::already_exists("x"),
-                "partition",
+                Resource::Partition,
                 "partition_already_exists",
             ),
             (
                 GatewayError::failed_precondition("x"),
-                "database",
+                Resource::Database,
                 "database_not_empty",
             ),
         ];
         for (error, resource, expected) in cases {
-            let named = error.with_resource(resource, Some("name"));
+            let named = error.with_resource(resource);
             assert_eq!(named.code(), expected);
             let envelope = serde_json::to_value(ErrorEnvelope::new(&named, "r")).unwrap();
             assert_eq!(envelope["error"]["code"], expected);
         }
 
-        // Without resource context the generic codes hold — the gateway never guesses.
+        // Without a resource the generic codes hold — the gateway never guesses.
         assert_eq!(GatewayError::not_found("x").code(), "not_found");
         assert_eq!(GatewayError::already_exists("x").code(), "already_exists");
-        assert_eq!(
-            GatewayError::failed_precondition("x").code(),
-            "failed_precondition"
-        );
         // A precondition on a table (e.g. it changed during preflight) is not "not empty".
         assert_eq!(
             GatewayError::failed_precondition("x")
-                .with_resource("table", Some("db.t"))
+                .with_resource(Resource::Table)
                 .code(),
             "failed_precondition"
         );
         // Backend and internal stay distinguishable (FIP-49 `backend` / `internal`).
         assert_eq!(GatewayError::backend("x").code(), "backend");
         assert_eq!(GatewayError::internal("x").code(), "internal");
+    }
+
+    /// Everything the taxonomy can emit is publishable, and nothing else is.
+    #[test]
+    fn wire_codes_cover_the_kinds_and_the_resource_forms() {
+        let codes = wire_codes();
+        for kind in ErrorKind::ALL.iter().copied() {
+            assert!(codes.contains(&kind.code()), "missing {}", kind.code());
+        }
+        for (_, _, code) in RESOURCE_CODES {
+            assert!(codes.contains(code), "missing {code}");
+        }
+        assert_eq!(
+            codes.len(),
+            ErrorKind::ALL.len() + RESOURCE_CODES.len(),
+            "wire codes are unique across kinds and resource forms"
+        );
+        assert!(codes.windows(2).all(|pair| pair[0] < pair[1]), "sorted");
+        // The write path's entry-level `storage_backpressure` is not a request status and arrives with the
+        // capability that emits it.
+        assert!(!codes.contains(&"storage_backpressure"));
     }
 }

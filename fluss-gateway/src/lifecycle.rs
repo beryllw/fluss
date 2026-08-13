@@ -31,13 +31,13 @@ use axum::Router;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use futures::FutureExt;
+use futures_util::FutureExt;
 use metrics_exporter_prometheus::PrometheusHandle;
 use std::any::Any;
 use std::future::Future;
 use std::future::IntoFuture;
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
@@ -45,62 +45,117 @@ use tokio_util::sync::CancellationToken;
 
 type RunError = Box<dyn std::error::Error + Send + Sync>;
 
-const MAX_SHUTDOWN_CLEANUP_RESERVE: Duration = Duration::from_secs(5);
-
 /// Named terminal result from one process-owned asynchronous subsystem.
 struct TaskExit {
     name: String,
     result: Result<(), String>,
 }
 
-/// The shared process acceptance predicate.
-#[derive(Debug, Default)]
+/// Monotonic process states; discriminants define their transition order.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[repr(u8)]
+enum LifecycleState {
+    Starting = 0,
+    Serving = 1,
+    Quiescing = 2,
+    Draining = 3,
+    Stopped = 4,
+}
+
+impl LifecycleState {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::Starting,
+            1 => Self::Serving,
+            2 => Self::Quiescing,
+            3 => Self::Draining,
+            4 => Self::Stopped,
+            _ => unreachable!("invalid lifecycle state"),
+        }
+    }
+}
+
+/// The shared process acceptance state.
+#[derive(Debug)]
 pub struct Readiness {
-    serving: AtomicBool,
-    shutting_down: AtomicBool,
+    state: AtomicU8,
+}
+
+impl Default for Readiness {
+    fn default() -> Self {
+        Self {
+            state: AtomicU8::new(LifecycleState::Starting as u8),
+        }
+    }
 }
 
 impl Readiness {
-    /// Starts neither serving nor shutting down, so new work is rejected until startup completes.
+    /// Starts in the non-accepting startup state.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Marks the gateway ready to serve. Called once after the listeners are bound.
-    pub fn set_serving(&self) {
-        self.serving.store(true, Ordering::SeqCst);
+    pub(crate) fn set_serving(&self) {
+        self.transition(LifecycleState::Starting, LifecycleState::Serving);
     }
 
-    /// Flips acceptance off so guarded routes answer 503 and callers stop sending traffic, before
-    /// draining starts.
-    pub fn begin_shutdown(&self) {
-        self.shutting_down.store(true, Ordering::SeqCst);
+    pub(crate) fn begin_quiescing(&self) {
+        self.transition(LifecycleState::Serving, LifecycleState::Quiescing);
     }
 
-    /// True once startup finished, regardless of whether shutdown has begun.
-    pub fn is_serving(&self) -> bool {
-        self.serving.load(Ordering::SeqCst)
+    pub(crate) fn begin_draining(&self) {
+        self.transition(LifecycleState::Quiescing, LifecycleState::Draining);
     }
 
-    /// True once shutdown started. Never returns to false.
+    pub(crate) fn set_stopped(&self) {
+        self.transition(LifecycleState::Draining, LifecycleState::Stopped);
+    }
+
+    /// True once startup completed, including while shutting down.
+    pub fn has_started(&self) -> bool {
+        self.state() >= LifecycleState::Serving
+    }
+
+    /// True once shutdown started.
     pub fn is_shutting_down(&self) -> bool {
-        self.shutting_down.load(Ordering::SeqCst)
+        self.state() >= LifecycleState::Quiescing
     }
 
-    /// The predicate that gates request acceptance: serving and not yet draining.
+    /// True only while the gateway accepts application work.
     pub fn is_accepting(&self) -> bool {
-        self.is_serving() && !self.is_shutting_down()
+        self.state() == LifecycleState::Serving
     }
 
-    /// Rejects new application work once startup has not completed or draining has begun.
+    /// Rejects new application work before startup completes or after shutdown begins.
     pub fn ensure_accepting(&self) -> Result<(), GatewayError> {
-        if self.is_shutting_down() {
-            return Err(GatewayError::unavailable("gateway is shutting down"));
+        match self.state() {
+            LifecycleState::Starting => Err(GatewayError::unavailable("gateway is starting")),
+            LifecycleState::Serving => Ok(()),
+            LifecycleState::Quiescing | LifecycleState::Draining | LifecycleState::Stopped => {
+                Err(GatewayError::unavailable("gateway is shutting down"))
+            }
         }
-        if !self.is_serving() {
-            return Err(GatewayError::unavailable("gateway is starting"));
+    }
+
+    fn state(&self) -> LifecycleState {
+        LifecycleState::from_u8(self.state.load(Ordering::SeqCst))
+    }
+
+    fn transition(&self, current: LifecycleState, next: LifecycleState) {
+        assert_eq!(next as u8, current as u8 + 1);
+        match self.state.compare_exchange(
+            current as u8,
+            next as u8,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => {}
+            Err(actual) if actual >= next as u8 => {}
+            Err(actual) => panic!(
+                "invalid lifecycle transition from {:?} to {next:?}",
+                LifecycleState::from_u8(actual)
+            ),
         }
-        Ok(())
     }
 }
 
@@ -125,9 +180,9 @@ impl RunningGateway {
         self.metrics_addr
     }
 
-    /// Begins graceful draining, the same transition SIGTERM triggers.
+    /// Stops accepting application work without closing the listeners.
     pub fn begin_shutdown(&self) {
-        self.readiness.begin_shutdown();
+        self.readiness.begin_quiescing();
     }
 
     /// Stops accepting, drains in-flight requests within the configured drain timeout, then closes the
@@ -138,38 +193,30 @@ impl RunningGateway {
 
     async fn finish(mut self, unexpected_exit: Option<String>) -> Result<(), RunError> {
         let shutdown_started = Instant::now();
-        self.readiness.begin_shutdown();
-        observability::process_draining();
-        let (task_deadline, _deadline) = shutdown_deadlines(Instant::now(), self.drain_timeout);
+        self.readiness.begin_quiescing();
+        // Draining gets the whole configured budget: the gateway holds no request-spanning state, so there is
+        // no cleanup step after the tasks stop that would need a reserved tail. The deadline comes from the
+        // timer's own clock, so it cannot skew against it.
+        let deadline = tokio::time::Instant::now() + self.drain_timeout;
+        self.readiness.begin_draining();
         self.shutdown.cancel();
-        let cleanup_error = drain_tasks(&mut self.tasks, task_deadline).await;
+        let cleanup_error = drain_tasks(&mut self.tasks, deadline).await;
+        self.readiness.set_stopped();
 
+        // The metrics listener is one of the drained tasks, so nothing recorded from here on could ever be
+        // scraped: the shutdown outcome is reported through this log line and the process exit code.
+        let elapsed = shutdown_started.elapsed();
         if let Some(error) = unexpected_exit {
-            observability::process_stopped("task_error", shutdown_started.elapsed());
+            log::error!("fluss-gateway stopped after {elapsed:?}: {error}");
             return Err(error.into());
         }
         if let Some(error) = cleanup_error {
-            observability::process_stopped("cleanup_error", shutdown_started.elapsed());
+            log::error!("fluss-gateway stopped after {elapsed:?}: {error}");
             return Err(error.into());
         }
-        observability::process_stopped("success", shutdown_started.elapsed());
-        log::info!("fluss-gateway stopped");
+        log::info!("fluss-gateway stopped after {elapsed:?}");
         Ok(())
     }
-}
-
-/// Splits one process deadline into request draining and a bounded resource-cleanup tail.
-fn shutdown_deadlines(started: Instant, timeout: Duration) -> (Instant, Instant) {
-    // Configuration rejects overflowing durations, so this is defence in depth: an instant that
-    // cannot represent `started + timeout` falls back to a one-hour drain rather than panicking.
-    let deadline = started
-        .checked_add(timeout)
-        .unwrap_or_else(|| started + Duration::from_secs(3600));
-    let minimum_reserve = Duration::from_millis(1).min(timeout);
-    let cleanup_reserve = (timeout / 4)
-        .max(minimum_reserve)
-        .min(MAX_SHUTDOWN_CLEANUP_RESERVE);
-    (deadline - cleanup_reserve, deadline)
 }
 
 /// Runs the gateway until a process shutdown signal or any process-owned task exits unexpectedly.
@@ -188,8 +235,10 @@ pub async fn run(config: GatewayConfig) -> Result<(), RunError> {
     gateway.finish(unexpected_exit).await
 }
 
-/// Binds listeners and starts serving without requiring Fluss to be available.
+/// Validates the complete configuration, then binds listeners and starts serving without requiring Fluss to be
+/// available.
 pub async fn start(config: GatewayConfig) -> Result<RunningGateway, RunError> {
+    config.validate()?;
     start_internal(config).await
 }
 
@@ -199,7 +248,6 @@ async fn start_internal(config: GatewayConfig) -> Result<RunningGateway, RunErro
         log::warn!("{warning}");
     }
     observability::init_metrics(config.server.metrics.enabled)?;
-    observability::register_process_metrics();
 
     let listener = bind_listener(config.server.rest.bind_address, "REST").await?;
     let local_addr = listener
@@ -248,7 +296,6 @@ async fn start_internal(config: GatewayConfig) -> Result<RunningGateway, RunErro
     }
 
     readiness.set_serving();
-    observability::process_ready();
     log::info!("fluss-gateway REST listener serving at {local_addr}");
     if let Some(address) = metrics_addr {
         log::info!("fluss-gateway metrics listener serving at {address}");
@@ -363,10 +410,13 @@ fn unexpected_task_detail(result: Option<Result<TaskExit, tokio::task::JoinError
 }
 
 /// Waits for every process task under one absolute deadline, then aborts and joins any stragglers.
-async fn drain_tasks(tasks: &mut JoinSet<TaskExit>, deadline: Instant) -> Option<String> {
+async fn drain_tasks(
+    tasks: &mut JoinSet<TaskExit>,
+    deadline: tokio::time::Instant,
+) -> Option<String> {
     let mut cleanup_error = None;
     loop {
-        match tokio::time::timeout_at(deadline.into(), tasks.join_next()).await {
+        match tokio::time::timeout_at(deadline, tasks.join_next()).await {
             Ok(Some(Ok(TaskExit { name, result }))) => match result {
                 Ok(()) => log::info!("{name} stopped"),
                 Err(error) => {
@@ -433,32 +483,110 @@ mod tests {
         }
     }
 
-    /// Verifies readiness transitions and idempotent shutdown state.
-    #[test]
-    fn readiness_predicate() {
-        let readiness = Readiness::new();
-        assert!(!readiness.is_accepting());
-        readiness.set_serving();
-        assert!(readiness.is_accepting());
-        readiness.begin_shutdown();
-        assert!(!readiness.is_accepting());
-        assert_eq!(
-            readiness.ensure_accepting().unwrap_err().message(),
-            "gateway is shutting down"
-        );
-        readiness.begin_shutdown();
-        assert!(readiness.is_shutting_down());
+    fn assert_readiness(
+        readiness: &Readiness,
+        state: LifecycleState,
+        has_started: bool,
+        is_accepting: bool,
+        is_shutting_down: bool,
+        rejection: Option<&str>,
+    ) {
+        assert_eq!(readiness.state(), state);
+        assert_eq!(readiness.has_started(), has_started);
+        assert_eq!(readiness.is_accepting(), is_accepting);
+        assert_eq!(readiness.is_shutting_down(), is_shutting_down);
+        match rejection {
+            Some(message) => {
+                let error = readiness.ensure_accepting().unwrap_err();
+                assert_eq!(error.kind(), crate::error::ErrorKind::Unavailable);
+                assert_eq!(error.message(), message);
+            }
+            None => readiness.ensure_accepting().unwrap(),
+        }
     }
 
     #[test]
-    fn readiness_rejects_work_before_startup() {
+    fn readiness_lifecycle() {
         let readiness = Readiness::new();
-        let error = readiness.ensure_accepting().unwrap_err();
-        assert_eq!(error.kind(), crate::error::ErrorKind::Unavailable);
-        assert_eq!(error.message(), "gateway is starting");
+        assert_readiness(
+            &readiness,
+            LifecycleState::Starting,
+            false,
+            false,
+            false,
+            Some("gateway is starting"),
+        );
 
         readiness.set_serving();
-        readiness.ensure_accepting().unwrap();
+        assert_readiness(&readiness, LifecycleState::Serving, true, true, false, None);
+
+        readiness.begin_quiescing();
+        assert_readiness(
+            &readiness,
+            LifecycleState::Quiescing,
+            true,
+            false,
+            true,
+            Some("gateway is shutting down"),
+        );
+
+        readiness.begin_draining();
+        assert_readiness(
+            &readiness,
+            LifecycleState::Draining,
+            true,
+            false,
+            true,
+            Some("gateway is shutting down"),
+        );
+
+        readiness.set_stopped();
+        assert_readiness(
+            &readiness,
+            LifecycleState::Stopped,
+            true,
+            false,
+            true,
+            Some("gateway is shutting down"),
+        );
+    }
+
+    #[test]
+    fn lifecycle_transitions_are_idempotent_and_never_move_backwards() {
+        let readiness = Readiness::new();
+        readiness.set_serving();
+        readiness.set_serving();
+        readiness.begin_quiescing();
+        readiness.set_serving();
+        readiness.begin_quiescing();
+        readiness.begin_draining();
+        readiness.begin_quiescing();
+        readiness.set_stopped();
+        readiness.begin_draining();
+
+        assert_eq!(readiness.state(), LifecycleState::Stopped);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid lifecycle transition")]
+    fn lifecycle_transition_cannot_skip_a_state() {
+        Readiness::new().begin_draining();
+    }
+
+    #[tokio::test]
+    async fn start_rejects_programmatically_invalid_config_before_binding() {
+        let mut config = GatewayConfig::default();
+        config.server.rest.bind_address = "127.0.0.1:0".parse().expect("valid address");
+        config.server.metrics.enabled = false;
+        config.server.rest.request_timeout = crate::config::ConfigDuration::from_millis(0);
+
+        let error = start(config).await.err().expect("invalid config");
+        assert!(
+            error
+                .to_string()
+                .contains("gateway.rest.write.request-timeout must be greater than zero"),
+            "got: {error}"
+        );
     }
 
     /// Timed-out tasks are aborted and joined before cleanup returns.
@@ -473,7 +601,7 @@ mod tests {
         });
         tokio::task::yield_now().await;
         let started = tokio::time::Instant::now();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = started + Duration::from_secs(5);
         let error = drain_tasks(&mut tasks, deadline)
             .await
             .expect("a stuck task exceeds the deadline");
@@ -484,26 +612,6 @@ mod tests {
         assert!(error.contains("1 gateway task(s)"), "{error}");
         assert_eq!(task_drops.load(Ordering::SeqCst), 1);
         assert!(tasks.is_empty());
-    }
-
-    /// A stuck request cannot consume the tail reserved for resource cleanup.
-    #[tokio::test]
-    async fn stuck_task_leaves_time_for_resource_cleanup() {
-        let mut tasks = JoinSet::new();
-        spawn_named(&mut tasks, "stuck listener", async move {
-            std::future::pending::<Result<(), String>>().await
-        });
-        tokio::task::yield_now().await;
-        let started = Instant::now();
-        let (task_deadline, deadline) = shutdown_deadlines(started, Duration::from_millis(200));
-
-        let task_error = drain_tasks(&mut tasks, task_deadline).await;
-        assert!(task_error.is_some());
-        assert!(task_deadline < deadline);
-
-        let elapsed = started.elapsed();
-        assert!(elapsed >= Duration::from_millis(140), "{elapsed:?}");
-        assert!(elapsed < Duration::from_millis(500), "{elapsed:?}");
     }
 
     #[tokio::test]
@@ -543,7 +651,11 @@ mod tests {
         }
 
         shutdown.cancel();
-        let error = drain_tasks(&mut tasks, Instant::now() + Duration::from_secs(1)).await;
+        let error = drain_tasks(
+            &mut tasks,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await;
 
         assert!(error.is_none(), "{error:?}");
         assert!(tasks.is_empty());

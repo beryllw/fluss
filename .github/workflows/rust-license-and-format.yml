@@ -125,6 +125,8 @@ jobs:
       - name: Check dependency licenses (Apache-compatible)
         run: cargo deny check licenses
 
+      # The dockerized cluster fixture is an unconditional dev-dependency, so `--all-targets` builds its
+      # proto codegen even when the e2e suites are compiled away.
       - name: Install protoc
         uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
