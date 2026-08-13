@@ -44,6 +44,11 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use utoipa_axum::router::OpenApiRouter;
 
+/// The deadline handed to a request whose configured timeout cannot be added to the current instant.
+///
+/// Only reachable if a duration slips past configuration validation; one hour keeps such a request bounded.
+const MAX_REQUEST_DEADLINE: Duration = Duration::from_secs(3600);
+
 /// Shared state for REST handlers.
 ///
 /// Everything here is either immutable configuration or a shared process service. Nothing is scoped to a
@@ -270,6 +275,18 @@ pub fn apply_middleware(router: Router, options: &RestOptions) -> Router {
     apply_common_middleware(apply_data_limits(router, options))
 }
 
+/// The absolute deadline of a request starting now, saturating instead of overflowing.
+///
+/// Configuration caps every duration well below the instant-arithmetic limit, so this is defence in depth:
+/// a request must never panic a worker thread over a deadline it cannot represent.
+fn deadline_from_now(request_timeout: Duration) -> RequestDeadline {
+    let now = Instant::now();
+    RequestDeadline(
+        now.checked_add(request_timeout)
+            .unwrap_or_else(|| now + MAX_REQUEST_DEADLINE),
+    )
+}
+
 /// Records the absolute deadline of a request that does not pass through the data-limit layer.
 fn assign_request_deadline(
     request_timeout: Duration,
@@ -278,7 +295,7 @@ fn assign_request_deadline(
         Box::pin(async move {
             request
                 .extensions_mut()
-                .insert(RequestDeadline(Instant::now() + request_timeout));
+                .insert(deadline_from_now(request_timeout));
             next.run(request).await
         })
     }
@@ -296,7 +313,7 @@ fn apply_data_limits(router: Router, options: &RestOptions) -> Router {
             .unwrap_or_default();
         request
             .extensions_mut()
-            .insert(RequestDeadline(Instant::now() + request_timeout));
+            .insert(deadline_from_now(request_timeout));
 
         let oversized = declared_content_length(&request).filter(|length| *length > max_body_bytes);
         if let Some(length) = oversized {

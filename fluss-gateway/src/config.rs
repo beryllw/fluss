@@ -58,9 +58,15 @@ use toml::Value;
 pub const ENV_PREFIX: &str = "FLUSS_GATEWAY__";
 
 /// A strictly parsed duration: `<integer><ms|s|m|h>` (e.g. `"60s"`, `"15m"`). No floats, no whitespace, no
-/// compound values. Deserialization rejects zero because every configured duration is a deadline or an interval.
+/// compound values. Deserialization rejects zero because every configured duration is a deadline or an interval,
+/// and rejects anything above [`MAX_CONFIG_DURATION`] because such a value is a configuration mistake that would
+/// otherwise overflow the instant arithmetic every deadline performs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConfigDuration(Duration);
+
+/// The upper bound of any configured duration: one year, far beyond any meaningful gateway deadline or
+/// interval, and small enough that adding it to an [`std::time::Instant`] can never overflow.
+pub const MAX_CONFIG_DURATION: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
 impl ConfigDuration {
     /// Builds a duration directly, bypassing the string syntax used by configuration sources.
@@ -78,7 +84,7 @@ impl ConfigDuration {
         self.0
     }
 
-    /// Parses the strict integer-plus-unit syntax and rejects a zero result.
+    /// Parses the strict integer-plus-unit syntax and rejects a zero or out-of-range result.
     pub(crate) fn parse(s: &str) -> Result<Self, String> {
         let (digits, unit) = split_number_and_unit(s);
         if digits.is_empty() {
@@ -89,12 +95,17 @@ impl ConfigDuration {
         let value: u64 = digits
             .parse()
             .map_err(|e| format!("invalid duration {s:?}: {e}"))?;
-        let overflow = || format!("invalid duration {s:?}: value is too large");
+        let too_large = || {
+            format!(
+                "invalid duration {s:?}: must not exceed {} seconds",
+                MAX_CONFIG_DURATION.as_secs()
+            )
+        };
         let duration = match unit {
             "ms" => Duration::from_millis(value),
             "s" => Duration::from_secs(value),
-            "m" => Duration::from_secs(value.checked_mul(60).ok_or_else(overflow)?),
-            "h" => Duration::from_secs(value.checked_mul(3600).ok_or_else(overflow)?),
+            "m" => Duration::from_secs(value.checked_mul(60).ok_or_else(too_large)?),
+            "h" => Duration::from_secs(value.checked_mul(3600).ok_or_else(too_large)?),
             _ => {
                 return Err(format!(
                     "invalid duration {s:?}: unit must be one of ms, s, m, h"
@@ -103,6 +114,9 @@ impl ConfigDuration {
         };
         if duration.is_zero() {
             return Err(format!("invalid duration {s:?}: must be greater than zero"));
+        }
+        if duration > MAX_CONFIG_DURATION {
+            return Err(too_large());
         }
         Ok(Self(duration))
     }
@@ -890,10 +904,24 @@ gateway.metrics.enabled: true
 
     #[test]
     fn overflowing_duration_is_rejected_rather_than_saturated() {
-        // A syntactically valid but astronomically large duration must be refused at parse time,
-        // not silently clamped, so it can never reach an `Instant + Duration` overflow at runtime.
-        let error = ConfigDuration::parse("18446744073709551615h").unwrap_err();
-        assert!(error.contains("too large"), "got: {error}");
+        // Syntactically valid but astronomically large durations must be refused at parse time, not
+        // silently clamped, so they can never reach an `Instant + Duration` overflow at runtime. Every
+        // unit needs its own case: the unmultiplied ones overflow without any arithmetic at all.
+        for bad in [
+            "18446744073709551615ms",
+            "18446744073709551615s",
+            "18446744073709551615m",
+            "18446744073709551615h",
+        ] {
+            let error = ConfigDuration::parse(bad).unwrap_err();
+            assert!(error.contains("must not exceed"), "{bad}: {error}");
+        }
+        // The bound itself is accepted, one second past it is not.
+        assert_eq!(
+            ConfigDuration::parse("31536000s").unwrap().get(),
+            MAX_CONFIG_DURATION
+        );
+        assert!(ConfigDuration::parse("31536001s").is_err());
     }
 
     #[test]
