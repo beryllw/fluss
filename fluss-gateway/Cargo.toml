@@ -26,10 +26,8 @@ name = "fluss-gateway"
 edition = "2024"
 version = "1.0.0"
 license = "Apache-2.0"
-# The shipped dependency set only needs 1.85, the same floor as fluss-rust. The declared MSRV is 1.88
-# because the dockerized cluster fixture used by the `integration_tests` suites depends on
-# testcontainers, which requires 1.88; dev-dependencies cannot be made optional, so they are part of the
-# `--all-targets` graph. Dropping back to 1.85 means isolating that fixture, not changing the gateway.
+# The shipped dependency set only needs 1.85; the declared floor stays at 1.88 to match fluss-rust,
+# which the gateway depends on once the FlussBackend capability lands.
 rust-version = "1.88"
 authors = ["Apache Fluss <dev@fluss.apache.org>"]
 repository = "https://github.com/apache/fluss"
@@ -47,12 +45,6 @@ path = "src/main.rs"
 # Internal testability boundary for the executable; this is not a published or supported Rust SDK.
 [lib]
 name = "fluss_gateway"
-
-[features]
-# Compiles the end-to-end suites that drive a dockerized Fluss cluster. Mirrors the `integration_tests`
-# feature of the fluss-rs crate and the name FIP-49's test plan uses, and is never enabled by default:
-# the suites need Docker, so CI runs them on demand rather than on every pull request.
-integration_tests = []
 
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "matched-path", "tokio"] }
@@ -79,9 +71,6 @@ utoipa-axum = "0.2"
 uuid = { version = "1.10", features = ["v4"] }
 
 [dev-dependencies]
-# The dockerized fixed-version Fluss cluster of the Rust client, reused as-is so the gateway's end-to-end
-# suites and the client's own agree on how a test cluster is started.
-fluss-test-cluster = { path = "../fluss-rust/crates/fluss-test-cluster" }
 http-body-util = "0.1"
 # No `blocking`: every suite is async, and the blocking client panics when dropped inside a tokio context.
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
@@ -94,6 +83,3 @@ name = "http_api"
 
 [[test]]
 name = "process"
-
-[[test]]
-name = "e2e_cluster"

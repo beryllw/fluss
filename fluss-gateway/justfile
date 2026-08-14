@@ -30,10 +30,6 @@ build-release:
 test:
     cargo test --all-targets
 
-# Run the end-to-end suite against a dockerized Fluss cluster. Needs a running Docker daemon.
-e2e:
-    cargo test --features integration_tests --test e2e_cluster
-
 # Format the gateway sources in place.
 fmt:
     cargo fmt --all

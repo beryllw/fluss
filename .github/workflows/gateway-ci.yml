@@ -15,10 +15,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# CI gates for the fluss-gateway module. The gateway is its own Cargo workspace,
-# so it gets its own workflow: triggering on gateway changes never builds the
-# fluss-rust workspace, and fluss-rust changes never build the gateway. `uses:`
-# step inputs stay relative to the repository root.
+# Gateway-only CI: gateway changes never build the fluss-rust workspace and vice versa.
+# `uses:` step inputs are relative to the repository root.
 name: Gateway CI
 
 on:
@@ -57,13 +55,6 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      # The dockerized cluster fixture is an unconditional dev-dependency, so it is part of the
-      # `--all-targets` graph and its proto codegen runs even when the e2e suites are compiled away.
-      - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Rust Cache
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
@@ -88,17 +79,12 @@ jobs:
 
   msrv:
     name: "Gateway MSRV (1.88)"
-    # The rust-toolchain.toml floats to stable, so a plain build never catches use of features newer
-    # than the declared rust-version. Pin the MSRV explicitly here; `+toolchain` overrides the file.
+    # rust-toolchain.toml floats to stable, so a plain build never catches features newer
+    # than the declared rust-version; `+toolchain` overrides the file here.
     timeout-minutes: 60
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-
-      - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install the MSRV toolchain
         run: rustup toolchain install 1.88.0 --profile minimal
@@ -130,13 +116,6 @@ jobs:
       - name: Check dependency licenses (Apache-compatible)
         run: cargo deny check licenses
 
-      # The dockerized cluster fixture is an unconditional dev-dependency, so `--all-targets` builds its
-      # proto codegen even when the e2e suites are compiled away.
-      - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Rust Cache
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
@@ -152,39 +131,3 @@ jobs:
         run: cargo doc --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
-
-  e2e-cluster:
-    name: "Gateway E2E (dockerized Fluss cluster)"
-    # Not a pull-request gate yet: the gateway does not talk to Fluss until the FlussBackend capability
-    # lands, so the suite would spend minutes pulling a Docker image to check the startup and draining the
-    # process suite already covers without one. Run it from the Actions tab meanwhile; to make it a
-    # required gate later, delete the `if:` below.
-    if: github.event_name == 'workflow_dispatch'
-    timeout-minutes: 30
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          workspaces: fluss-gateway
-
-      # A selected scenario must exist: an empty test list means the suite was compiled away, which is a
-      # silent skip and therefore a failure.
-      - name: Assert the cluster scenarios are selected
-        run: |
-          count=$(cargo test --features integration_tests --test e2e_cluster -- --list 2>/dev/null | grep -c ': test$')
-          echo "selected scenarios: $count"
-          test "$count" -ge 1
-
-      - name: Run the cluster suite
-        run: cargo test --features integration_tests --test e2e_cluster
-        env:
-          RUST_LOG: DEBUG
-          RUST_BACKTRACE: full
