@@ -683,8 +683,9 @@
                         <exclude>website/static/**</exclude>
                         <exclude>website/build/**</exclude>
                         <exclude>website/node_modules/**</exclude>
-                        <!-- Rust client: own license enforcement (skywalking-eyes + cargo-deny) -->
+                        <!-- Rust client and gateway: own license enforcement (skywalking-eyes + cargo-deny) -->
                         <exclude>fluss-rust/**</exclude>
+                        <exclude>fluss-gateway/**</exclude>
                     </excludes>
                 </configuration>
             </plugin>
