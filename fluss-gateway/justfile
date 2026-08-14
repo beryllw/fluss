@@ -1,0 +1,55 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+# Recipes for the fluss-gateway module. The module is its own Cargo workspace,
+# so every recipe runs cargo from this directory.
+
+# Build the gateway and every test target in debug mode.
+build:
+    cargo build --all-targets
+
+# Build the gateway with the release profile.
+build-release:
+    cargo build --release
+
+# Run all tests of the gateway.
+test:
+    cargo test --all-targets
+
+# Format the gateway sources in place.
+fmt:
+    cargo fmt --all
+
+# Verify formatting without changing any file.
+fmt-check:
+    cargo fmt --all -- --check
+
+# Lint the gateway with clippy, treating warnings as errors.
+clippy:
+    cargo clippy --all-targets -- -D warnings
+
+# Build the API documentation for this package only.
+doc:
+    RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+
+# Run the gateway binary, forwarding any flags, e.g. just run --version
+run *flags:
+    cargo run -- {{flags}}
+
+# Check that every dependency license is compatible with the Apache License.
+licenses:
+    cargo deny check licenses
