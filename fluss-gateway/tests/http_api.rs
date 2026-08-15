@@ -147,11 +147,63 @@ async fn an_oversized_body_is_rejected_with_413_and_never_429() {
     gateway.shutdown().await.expect("clean shutdown");
 }
 
+/// `/ready` answers 200 over the real listener once the gateway is serving, alongside `/health`.
+#[tokio::test]
+async fn ready_and_health_answer_over_the_real_listener() {
+    let (gateway, api) = gateway().await;
+
+    assert_eq!(api.get("/health").await.status(), 200);
+    let ready = api.get_ok("/ready").await;
+    assert_eq!(ready["status"], "ready");
+
+    gateway.shutdown().await.expect("clean shutdown");
+}
+
+/// A connection that stalls mid-head is closed when the header read timeout expires. The request
+/// deadline cannot defend here: it runs only after hyper has parsed a complete head, so without
+/// this timeout such a connection would hold its socket and task forever.
+#[tokio::test]
+async fn a_stalled_head_connection_is_closed_by_the_header_read_timeout() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut config = fluss_gateway::config::GatewayConfig::default();
+    config.server.rest.bind_address = "127.0.0.1:0".parse().expect("valid");
+    config.server.metrics.enabled = false;
+    config.server.rest.header_read_timeout =
+        fluss_gateway::config::ConfigDuration::from_millis(300);
+    let gateway = fluss_gateway::lifecycle::start(config)
+        .await
+        .expect("gateway starts");
+
+    let mut socket = tokio::net::TcpStream::connect(gateway.local_addr())
+        .await
+        .expect("connect");
+    socket
+        .write_all(b"GET /heal")
+        .await
+        .expect("half a request head");
+
+    // The server closes the connection instead of holding it open forever.
+    let mut buffer = [0u8; 16];
+    let read =
+        tokio::time::timeout(std::time::Duration::from_secs(5), socket.read(&mut buffer)).await;
+    match read {
+        Ok(Ok(0)) | Ok(Err(_)) => {}
+        Ok(Ok(byte_count)) => {
+            panic!("the gateway answered a half request head with {byte_count} bytes")
+        }
+        Err(_) => panic!("the stalled connection was not closed within the test timeout"),
+    }
+
+    gateway.shutdown().await.expect("clean shutdown");
+}
+
 #[tokio::test]
 async fn draining_rejects_guarded_routes_but_keeps_health_answering() {
     let gateway = support::start_gateway().await;
     let api = Api::new(format!("http://{}", gateway.local_addr()));
     gateway.begin_shutdown();
     assert_eq!(api.get("/health").await.status(), 200);
+    assert_eq!(api.get("/ready").await.status(), 503);
     assert_eq!(api.get("/v1/openapi.json").await.status(), 503);
 }

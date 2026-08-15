@@ -49,6 +49,11 @@ use utoipa_axum::router::OpenApiRouter;
 /// Only reachable if a duration slips past configuration validation; one hour keeps such a request bounded.
 const MAX_REQUEST_DEADLINE: Duration = Duration::from_secs(3600);
 
+/// Reserved between a request's deadline and the middleware timeout that backstops it, so a
+/// response completing at the deadline still gets out instead of racing the timeout. The timeout
+/// keeps the configured value; the deadline ends this much earlier.
+const RESPONSE_GRACE: Duration = Duration::from_secs(1);
+
 /// Shared state for REST handlers.
 ///
 /// Everything here is either immutable configuration or a shared process service. Nothing is scoped to a
@@ -207,10 +212,11 @@ pub fn shaped(mut response: Response) -> Response {
     response
 }
 
-/// Builds the P1 router: `GET /health` sits outside both the acceptance guard and the body/deadline
-/// budget so it answers while draining and never carries a body; every guarded route (today
-/// `/v1/openapi.json`, later all data/control routes) carries the request-body size and deadline
-/// budget, with the acceptance guard outermost so draining answers 503 without consuming bodies.
+/// Builds the P1 router: the health routes (`GET /health` for liveness, `GET /ready` for
+/// readiness) sit outside both the acceptance guard and the body/deadline budget so they answer
+/// while draining and never carry a body; every guarded route (today `/v1/openapi.json`, later all
+/// data/control routes) carries the request-body size and deadline budget, with the acceptance
+/// guard outermost so draining answers 503 without consuming bodies.
 pub fn build_router(state: RestState, options: &RestOptions) -> Router {
     let (guarded_router, guarded_api) = OpenApiRouter::new()
         .merge(openapi::routes())
@@ -266,15 +272,22 @@ pub fn apply_middleware(router: Router, options: &RestOptions) -> Router {
     apply_common_middleware(apply_data_limits(router, options))
 }
 
-/// The absolute deadline of a request starting now, saturating instead of overflowing.
+/// The deadline of a request starting now, ending [`RESPONSE_GRACE`] before the middleware timeout.
 ///
-/// Configuration caps every duration well below the instant-arithmetic limit, so this is defence in depth:
-/// a request must never panic a worker thread over a deadline it cannot represent.
+/// The checked additions are defence in depth — configuration caps every duration well below the
+/// instant-arithmetic limit — and, like Envoy's `grpc_timeout_offset`, the grace applies only when
+/// the timeout is longer than it.
 fn deadline_from_now(request_timeout: Duration) -> RequestDeadline {
+    let handler_budget = if request_timeout > RESPONSE_GRACE {
+        request_timeout - RESPONSE_GRACE
+    } else {
+        request_timeout
+    };
     let now = Instant::now();
     RequestDeadline(
-        now.checked_add(request_timeout)
-            .unwrap_or_else(|| now + MAX_REQUEST_DEADLINE),
+        now.checked_add(handler_budget)
+            .or_else(|| now.checked_add(MAX_REQUEST_DEADLINE))
+            .unwrap_or(now),
     )
 }
 
@@ -618,6 +631,72 @@ mod tests {
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
         let json = body_json(response).await;
         assert_eq!(json["error"]["code"], "timeout");
+    }
+
+    /// The deadline ends before the middleware timeout so a response completing at the deadline can
+    /// still be delivered inside the timeout wrapper.
+    #[test]
+    fn deadline_ends_one_grace_before_the_middleware_timeout() {
+        let timeout = Duration::from_secs(30);
+        let before = Instant::now();
+        let deadline = deadline_from_now(timeout).instant();
+        let after = Instant::now();
+
+        assert!(
+            deadline >= before + timeout - RESPONSE_GRACE,
+            "the deadline must sit a grace before the timeout: {deadline:?}"
+        );
+        assert!(
+            deadline <= after + timeout - RESPONSE_GRACE + Duration::from_millis(50),
+            "the deadline must not end earlier than one grace before the timeout: {deadline:?}"
+        );
+    }
+
+    /// Timeouts at or below the grace keep their full budget, mirroring Envoy's
+    /// "offset only applies when the timeout is greater" rule.
+    #[test]
+    fn deadline_keeps_the_full_budget_for_short_timeouts() {
+        let timeout = Duration::from_millis(200);
+        let before = Instant::now();
+        let deadline = deadline_from_now(timeout).instant();
+        let after = Instant::now();
+
+        assert!(deadline >= before + timeout);
+        assert!(deadline <= after + timeout + Duration::from_millis(50));
+    }
+
+    /// A handler that finishes exactly at its deadline still gets its response out: the middleware
+    /// timeout backstops the deadline plus the response grace instead of racing it.
+    #[tokio::test]
+    async fn response_completing_at_the_deadline_is_delivered() {
+        async fn finishes_at_deadline(request: Request) -> &'static str {
+            let deadline = request
+                .extensions()
+                .get::<RequestDeadline>()
+                .copied()
+                .expect("the limits middleware assigns the deadline");
+            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline.instant())).await;
+            "ok"
+        }
+        let options = RestOptions {
+            request_timeout: RESPONSE_GRACE + Duration::from_millis(400),
+            max_body_bytes: 1024,
+        };
+        let app = apply_middleware(
+            Router::new().route("/deadline", get(finishes_at_deadline)),
+            &options,
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/deadline")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     /// A route that exists for another method answers the shared envelope with a code the published

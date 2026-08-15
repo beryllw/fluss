@@ -194,6 +194,7 @@ impl<'de> Deserialize<'de> for ByteSize {
 
 const INSTANCE_ID_KEY: &str = "gateway.instance-id";
 const REST_LISTEN_KEY: &str = "gateway.rest.listen";
+const REST_HEADER_READ_TIMEOUT_KEY: &str = "gateway.rest.header-read-timeout";
 const REST_REQUEST_TIMEOUT_KEY: &str = "gateway.rest.write.request-timeout";
 const REST_MAX_REQUEST_BYTES_KEY: &str = "gateway.rest.write.max-request-bytes";
 const METRICS_ENABLED_KEY: &str = "gateway.metrics.enabled";
@@ -201,6 +202,7 @@ const METRICS_LISTEN_KEY: &str = "gateway.metrics.exporter.prometheus.listen";
 const SHUTDOWN_DRAIN_TIMEOUT_KEY: &str = "gateway.shutdown.drain-timeout";
 
 const DEFAULT_REST_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
+const DEFAULT_REST_HEADER_READ_TIMEOUT: ConfigDuration = ConfigDuration::from_secs(10);
 const DEFAULT_REST_REQUEST_TIMEOUT: ConfigDuration = ConfigDuration::from_secs(30);
 const DEFAULT_REST_MAX_REQUEST_BYTES: ByteSize = ByteSize::new(32 * 1024 * 1024);
 const DEFAULT_METRICS_ENABLED: bool = true;
@@ -221,6 +223,10 @@ const CONFIG_ENTRIES: &[ConfigEntry] = &[
     ConfigEntry {
         key: REST_LISTEN_KEY,
         internal_path: "server.rest.bind_address",
+    },
+    ConfigEntry {
+        key: REST_HEADER_READ_TIMEOUT_KEY,
+        internal_path: "server.rest.header_read_timeout",
     },
     ConfigEntry {
         key: REST_REQUEST_TIMEOUT_KEY,
@@ -263,6 +269,10 @@ pub struct ServerConfig {
 pub struct RestServerConfig {
     /// Loopback by default because the gateway has no transport security.
     pub bind_address: SocketAddr,
+    /// Closes a connection whose request head is not complete within this budget, counted from
+    /// connection establishment; the per-request deadline cannot defend here, as it runs only after
+    /// a complete head.
+    pub header_read_timeout: ConfigDuration,
     /// Per-request server-side deadline. Exceeding it yields 504.
     pub request_timeout: ConfigDuration,
     /// Maximum accepted request body size. Exceeding it yields 413.
@@ -273,6 +283,7 @@ impl Default for RestServerConfig {
     fn default() -> Self {
         Self {
             bind_address: DEFAULT_REST_LISTEN,
+            header_read_timeout: DEFAULT_REST_HEADER_READ_TIMEOUT,
             request_timeout: DEFAULT_REST_REQUEST_TIMEOUT,
             max_body_bytes: DEFAULT_REST_MAX_REQUEST_BYTES,
         }
@@ -281,6 +292,11 @@ impl Default for RestServerConfig {
 
 impl RestServerConfig {
     fn validate(&self, problems: &mut Vec<String>) {
+        validate_duration(
+            REST_HEADER_READ_TIMEOUT_KEY,
+            self.header_read_timeout.get(),
+            problems,
+        );
         validate_duration(
             REST_REQUEST_TIMEOUT_KEY,
             self.request_timeout.get(),
@@ -378,15 +394,10 @@ impl GatewayConfig {
                 ));
             }
         }
-        // Port 0 asks the OS for a free port, so two ephemeral listeners never collide even though the
-        // configured addresses are equal.
-        if server.metrics.enabled
-            && server.metrics.bind_address == rest_address
-            && rest_address.port() != 0
-        {
+        if server.metrics.enabled && addresses_overlap(rest_address, server.metrics.bind_address) {
             problems.push(format!(
-                "{} must differ from {}",
-                METRICS_LISTEN_KEY, REST_LISTEN_KEY
+                "{} ({}) must differ from {} ({})",
+                METRICS_LISTEN_KEY, server.metrics.bind_address, REST_LISTEN_KEY, rest_address
             ));
         }
     }
@@ -402,6 +413,20 @@ impl GatewayConfig {
             ));
         }
         warnings
+    }
+}
+
+/// True when two listeners cannot both bind: the addresses are equal, or either is a wildcard
+/// (`0.0.0.0`, `::`) claiming the port for its family — `::` for both families, being dual-stack.
+/// Port 0 asks the OS for a free port and never collides.
+fn addresses_overlap(rest: SocketAddr, metrics: SocketAddr) -> bool {
+    if rest.port() == 0 || metrics.port() == 0 || rest.port() != metrics.port() {
+        return false;
+    }
+    match (rest.ip(), metrics.ip()) {
+        (IpAddr::V4(a), IpAddr::V4(b)) => a == b || a.is_unspecified() || b.is_unspecified(),
+        (IpAddr::V6(a), IpAddr::V6(b)) => a == b || a.is_unspecified() || b.is_unspecified(),
+        (IpAddr::V6(a), IpAddr::V4(_)) | (IpAddr::V4(_), IpAddr::V6(a)) => a.is_unspecified(),
     }
 }
 
@@ -1006,9 +1031,61 @@ mod tests {
         .unwrap_err();
         assert!(problems(error).iter().any(|problem| {
             problem.contains(
-                "gateway.metrics.exporter.prometheus.listen must differ from gateway.rest.listen",
+                "gateway.metrics.exporter.prometheus.listen (127.0.0.1:9095) must differ from \
+                 gateway.rest.listen (127.0.0.1:9095)",
             )
         }));
+    }
+
+    /// A wildcard listener claims the whole family on the port, so a textual difference between the
+    /// two addresses is not a usable configuration.
+    #[test]
+    fn wildcard_listener_must_differ_from_metrics_on_the_same_port() {
+        let error = load_file(
+            "gateway.rest.listen: 0.0.0.0:9095\ngateway.metrics.exporter.prometheus.listen: 127.0.0.1:9095\n",
+        )
+        .unwrap_err();
+        assert!(problems(error).iter().any(|problem| {
+            problem.contains("must differ from gateway.rest.listen (0.0.0.0:9095)")
+        }));
+    }
+
+    /// Overlap detection covers the wildcard and dual-stack pairs that differ textually but cannot
+    /// both bind, plus the pairs that coexist.
+    #[test]
+    fn listener_overlap_covers_wildcards_and_dual_stack() {
+        let clashes = [
+            ("0.0.0.0:8080", "127.0.0.1:8080"),
+            ("127.0.0.1:8080", "0.0.0.0:8080"),
+            ("0.0.0.0:8080", "0.0.0.0:8080"),
+            ("[::]:8080", "[::1]:8080"),
+            ("[::]:8080", "0.0.0.0:8080"),
+            ("127.0.0.1:8080", "[::]:8080"),
+        ];
+        for (rest, metrics) in clashes {
+            let rest: SocketAddr = rest.parse().unwrap();
+            let metrics: SocketAddr = metrics.parse().unwrap();
+            assert!(
+                addresses_overlap(rest, metrics),
+                "{rest} and {metrics} cannot both bind"
+            );
+        }
+
+        let coexist = [
+            ("127.0.0.1:8080", "192.168.1.2:8080"),
+            ("127.0.0.1:8080", "[::1]:8080"),
+            ("0.0.0.0:8080", "127.0.0.1:9095"),
+            ("0.0.0.0:0", "0.0.0.0:0"),
+            ("127.0.0.1:0", "0.0.0.0:8080"),
+        ];
+        for (rest, metrics) in coexist {
+            let rest: SocketAddr = rest.parse().unwrap();
+            let metrics: SocketAddr = metrics.parse().unwrap();
+            assert!(
+                !addresses_overlap(rest, metrics),
+                "{rest} and {metrics} can coexist"
+            );
+        }
     }
 
     /// Two ephemeral listeners are not a clash: the OS hands out a different port to each.
@@ -1097,6 +1174,6 @@ mod tests {
             );
         }
 
-        assert_eq!(CONFIG_ENTRIES.len(), 7);
+        assert_eq!(CONFIG_ENTRIES.len(), 8);
     }
 }

@@ -73,6 +73,14 @@ components:
       - status
       - uptime_ms
       type: object
+    ReadyResponse:
+      description: 'Response of `GET /ready`: the gateway accepts application traffic.'
+      properties:
+        status:
+          type: string
+      required:
+      - status
+      type: object
 info:
   description: Stateless REST gateway for Apache Fluss
   license:
@@ -99,6 +107,36 @@ paths:
                 $ref: '#/components/schemas/ErrorEnvelope'
           description: Wrong method for this route
       summary: 'The FIP-49 health summary: `{status, uptime_ms}`, always 200 while the process answers.'
+      tags:
+      - health
+  /ready:
+    get:
+      description: |-
+        `/health` is liveness and stays 200 while the process answers, so a liveness probe never
+        restarts a draining process; this route reports acceptance instead. Readiness covers the process
+        lifecycle only: Fluss cluster availability surfaces through request errors and metrics, not by
+        unloading every gateway instance at once.
+      operationId: getReady
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadyResponse'
+          description: The gateway accepts application traffic
+        '405':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Wrong method for this route
+        '503':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: The gateway is starting or shutting down
+      summary: Readiness for load balancers and readiness probes.
       tags:
       - health
   /v1/openapi.json:

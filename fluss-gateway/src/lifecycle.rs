@@ -32,10 +32,11 @@ use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use futures_util::FutureExt;
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use hyper_util::service::TowerToHyperService;
 use metrics_exporter_prometheus::PrometheusHandle;
 use std::any::Any;
 use std::future::Future;
-use std::future::IntoFuture;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -268,19 +269,25 @@ async fn start_internal(config: GatewayConfig) -> Result<RunningGateway, RunErro
     let readiness = Arc::new(Readiness::new());
     let state = rest_state(&config, &readiness, local_addr);
     let router = rest::build_router(state, &RestOptions::from(&config.server.rest));
+    let header_read_timeout = config.server.rest.header_read_timeout.get();
     let shutdown = CancellationToken::new();
     let mut tasks = JoinSet::new();
     spawn_named(
         &mut tasks,
         "REST listener",
-        serve(listener, router, shutdown.clone()),
+        serve(listener, router, header_read_timeout, shutdown.clone()),
     );
     if let Some(listener) = metrics_listener {
         let handle = observability::metrics_handle();
         spawn_named(
             &mut tasks,
             "metrics listener",
-            serve(listener, metrics_router(handle), shutdown.clone()),
+            serve(
+                listener,
+                metrics_router(handle),
+                header_read_timeout,
+                shutdown.clone(),
+            ),
         );
         // Samples the FIP-49 process_* and tokio_* gauges alongside the exporter they feed.
         let sampler_shutdown = shutdown.clone();
@@ -337,18 +344,49 @@ async fn bind_listener(
 }
 
 /// Serves one Axum listener until process cancellation starts graceful drain.
+///
+/// Follows axum's official `serve-with-hyper` example, because `axum::serve` does not expose the
+/// hyper builder that the header read timeout lives on — the only defence against connections that
+/// stall or dribble the request head, which the per-request deadline cannot see (it runs only after
+/// a complete head). Hyper ≥ 1.4 starts that timer at connection establishment, so a client that
+/// never sends a byte is covered too.
 async fn serve(
     listener: tokio::net::TcpListener,
     router: Router,
+    header_read_timeout: Duration,
     shutdown: CancellationToken,
 ) -> Result<(), String> {
-    let server = axum::serve(listener, router).with_graceful_shutdown(async move {
-        shutdown.cancelled().await;
-    });
-    server
-        .into_future()
-        .await
-        .map_err(|error| error.to_string())
+    let graceful = hyper_util::server::graceful::GracefulShutdown::new();
+    loop {
+        let (socket, _remote) = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => break,
+            accepted = listener.accept() => accepted.map_err(|error| error.to_string())?,
+        };
+        // `axum::serve` sets TCP_NODELAY on accepted sockets; keep that behaviour.
+        let _ = socket.set_nodelay(true);
+        let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+        // The header read timeout runs on hyper's background timer, so one must be installed first.
+        builder
+            .http1()
+            .timer(TokioTimer::new())
+            .header_read_timeout(header_read_timeout);
+        let service = TowerToHyperService::new(router.clone());
+        // `into_owned` unhooks the connection from the borrowed builder for the `'static` spawn.
+        let connection = builder
+            .serve_connection_with_upgrades(TokioIo::new(socket), service)
+            .into_owned();
+        let connection = graceful.watch(connection);
+        tokio::spawn(async move {
+            if let Err(error) = connection.await {
+                log::debug!("connection ended with an error: {error}");
+            }
+        });
+    }
+    // Idle connections close now; in-flight requests run to completion, bounded by the outer drain
+    // budget that aborts this task.
+    graceful.shutdown().await;
+    Ok(())
 }
 
 /// Builds the isolated Prometheus scrape router.

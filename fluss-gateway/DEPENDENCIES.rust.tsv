@@ -27,7 +27,6 @@ fnv@1.0.7	X						X
 foldhash@0.2.0										X
 futures-channel@0.3.34	X						X			
 futures-core@0.3.34	X						X			
-futures-io@0.3.34	X						X			
 futures-macro@0.3.34	X						X			
 futures-sink@0.3.34	X						X			
 futures-task@0.3.34	X						X			
@@ -51,7 +50,6 @@ is_terminal_polyfill@1.70.2	X						X
 itoa@1.0.18	X						X			
 js-sys@0.3.104	X						X			
 libc@0.2.189	X						X			
-lock_api@0.4.14	X						X			
 log@0.4.33	X						X			
 matchit@0.8.4				X			X			
 memchr@2.8.3							X		X	
@@ -62,8 +60,6 @@ mime@0.3.17	X						X
 mio@1.2.2							X			
 once_cell@1.21.4	X						X			
 once_cell_polyfill@1.70.2	X						X			
-parking_lot@0.12.5	X						X			
-parking_lot_core@0.9.12	X						X			
 paste@1.0.15	X						X			
 percent-encoding@2.3.2	X						X			
 pin-project-lite@0.2.17	X						X			
@@ -76,18 +72,15 @@ r-efi@5.3.0	X					X	X
 r-efi@6.0.0	X					X	X			
 rand@0.9.5	X						X			
 rand_chacha@0.9.0	X						X			
-rand_core@0.10.1	X						X			
 rand_core@0.9.5	X						X			
 rand_xoshiro@0.7.0	X						X			
 rapidhash@4.5.1	X						X			
 raw-cpuid@11.6.0							X			
-redox_syscall@0.5.18							X			
 regex@1.13.1	X						X			
 regex-automata@0.4.18	X						X			
 regex-syntax@0.8.11	X						X			
 rustversion@1.0.23	X						X			
 ryu@1.0.23	X				X					
-scopeguard@1.2.0	X						X			
 serde@1.0.229	X						X			
 serde_core@1.0.229	X						X			
 serde_derive@1.0.229	X						X			
@@ -112,7 +105,6 @@ tower@0.5.3							X
 tower-layer@0.3.3							X			
 tower-service@0.3.3							X			
 tracing@0.1.44							X			
-tracing-attributes@0.1.31							X			
 tracing-core@0.1.36							X			
 try-lock@0.2.5							X			
 unicode-ident@1.0.24	X						X	X		
@@ -122,7 +114,6 @@ utoipa@5.5.0	X						X
 utoipa-axum@0.2.0	X						X			
 utoipa-gen@5.5.0	X						X			
 uuid@1.24.0	X						X			
-value-bag@1.13.2	X						X			
 want@0.3.1							X			
 wasi@0.11.1+wasi-snapshot-preview1	X	X					X			
 wasip2@1.0.1+wasi-0.2.4	X	X					X			
@@ -138,5 +129,4 @@ windows-link@0.2.1	X						X
 windows-sys@0.61.2	X						X			
 wit-bindgen@0.46.0	X	X					X			
 zerocopy@0.8.56	X		X				X			
-zerocopy-derive@0.8.56	X		X				X			
 zmij@1.0.23							X			

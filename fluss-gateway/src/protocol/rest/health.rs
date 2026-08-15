@@ -15,14 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Health endpoint.
+//! Health endpoints.
 //!
 //! `GET /health` returns the FIP-49 `{status, uptime_ms}` shape and answers from the event loop
 //! without a backend RPC; deeper diagnostics live in the Prometheus metrics, not in this payload.
+//! `GET /ready` is the readiness counterpart: 200 only while the gateway accepts traffic.
 
 use crate::error::ErrorEnvelope;
-use crate::protocol::rest::{RestState, json_response};
-use axum::extract::State;
+use crate::protocol::rest::{RequestId, RestState, error_response, json_response};
+use axum::extract::{Request, State};
 use axum::response::Response;
 use serde::Serialize;
 use utoipa::ToSchema;
@@ -31,7 +32,9 @@ use utoipa_axum::routes;
 
 /// Health routes merged into the main router by [`crate::protocol::rest::build_router`].
 pub fn routes() -> OpenApiRouter<RestState> {
-    OpenApiRouter::new().routes(routes!(health))
+    OpenApiRouter::new()
+        .routes(routes!(health))
+        .routes(routes!(ready))
 }
 
 /// Response of `GET /health` (FIP-49): liveness plus process uptime.
@@ -60,6 +63,44 @@ pub(crate) async fn health(State(state): State<RestState>) -> Response {
         uptime_ms: u64::try_from(state.started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
     })
     .expect("the health response is serializable")
+}
+
+/// Response of `GET /ready`: the gateway accepts application traffic.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ReadyResponse {
+    pub status: &'static str,
+}
+
+/// Readiness for load balancers and readiness probes.
+///
+/// `/health` is liveness and stays 200 while the process answers, so a liveness probe never
+/// restarts a draining process; this route reports acceptance instead. Readiness covers the process
+/// lifecycle only: Fluss cluster availability surfaces through request errors and metrics, not by
+/// unloading every gateway instance at once.
+#[utoipa::path(
+    get,
+    path = "/ready",
+    operation_id = "getReady",
+    tag = "health",
+    responses(
+        (status = 200, description = "The gateway accepts application traffic", body = ReadyResponse),
+        (status = 405, description = "Wrong method for this route", body = ErrorEnvelope),
+        (status = 503, description = "The gateway is starting or shutting down", body = ErrorEnvelope),
+    )
+)]
+pub(crate) async fn ready(State(state): State<RestState>, request: Request) -> Response {
+    match state.readiness.ensure_accepting() {
+        Ok(()) => json_response(&ReadyResponse { status: "ready" })
+            .expect("the ready response is serializable"),
+        Err(error) => {
+            let request_id = request
+                .extensions()
+                .get::<RequestId>()
+                .cloned()
+                .unwrap_or_default();
+            error_response(&error, &request_id)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -130,5 +171,37 @@ mod tests {
         let response = get(app, "/health").await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(body_json(response).await["status"], "ok");
+    }
+
+    /// `/ready` is 200 only while the gateway accepts traffic, so load balancers stop sending
+    /// traffic the moment shutdown starts instead of feeding requests the acceptance guard rejects.
+    #[tokio::test]
+    async fn ready_reflects_acceptance_across_the_lifecycle() {
+        let state = test_support::test_state();
+
+        let app = crate::protocol::rest::build_router(state.clone(), &test_support::test_options());
+        let response = get(app, "/ready").await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let json = body_json(response).await;
+        assert_eq!(json["error"]["code"], "unavailable");
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("starting"),
+            "the envelope names the state: {json}"
+        );
+
+        state.readiness.set_serving();
+        let app = crate::protocol::rest::build_router(state.clone(), &test_support::test_options());
+        let response = get(app, "/ready").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["status"], "ready");
+
+        state.readiness.begin_quiescing();
+        let app = crate::protocol::rest::build_router(state, &test_support::test_options());
+        let response = get(app, "/ready").await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body_json(response).await["error"]["code"], "unavailable");
     }
 }
