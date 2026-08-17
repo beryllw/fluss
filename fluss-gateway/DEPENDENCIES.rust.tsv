@@ -23,7 +23,6 @@ crossbeam-utils@0.8.22	X						X
 equivalent@1.0.2	X						X			
 errno@0.3.14	X						X			
 fluss-gateway@1.0.0	X									
-fnv@1.0.7	X						X			
 foldhash@0.2.0										X
 futures-channel@0.3.34	X						X			
 futures-core@0.3.34	X						X			
@@ -33,7 +32,6 @@ futures-task@0.3.34	X						X
 futures-util@0.3.34	X						X			
 getrandom@0.3.4	X						X			
 getrandom@0.4.3	X						X			
-h2@0.4.15							X			
 hashbrown@0.16.1	X						X			
 hashbrown@0.17.1	X						X			
 heck@0.5.0	X						X			

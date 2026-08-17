@@ -212,6 +212,26 @@ pub fn shaped(mut response: Response) -> Response {
     response
 }
 
+/// Assembles the REST frontend from the REST configuration and the shared process services.
+///
+/// This is the frontend's entry point for the lifecycle: it owns how the handler state is built and
+/// the router is wired, so the lifecycle stays protocol-agnostic and only supervises the listener
+/// this router is served on. `local_addr` is the resolved bound address, which differs from the
+/// configured one when the port is 0.
+pub fn build(
+    rest_config: &RestServerConfig,
+    readiness: &Arc<Readiness>,
+    local_addr: SocketAddr,
+) -> Router {
+    let state = RestState {
+        readiness: readiness.clone(),
+        bind_address: local_addr,
+        started_at: Instant::now(),
+        openapi: Arc::new(OnceLock::new()),
+    };
+    build_router(state, &RestOptions::from(rest_config))
+}
+
 /// Builds the P1 router: the health routes (`GET /health` for liveness, `GET /ready` for
 /// readiness) sit outside both the acceptance guard and the body/deadline budget so they answer
 /// while draining and never carry a body; every guarded route (today `/v1/openapi.json`, later all

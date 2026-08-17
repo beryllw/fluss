@@ -26,20 +26,21 @@
 use crate::config::GatewayConfig;
 use crate::error::GatewayError;
 use crate::observability;
-use crate::protocol::rest::{self, RestOptions, RestState};
+use crate::protocol::rest;
 use axum::Router;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use futures_util::FutureExt;
-use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use hyper::server::conn::http1;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
 use metrics_exporter_prometheus::PrometheusHandle;
 use std::any::Any;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -267,8 +268,7 @@ async fn start_internal(config: GatewayConfig) -> Result<RunningGateway, RunErro
         .map_err(|error| format!("failed to read the bound metrics listener address: {error}"))?;
 
     let readiness = Arc::new(Readiness::new());
-    let state = rest_state(&config, &readiness, local_addr);
-    let router = rest::build_router(state, &RestOptions::from(&config.server.rest));
+    let router = rest::build(&config.server.rest, &readiness, local_addr);
     let header_read_timeout = config.server.rest.header_read_timeout.get();
     let shutdown = CancellationToken::new();
     let mut tasks = JoinSet::new();
@@ -317,20 +317,6 @@ async fn start_internal(config: GatewayConfig) -> Result<RunningGateway, RunErro
     })
 }
 
-/// Builds shared handler state from validated configuration and process services.
-pub fn rest_state(
-    _config: &GatewayConfig,
-    readiness: &Arc<Readiness>,
-    bind_address: std::net::SocketAddr,
-) -> RestState {
-    RestState {
-        readiness: readiness.clone(),
-        bind_address,
-        started_at: Instant::now(),
-        openapi: Arc::new(OnceLock::new()),
-    }
-}
-
 /// Binds one configured HTTP listener and adds a contextual startup error.
 async fn bind_listener(
     bind_address: std::net::SocketAddr,
@@ -346,10 +332,10 @@ async fn bind_listener(
 /// Serves one Axum listener until process cancellation starts graceful drain.
 ///
 /// Follows axum's official `serve-with-hyper` example, because `axum::serve` does not expose the
-/// hyper builder that the header read timeout lives on — the only defence against connections that
-/// stall or dribble the request head, which the per-request deadline cannot see (it runs only after
-/// a complete head). Hyper ≥ 1.4 starts that timer at connection establishment, so a client that
-/// never sends a byte is covered too.
+/// hyper builder that the header read timeout lives on — the only defence against connections
+/// that stall or dribble the request head, which the per-request deadline cannot see (it runs
+/// only after a complete head). The plain http1 builder (not auto) starts that timer at
+/// connection setup, before any byte arrives, and has no HTTP/2 preface sniffing to park on.
 async fn serve(
     listener: tokio::net::TcpListener,
     router: Router,
@@ -358,25 +344,28 @@ async fn serve(
 ) -> Result<(), String> {
     let graceful = hyper_util::server::graceful::GracefulShutdown::new();
     loop {
-        let (socket, _remote) = tokio::select! {
+        let socket = tokio::select! {
             biased;
             _ = shutdown.cancelled() => break,
-            accepted = listener.accept() => accepted.map_err(|error| error.to_string())?,
+            accepted = listener.accept() => match accepted {
+                Ok((socket, _remote)) => socket,
+                Err(error) => {
+                    handle_accept_error(error).await;
+                    continue;
+                }
+            },
         };
         // `axum::serve` sets TCP_NODELAY on accepted sockets; keep that behaviour.
         let _ = socket.set_nodelay(true);
-        let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+        let mut builder = http1::Builder::new();
         // The header read timeout runs on hyper's background timer, so one must be installed first.
         builder
-            .http1()
             .timer(TokioTimer::new())
             .header_read_timeout(header_read_timeout);
         let service = TowerToHyperService::new(router.clone());
-        // `into_owned` unhooks the connection from the borrowed builder for the `'static` spawn.
-        let connection = builder
-            .serve_connection_with_upgrades(TokioIo::new(socket), service)
-            .into_owned();
-        let connection = graceful.watch(connection);
+        // The non-upgradeable connection is what `graceful.watch` accepts; the gateway has no
+        // upgrade-based protocol.
+        let connection = graceful.watch(builder.serve_connection(TokioIo::new(socket), service));
         tokio::spawn(async move {
             if let Err(error) = connection.await {
                 log::debug!("connection ended with an error: {error}");
@@ -387,6 +376,22 @@ async fn serve(
     // budget that aborts this task.
     graceful.shutdown().await;
     Ok(())
+}
+
+/// Copies `axum::serve`'s accept-loop resilience: per-connection hiccups are ignored, and a
+/// resource error such as EMFILE (the process hit its open-file limit) logs and waits a second
+/// for fds to be released instead of failing the whole listener.
+async fn handle_accept_error(error: std::io::Error) {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+    ) {
+        return;
+    }
+    log::error!("accept error: {error}");
+    tokio::time::sleep(Duration::from_secs(1)).await;
 }
 
 /// Builds the isolated Prometheus scrape router.

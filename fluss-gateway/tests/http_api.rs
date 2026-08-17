@@ -159,6 +159,18 @@ async fn ready_and_health_answer_over_the_real_listener() {
     gateway.shutdown().await.expect("clean shutdown");
 }
 
+/// A gateway with a short header read timeout, for the connection-level tests.
+async fn short_header_timeout_gateway() -> fluss_gateway::lifecycle::RunningGateway {
+    let mut config = fluss_gateway::config::GatewayConfig::default();
+    config.server.rest.bind_address = "127.0.0.1:0".parse().expect("valid");
+    config.server.metrics.enabled = false;
+    config.server.rest.header_read_timeout =
+        fluss_gateway::config::ConfigDuration::from_millis(300);
+    fluss_gateway::lifecycle::start(config)
+        .await
+        .expect("gateway starts")
+}
+
 /// A connection that stalls mid-head is closed when the header read timeout expires. The request
 /// deadline cannot defend here: it runs only after hyper has parsed a complete head, so without
 /// this timeout such a connection would hold its socket and task forever.
@@ -166,14 +178,7 @@ async fn ready_and_health_answer_over_the_real_listener() {
 async fn a_stalled_head_connection_is_closed_by_the_header_read_timeout() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let mut config = fluss_gateway::config::GatewayConfig::default();
-    config.server.rest.bind_address = "127.0.0.1:0".parse().expect("valid");
-    config.server.metrics.enabled = false;
-    config.server.rest.header_read_timeout =
-        fluss_gateway::config::ConfigDuration::from_millis(300);
-    let gateway = fluss_gateway::lifecycle::start(config)
-        .await
-        .expect("gateway starts");
+    let gateway = short_header_timeout_gateway().await;
 
     let mut socket = tokio::net::TcpStream::connect(gateway.local_addr())
         .await
@@ -194,6 +199,64 @@ async fn a_stalled_head_connection_is_closed_by_the_header_read_timeout() {
         }
         Err(_) => panic!("the stalled connection was not closed within the test timeout"),
     }
+
+    gateway.shutdown().await.expect("clean shutdown");
+}
+
+/// A connection that sends nothing at all is closed too: the plain http1 builder starts the
+/// header timer at connection setup, before any byte arrives (the auto builder's HTTP/2 preface
+/// sniffing read had no timer on it, so silent sockets stayed parked).
+#[tokio::test]
+async fn a_silent_connection_is_closed_by_the_header_read_timeout() {
+    use tokio::io::AsyncReadExt;
+
+    let gateway = short_header_timeout_gateway().await;
+
+    let mut socket = tokio::net::TcpStream::connect(gateway.local_addr())
+        .await
+        .expect("connect");
+
+    let mut buffer = [0u8; 16];
+    let read =
+        tokio::time::timeout(std::time::Duration::from_secs(5), socket.read(&mut buffer)).await;
+    match read {
+        Ok(Ok(0)) | Ok(Err(_)) => {}
+        Ok(Ok(byte_count)) => {
+            panic!("the gateway answered a silent connection with {byte_count} bytes")
+        }
+        Err(_) => panic!("the silent connection was not closed within the test timeout"),
+    }
+
+    gateway.shutdown().await.expect("clean shutdown");
+}
+
+/// The HTTP/2 client preface is not negotiated: the gateway serves HTTP/1 only, so the preface
+/// fails head parsing and the connection answers with an HTTP/1 error and closes.
+#[tokio::test]
+async fn an_http2_preface_connection_is_not_served_as_http2() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let gateway = short_header_timeout_gateway().await;
+
+    let mut socket = tokio::net::TcpStream::connect(gateway.local_addr())
+        .await
+        .expect("connect");
+    socket
+        .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+        .await
+        .expect("HTTP/2 preface");
+
+    let mut received = Vec::new();
+    let read = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        socket.read_to_end(&mut received),
+    )
+    .await;
+    let response = String::from_utf8_lossy(&received);
+    assert!(
+        read.is_ok() && (received.is_empty() || response.starts_with("HTTP/1.1 4")),
+        "no HTTP/2 session and no parked connection, at most an HTTP/1 error: {response}"
+    );
 
     gateway.shutdown().await.expect("clean shutdown");
 }

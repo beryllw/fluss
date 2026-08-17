@@ -49,8 +49,11 @@ name = "fluss_gateway"
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "matched-path", "tokio"] }
 # The listeners follow axum's official serve-with-hyper example: axum::serve does not expose the
-# hyper builder that the header read timeout lives on.
-hyper-util = { version = "0.1", default-features = false, features = ["server-auto", "server-graceful", "service", "tokio"] }
+# hyper builder that the header read timeout lives on. The plain http1 builder (not auto) has no
+# HTTP/2 preface sniffing, so the header timer covers a connection from its first byte.
+hyper = { version = "1", default-features = false, features = ["http1", "server"] }
+# GracefulShutdown and the tower-to-hyper service adapter for the serve loop above.
+hyper-util = { version = "0.1", default-features = false, features = ["server-graceful", "service", "tokio"] }
 clap = { version = "4.5.37", features = ["derive"] }
 # Only FutureExt/join_all are used; avoid the larger futures facade crate.
 futures-util = "0.3"
