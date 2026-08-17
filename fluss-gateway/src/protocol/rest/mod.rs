@@ -28,7 +28,7 @@ pub mod health;
 pub mod openapi;
 
 use crate::config::RestServerConfig;
-use crate::error::{ErrorEnvelope, ErrorKind, GatewayError};
+use crate::error::{ErrorEnvelope, ErrorKind, GatewayError, panic_message};
 use crate::lifecycle::Readiness;
 use crate::observability;
 use axum::Router;
@@ -37,9 +37,11 @@ use axum::extract::{DefaultBodyLimit, MatchedPath, Request};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
+use futures_util::FutureExt;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::net::SocketAddr;
+use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use utoipa_axum::router::OpenApiRouter;
@@ -383,8 +385,33 @@ fn apply_data_limits(router: Router, options: &RestOptions) -> Router {
 
 fn apply_common_middleware(router: Router) -> Router {
     router
+        .layer(middleware::from_fn(catch_panic))
         .layer(middleware::from_fn(request_log))
         .layer(middleware::from_fn(request_context))
+}
+
+/// Turns a panic below this layer into the error envelope a client is promised.
+///
+/// Sitting inside the access-log layer, the synthesised 500 is logged and counted like any other
+/// response, where a dropped connection would have been recorded nowhere. The payload goes to the
+/// log, never into the response, since it can carry internal detail.
+async fn catch_panic(request: Request, next: Next) -> Response {
+    let request_id = request
+        .extensions()
+        .get::<RequestId>()
+        .cloned()
+        .unwrap_or_default();
+    match AssertUnwindSafe(next.run(request)).catch_unwind().await {
+        Ok(response) => response,
+        Err(payload) => {
+            log::error!(
+                "request_id={} handler panicked: {}",
+                request_id.as_str(),
+                panic_message(payload)
+            );
+            error_response(&GatewayError::internal("internal error"), &request_id)
+        }
+    }
 }
 
 async fn request_log(request: Request, next: Next) -> Response {
@@ -779,6 +806,42 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert!(response.headers().contains_key("x-request-id"));
+    }
+
+    /// A panicking handler answers the shared envelope instead of dropping the connection.
+    #[tokio::test]
+    async fn a_panicking_handler_yields_a_500_envelope() {
+        async fn boom() -> &'static str {
+            panic!("handler bug");
+        }
+        let app = apply_middleware(
+            Router::new().route("/boom", get(boom)),
+            &test_support::test_options(),
+        );
+
+        // The default panic hook still prints the payload; that output is expected here.
+        let response = app
+            .oneshot(Request::builder().uri("/boom").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let request_id = response
+            .headers()
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+            .expect("x-request-id header");
+        let json = body_json(response).await;
+        assert_eq!(json["error"]["code"], "internal");
+        assert_eq!(json["error"]["request_id"], request_id.as_str());
+        assert!(
+            !json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("handler bug"),
+            "the panic payload stays in the log, never in the response: {json}"
+        );
     }
 
     #[test]

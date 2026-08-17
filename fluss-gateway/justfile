@@ -54,9 +54,11 @@ openapi:
 run *flags:
     cargo run -- {{flags}}
 
-# Check that every dependency license is compatible with the Apache License.
+# Check that every dependency license is compatible with the Apache License, and that no banned
+# crate entered the graph.
 licenses:
     cargo deny check licenses
+    cargo deny check bans
 
 # Regenerate the checked-in dependency license inventory.
 deps:

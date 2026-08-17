@@ -48,21 +48,22 @@ name = "fluss_gateway"
 
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "matched-path", "tokio"] }
+clap = { version = "4.5.37", features = ["derive"] }
+# Only FutureExt/join_all are used; avoid the larger futures facade crate.
+futures-util = "0.3"
 # The listeners follow axum's official serve-with-hyper example: axum::serve does not expose the
 # hyper builder that the header read timeout lives on. The plain http1 builder (not auto) has no
 # HTTP/2 preface sniffing, so the header timer covers a connection from its first byte.
 hyper = { version = "1", default-features = false, features = ["http1", "server"] }
-# GracefulShutdown and the tower-to-hyper service adapter for the serve loop above. `http1` is what
-# gates the `GracefulConnection` impl that `graceful.watch` needs, so it is requested here rather
-# than inherited from axum's own `http1`, whose feature set is not ours to rely on.
+# GracefulShutdown and the tower-to-hyper service adapter for the serve loop above. `http1` gates
+# the `GracefulConnection` impl `graceful.watch` needs, so it is requested rather than inherited.
 hyper-util = { version = "0.1", default-features = false, features = ["http1", "server-graceful", "service", "tokio"] }
-clap = { version = "4.5.37", features = ["derive"] }
-# Only FutureExt/join_all are used; avoid the larger futures facade crate.
-futures-util = "0.3"
 # Process CPU/RSS/fd sampling for the FIP-49 process_* metric families.
 libc = "0.2"
 log = "0.4"
 metrics = "0.24"
+# The recorder and the `/metrics` route need no default feature, and those would reach the whole
+# graph through `hyper-util/server-auto`; `deny.toml` guards the consequence.
 metrics-exporter-prometheus = { version = "0.17", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -73,7 +74,8 @@ serde_path_to_error = "0.1"
 serde_yaml_ng = "0.10"
 # Runtime capabilities used by the server; test-only I/O/time controls are enabled below.
 tokio = { version = "1.44.2", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
-tokio-util = { version = "0.7", features = ["rt"] }
+# Only `sync::CancellationToken` is used, which needs no feature of its own.
+tokio-util = { version = "0.7", default-features = false }
 utoipa = { version = "5", features = ["axum_extras"] }
 utoipa-axum = "0.2"
 uuid = { version = "1.10", features = ["v4"] }

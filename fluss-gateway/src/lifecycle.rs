@@ -24,7 +24,7 @@
 //! instance would have to pick up.
 
 use crate::config::GatewayConfig;
-use crate::error::GatewayError;
+use crate::error::{GatewayError, panic_message};
 use crate::observability;
 use crate::protocol::rest;
 use axum::Router;
@@ -36,7 +36,6 @@ use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
 use metrics_exporter_prometheus::PrometheusHandle;
-use std::any::Any;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
@@ -362,9 +361,8 @@ async fn serve(
         let connection = graceful.watch(builder.serve_connection(TokioIo::new(socket), service));
         tokio::spawn(async move {
             if let Err(error) = connection.await {
-                // A client speaking HTTP/2 is a configuration problem on the other side, not per-
-                // connection noise: without this an ingress pointed here over h2c sees connections
-                // dropped with no explanation on either end.
+                // A client speaking HTTP/2 is a misconfiguration on the other side, not per-
+                // connection noise, and neither end can see it from a dropped connection alone.
                 if error.is_parse_version_h2() {
                     log::warn!(
                         "rejected an HTTP/2 connection preface: this listener serves HTTP/1.1 \
@@ -384,10 +382,9 @@ async fn serve(
 
 /// Accepts one connection, absorbing the accept errors that must not end the listener.
 ///
-/// The retry loop lives inside this future on purpose: the serve loop selects it against shutdown,
-/// so a signal arriving during the backoff drops the wait instead of having to outlast it. Both
-/// awaited operations are cancellation-safe, so dropping this future loses nothing. `axum::serve`
-/// keeps the same wait inside its `Listener::accept` for the same reason.
+/// The retry loop lives inside this future, as it does in `axum::serve`'s `Listener::accept`, so a
+/// signal arriving during the backoff cancels the wait rather than having to outlast it; both
+/// awaited operations are cancellation-safe.
 async fn accept_with_retry(listener: &tokio::net::TcpListener) -> tokio::net::TcpStream {
     loop {
         match listener.accept().await {
@@ -501,16 +498,6 @@ async fn drain_tasks(
                 ));
             }
         }
-    }
-}
-
-fn panic_message(payload: Box<dyn Any + Send>) -> String {
-    match payload.downcast::<String>() {
-        Ok(message) => *message,
-        Err(payload) => match payload.downcast::<&'static str>() {
-            Ok(message) => (*message).to_string(),
-            Err(_) => "non-string panic payload".to_string(),
-        },
     }
 }
 

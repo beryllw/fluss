@@ -32,6 +32,7 @@
 //! stable code per condition.
 
 use serde::Serialize;
+use std::any::Any;
 use std::fmt;
 use utoipa::openapi::schema::Type;
 use utoipa::openapi::{ObjectBuilder, RefOr, Schema};
@@ -353,6 +354,18 @@ impl fmt::Display for GatewayError {
 }
 
 impl std::error::Error for GatewayError {}
+
+/// Renders a caught panic payload as a log message, for the callers that report a panic as a named
+/// failure instead of losing it.
+pub(crate) fn panic_message(payload: Box<dyn Any + Send>) -> String {
+    match payload.downcast::<String>() {
+        Ok(message) => *message,
+        Err(payload) => match payload.downcast::<&'static str>() {
+            Ok(message) => (*message).to_string(),
+            Err(_) => "non-string panic payload".to_string(),
+        },
+    }
+}
 
 /// REST error envelope: `{"error": {"code", "message", "request_id"}}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
