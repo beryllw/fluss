@@ -347,13 +347,7 @@ async fn serve(
         let socket = tokio::select! {
             biased;
             _ = shutdown.cancelled() => break,
-            accepted = listener.accept() => match accepted {
-                Ok((socket, _remote)) => socket,
-                Err(error) => {
-                    handle_accept_error(error).await;
-                    continue;
-                }
-            },
+            socket = accept_with_retry(&listener) => socket,
         };
         // `axum::serve` sets TCP_NODELAY on accepted sockets; keep that behaviour.
         let _ = socket.set_nodelay(true);
@@ -368,7 +362,17 @@ async fn serve(
         let connection = graceful.watch(builder.serve_connection(TokioIo::new(socket), service));
         tokio::spawn(async move {
             if let Err(error) = connection.await {
-                log::debug!("connection ended with an error: {error}");
+                // A client speaking HTTP/2 is a configuration problem on the other side, not per-
+                // connection noise: without this an ingress pointed here over h2c sees connections
+                // dropped with no explanation on either end.
+                if error.is_parse_version_h2() {
+                    log::warn!(
+                        "rejected an HTTP/2 connection preface: this listener serves HTTP/1.1 \
+                         only, so clients and ingresses must not be configured for h2c"
+                    );
+                } else {
+                    log::debug!("connection ended with an error: {error}");
+                }
             }
         });
     }
@@ -376,6 +380,21 @@ async fn serve(
     // budget that aborts this task.
     graceful.shutdown().await;
     Ok(())
+}
+
+/// Accepts one connection, absorbing the accept errors that must not end the listener.
+///
+/// The retry loop lives inside this future on purpose: the serve loop selects it against shutdown,
+/// so a signal arriving during the backoff drops the wait instead of having to outlast it. Both
+/// awaited operations are cancellation-safe, so dropping this future loses nothing. `axum::serve`
+/// keeps the same wait inside its `Listener::accept` for the same reason.
+async fn accept_with_retry(listener: &tokio::net::TcpListener) -> tokio::net::TcpStream {
+    loop {
+        match listener.accept().await {
+            Ok((socket, _remote)) => return socket,
+            Err(error) => handle_accept_error(error).await,
+        }
+    }
 }
 
 /// Copies `axum::serve`'s accept-loop resilience: per-connection hiccups are ignored, and a

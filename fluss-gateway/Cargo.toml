@@ -52,8 +52,10 @@ axum = { version = "0.8", default-features = false, features = ["http1", "matche
 # hyper builder that the header read timeout lives on. The plain http1 builder (not auto) has no
 # HTTP/2 preface sniffing, so the header timer covers a connection from its first byte.
 hyper = { version = "1", default-features = false, features = ["http1", "server"] }
-# GracefulShutdown and the tower-to-hyper service adapter for the serve loop above.
-hyper-util = { version = "0.1", default-features = false, features = ["server-graceful", "service", "tokio"] }
+# GracefulShutdown and the tower-to-hyper service adapter for the serve loop above. `http1` is what
+# gates the `GracefulConnection` impl that `graceful.watch` needs, so it is requested here rather
+# than inherited from axum's own `http1`, whose feature set is not ours to rely on.
+hyper-util = { version = "0.1", default-features = false, features = ["http1", "server-graceful", "service", "tokio"] }
 clap = { version = "4.5.37", features = ["derive"] }
 # Only FutureExt/join_all are used; avoid the larger futures facade crate.
 futures-util = "0.3"
