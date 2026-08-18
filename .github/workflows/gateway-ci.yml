@@ -60,18 +60,20 @@ jobs:
         with:
           workspaces: fluss-gateway
 
+      # Without `--locked` Cargo rewrites a stale lockfile in the CI workspace, and the run would
+      # validate a dependency graph the repository does not contain.
       - name: Build
-        run: cargo build --all-targets
+        run: cargo build --locked --all-targets
 
       - name: Unit Test
-        run: cargo test --all-targets
+        run: cargo test --locked --all-targets
         env:
           RUST_LOG: DEBUG
           RUST_BACKTRACE: full
 
       - name: OpenAPI drift check
         run: |
-          cargo test --lib protocol::rest::openapi::tests::export_checked_in_document -- --ignored --exact
+          cargo test --locked --lib protocol::rest::openapi::tests::export_checked_in_document -- --ignored --exact
           git diff --exit-code openapi.yaml
 
       - name: OpenAPI external validation
@@ -95,7 +97,7 @@ jobs:
           workspaces: fluss-gateway
 
       - name: Check on the declared MSRV
-        run: cargo +1.88.0 check --all-targets
+        run: cargo +1.88.0 check --locked --all-targets
 
   check-license-and-formatting:
     name: "Gateway License and Formatting Check"
@@ -114,10 +116,16 @@ jobs:
           tool: cargo-deny@0.14.22
 
       - name: Check dependency licenses (Apache-compatible)
-        run: cargo deny check licenses
+        run: cargo deny --locked check licenses
 
       - name: Check banned dependencies (HTTP/2 stack stays out)
-        run: cargo deny check bans
+        run: cargo deny --locked check bans
+
+      # The inventory ships with the source release, so a stale one is worse than none.
+      - name: Dependency inventory drift check
+        run: |
+          cargo deny --locked list -f tsv -t 0.6 > DEPENDENCIES.rust.tsv
+          git diff --exit-code DEPENDENCIES.rust.tsv
 
       - name: Rust Cache
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
@@ -128,9 +136,9 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Rustdoc
-        run: cargo doc --no-deps
+        run: cargo doc --locked --no-deps
         env:
           RUSTDOCFLAGS: -D warnings

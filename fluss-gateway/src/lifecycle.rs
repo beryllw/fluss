@@ -269,12 +269,19 @@ async fn start_internal(config: GatewayConfig) -> Result<RunningGateway, RunErro
     let readiness = Arc::new(Readiness::new());
     let router = rest::build(&config.server.rest, &readiness, local_addr);
     let header_read_timeout = config.server.rest.header_read_timeout.get();
+    let connection_drain = connection_drain_budget(config.shutdown.drain_timeout.get());
     let shutdown = CancellationToken::new();
     let mut tasks = JoinSet::new();
     spawn_named(
         &mut tasks,
         "REST listener",
-        serve(listener, router, header_read_timeout, shutdown.clone()),
+        serve(
+            listener,
+            router,
+            header_read_timeout,
+            connection_drain,
+            shutdown.clone(),
+        ),
     );
     if let Some(listener) = metrics_listener {
         let handle = observability::metrics_handle();
@@ -285,6 +292,7 @@ async fn start_internal(config: GatewayConfig) -> Result<RunningGateway, RunErro
                 listener,
                 metrics_router(handle),
                 header_read_timeout,
+                connection_drain,
                 shutdown.clone(),
             ),
         );
@@ -316,6 +324,18 @@ async fn start_internal(config: GatewayConfig) -> Result<RunningGateway, RunErro
     })
 }
 
+/// Upper bound on the tail `connection_drain_budget` reserves for cleanup.
+const MAX_CLEANUP_HEADROOM: Duration = Duration::from_secs(2);
+
+/// Splits the configured shutdown budget into the connection drain and a cleanup tail.
+///
+/// The drain has to end before the process deadline: otherwise `drain_tasks` aborts `serve()`
+/// mid-drain and the connection abort loses its join. The tail scales rather than being a fixed
+/// subtraction, which would leave short budgets with no drain at all.
+fn connection_drain_budget(total: Duration) -> Duration {
+    total.saturating_sub(std::cmp::min(total / 10, MAX_CLEANUP_HEADROOM))
+}
+
 /// Binds one configured HTTP listener and adds a contextual startup error.
 async fn bind_listener(
     bind_address: std::net::SocketAddr,
@@ -335,13 +355,19 @@ async fn bind_listener(
 /// that stall or dribble the request head, which the per-request deadline cannot see (it runs
 /// only after a complete head). The plain http1 builder (not auto) starts that timer at
 /// connection setup, before any byte arrives, and has no HTTP/2 preface sniffing to park on.
+///
+/// Connection tasks belong to this task's [`JoinSet`], so no handler can outlive the listener that
+/// accepted it: whatever the graceful window does not finish is aborted and joined before this
+/// returns, and dropping the set aborts the rest even if this task is itself aborted.
 async fn serve(
     listener: tokio::net::TcpListener,
     router: Router,
     header_read_timeout: Duration,
+    connection_drain: Duration,
     shutdown: CancellationToken,
 ) -> Result<(), String> {
     let graceful = hyper_util::server::graceful::GracefulShutdown::new();
+    let mut connections = JoinSet::new();
     loop {
         let socket = tokio::select! {
             biased;
@@ -359,7 +385,7 @@ async fn serve(
         // The non-upgradeable connection is what `graceful.watch` accepts; the gateway has no
         // upgrade-based protocol.
         let connection = graceful.watch(builder.serve_connection(TokioIo::new(socket), service));
-        tokio::spawn(async move {
+        connections.spawn(async move {
             if let Err(error) = connection.await {
                 // A client speaking HTTP/2 is a misconfiguration on the other side, not per-
                 // connection noise, and neither end can see it from a dropped connection alone.
@@ -373,10 +399,20 @@ async fn serve(
                 }
             }
         });
+        // Reap finished connections so owning them does not grow the set without bound.
+        while connections.try_join_next().is_some() {}
     }
-    // Idle connections close now; in-flight requests run to completion, bounded by the outer drain
-    // budget that aborts this task.
-    graceful.shutdown().await;
+    // Idle connections close now and in-flight requests run to completion.
+    if tokio::time::timeout(connection_drain, graceful.shutdown())
+        .await
+        .is_err()
+    {
+        log::warn!(
+            "{} connection(s) did not finish within the drain budget",
+            connections.len()
+        );
+    }
+    connections.shutdown().await;
     Ok(())
 }
 
@@ -708,5 +744,97 @@ mod tests {
 
         assert!(error.is_none(), "{error:?}");
         assert!(tasks.is_empty());
+    }
+
+    /// Every configured budget keeps a drain window and a cleanup tail, and the tail is capped.
+    #[test]
+    fn the_connection_drain_leaves_a_proportional_cleanup_tail() {
+        for (total, drain) in [
+            (Duration::from_secs(30), Duration::from_secs(28)),
+            (Duration::from_secs(20), Duration::from_secs(18)),
+            (Duration::from_secs(10), Duration::from_secs(9)),
+            (Duration::from_millis(100), Duration::from_millis(90)),
+        ] {
+            assert_eq!(connection_drain_budget(total), drain, "total={total:?}");
+        }
+    }
+
+    /// A handler that outlives the connection drain budget is aborted and joined before `serve`
+    /// returns, so no request work can continue once the process reports itself stopped.
+    #[tokio::test]
+    async fn a_handler_outlasting_the_drain_budget_is_dropped_before_serve_returns() {
+        /// Reports that the handler future was dropped rather than left running.
+        struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let handler_dropped = dropped.clone();
+        let handler_entered = entered.clone();
+        let router = Router::new().route(
+            "/slow",
+            get(move || {
+                let guard = DropFlag(handler_dropped.clone());
+                let entered = handler_entered.clone();
+                async move {
+                    let _guard = guard;
+                    entered.notify_one();
+                    // Far longer than the drain budget below, so only the abort can end it.
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                    "unreachable"
+                }
+            }),
+        );
+
+        let listener = bind_listener("127.0.0.1:0".parse().expect("valid"), "test")
+            .await
+            .expect("bound");
+        let address = listener.local_addr().expect("address");
+        let shutdown = CancellationToken::new();
+        let serving = tokio::spawn(serve(
+            listener,
+            router,
+            Duration::from_secs(5),
+            Duration::from_millis(200),
+            shutdown.clone(),
+        ));
+
+        // Send a request without reading the response, then wait until the handler is running.
+        let request = tokio::spawn(async move {
+            let mut socket = tokio::net::TcpStream::connect(address)
+                .await
+                .expect("connect");
+            tokio::io::AsyncWriteExt::write_all(
+                &mut socket,
+                format!("GET /slow HTTP/1.1\r\nHost: {address}\r\n\r\n").as_bytes(),
+            )
+            .await
+            .expect("send request");
+            // Hold the connection open for as long as the server keeps it.
+            let mut buffer = Vec::new();
+            let _ = tokio::io::AsyncReadExt::read_to_end(&mut socket, &mut buffer).await;
+        });
+        entered.notified().await;
+        assert!(
+            !dropped.load(Ordering::SeqCst),
+            "the handler is still running before shutdown starts"
+        );
+
+        shutdown.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(10), serving)
+            .await
+            .expect("serve returns within the test timeout")
+            .expect("serve does not panic");
+
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the handler must be dropped before serve returns, not left running detached"
+        );
+        request.abort();
     }
 }

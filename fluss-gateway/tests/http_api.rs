@@ -33,12 +33,13 @@ async fn gateway() -> (RunningGateway, Api) {
 }
 
 #[tokio::test]
-async fn health_answers_with_status_and_uptime() {
+async fn health_and_ready_answer_over_the_real_listener() {
     let (gateway, api) = gateway().await;
 
     let health = api.get_ok("/health").await;
     assert_eq!(health["status"], "ok");
     assert!(health["uptime_ms"].is_u64(), "{health}");
+    assert_eq!(api.get_ok("/ready").await["status"], "ready");
 
     gateway.shutdown().await.expect("clean shutdown");
 }
@@ -147,18 +148,6 @@ async fn an_oversized_body_is_rejected_with_413_and_never_429() {
     gateway.shutdown().await.expect("clean shutdown");
 }
 
-/// `/ready` answers 200 over the real listener once the gateway is serving, alongside `/health`.
-#[tokio::test]
-async fn ready_and_health_answer_over_the_real_listener() {
-    let (gateway, api) = gateway().await;
-
-    assert_eq!(api.get("/health").await.status(), 200);
-    let ready = api.get_ok("/ready").await;
-    assert_eq!(ready["status"], "ready");
-
-    gateway.shutdown().await.expect("clean shutdown");
-}
-
 /// A gateway with a short header read timeout, for the connection-level tests.
 async fn short_header_timeout_gateway() -> fluss_gateway::lifecycle::RunningGateway {
     let mut config = fluss_gateway::config::GatewayConfig::default();
@@ -171,92 +160,43 @@ async fn short_header_timeout_gateway() -> fluss_gateway::lifecycle::RunningGate
         .expect("gateway starts")
 }
 
-/// A connection that stalls mid-head is closed when the header read timeout expires. The request
-/// deadline cannot defend here: it runs only after hyper has parsed a complete head, so without
-/// this timeout such a connection would hold its socket and task forever.
+/// A connection that never completes a request head is closed, and none of these heads negotiates
+/// HTTP/2. The per-request deadline cannot defend here, as it runs only after a complete head; the
+/// plain http1 builder starts its timer at connection setup, so a silent socket is covered too, and
+/// the HTTP/2 preface only fails head parsing.
 #[tokio::test]
-async fn a_stalled_head_connection_is_closed_by_the_header_read_timeout() {
+async fn connections_without_a_complete_head_are_closed_and_never_upgraded() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let gateway = short_header_timeout_gateway().await;
+    for (case, head) in [
+        ("a silent connection", b"".as_slice()),
+        ("half a request head", b"GET /heal".as_slice()),
+        (
+            "an HTTP/2 preface",
+            b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_slice(),
+        ),
+    ] {
+        let mut socket = tokio::net::TcpStream::connect(gateway.local_addr())
+            .await
+            .expect("connect");
+        socket.write_all(head).await.expect("send the head");
 
-    let mut socket = tokio::net::TcpStream::connect(gateway.local_addr())
+        // Reading to EOF returns only once the server closes, so a parked connection times out.
+        let mut received = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            socket.read_to_end(&mut received),
+        )
         .await
-        .expect("connect");
-    socket
-        .write_all(b"GET /heal")
-        .await
-        .expect("half a request head");
-
-    // The server closes the connection instead of holding it open forever.
-    let mut buffer = [0u8; 16];
-    let read =
-        tokio::time::timeout(std::time::Duration::from_secs(5), socket.read(&mut buffer)).await;
-    match read {
-        Ok(Ok(0)) | Ok(Err(_)) => {}
-        Ok(Ok(byte_count)) => {
-            panic!("the gateway answered a half request head with {byte_count} bytes")
-        }
-        Err(_) => panic!("the stalled connection was not closed within the test timeout"),
+        .unwrap_or_else(|_| panic!("{case} was not closed"))
+        .expect("read");
+        let response = String::from_utf8_lossy(&received);
+        assert!(
+            received.is_empty() || response.starts_with("HTTP/1.1 4"),
+            "{case}: expected a close or an HTTP/1 error, got: {response}"
+        );
     }
-
-    gateway.shutdown().await.expect("clean shutdown");
-}
-
-/// A connection that sends nothing at all is closed too: the plain http1 builder starts the
-/// header timer at connection setup, before any byte arrives (the auto builder's HTTP/2 preface
-/// sniffing read had no timer on it, so silent sockets stayed parked).
-#[tokio::test]
-async fn a_silent_connection_is_closed_by_the_header_read_timeout() {
-    use tokio::io::AsyncReadExt;
-
-    let gateway = short_header_timeout_gateway().await;
-
-    let mut socket = tokio::net::TcpStream::connect(gateway.local_addr())
-        .await
-        .expect("connect");
-
-    let mut buffer = [0u8; 16];
-    let read =
-        tokio::time::timeout(std::time::Duration::from_secs(5), socket.read(&mut buffer)).await;
-    match read {
-        Ok(Ok(0)) | Ok(Err(_)) => {}
-        Ok(Ok(byte_count)) => {
-            panic!("the gateway answered a silent connection with {byte_count} bytes")
-        }
-        Err(_) => panic!("the silent connection was not closed within the test timeout"),
-    }
-
-    gateway.shutdown().await.expect("clean shutdown");
-}
-
-/// The HTTP/2 client preface is not negotiated: the gateway serves HTTP/1 only, so the preface
-/// fails head parsing and the connection answers with an HTTP/1 error and closes.
-#[tokio::test]
-async fn an_http2_preface_connection_is_not_served_as_http2() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let gateway = short_header_timeout_gateway().await;
-
-    let mut socket = tokio::net::TcpStream::connect(gateway.local_addr())
-        .await
-        .expect("connect");
-    socket
-        .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
-        .await
-        .expect("HTTP/2 preface");
-
-    let mut received = Vec::new();
-    let read = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        socket.read_to_end(&mut received),
-    )
-    .await;
-    let response = String::from_utf8_lossy(&received);
-    assert!(
-        read.is_ok() && (received.is_empty() || response.starts_with("HTTP/1.1 4")),
-        "no HTTP/2 session and no parked connection, at most an HTTP/1 error: {response}"
-    );
 
     gateway.shutdown().await.expect("clean shutdown");
 }

@@ -55,11 +55,12 @@ run *flags:
     cargo run -- {{flags}}
 
 # Check that every dependency license is compatible with the Apache License, and that no banned
-# crate entered the graph.
+# crate entered the graph. `--locked` only here and in `deps`: editing `Cargo.toml` locally must
+# still be able to update the lockfile.
 licenses:
-    cargo deny check licenses
-    cargo deny check bans
+    cargo deny --locked check licenses
+    cargo deny --locked check bans
 
 # Regenerate the checked-in dependency license inventory.
 deps:
-    cargo deny list -f tsv -t 0.6 > DEPENDENCIES.rust.tsv
+    cargo deny --locked list -f tsv -t 0.6 > DEPENDENCIES.rust.tsv

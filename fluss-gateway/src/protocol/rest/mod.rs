@@ -680,36 +680,28 @@ mod tests {
         assert_eq!(json["error"]["code"], "timeout");
     }
 
-    /// The deadline ends before the middleware timeout so a response completing at the deadline can
-    /// still be delivered inside the timeout wrapper.
+    /// The deadline reserves the response grace, except for timeouts that are not longer than it,
+    /// which keep their full budget.
     #[test]
-    fn deadline_ends_one_grace_before_the_middleware_timeout() {
-        let timeout = Duration::from_secs(30);
-        let before = Instant::now();
-        let deadline = deadline_from_now(timeout).instant();
-        let after = Instant::now();
+    fn the_deadline_reserves_the_response_grace_when_the_timeout_allows_it() {
+        for (timeout, budget) in [
+            (
+                Duration::from_secs(30),
+                Duration::from_secs(30) - RESPONSE_GRACE,
+            ),
+            (RESPONSE_GRACE, RESPONSE_GRACE),
+            (Duration::from_millis(200), Duration::from_millis(200)),
+        ] {
+            let before = Instant::now();
+            let deadline = deadline_from_now(timeout).instant();
+            let after = Instant::now();
 
-        assert!(
-            deadline >= before + timeout - RESPONSE_GRACE,
-            "the deadline must sit a grace before the timeout: {deadline:?}"
-        );
-        assert!(
-            deadline <= after + timeout - RESPONSE_GRACE + Duration::from_millis(50),
-            "the deadline must not end earlier than one grace before the timeout: {deadline:?}"
-        );
-    }
-
-    /// Timeouts at or below the grace keep their full budget, mirroring Envoy's
-    /// "offset only applies when the timeout is greater" rule.
-    #[test]
-    fn deadline_keeps_the_full_budget_for_short_timeouts() {
-        let timeout = Duration::from_millis(200);
-        let before = Instant::now();
-        let deadline = deadline_from_now(timeout).instant();
-        let after = Instant::now();
-
-        assert!(deadline >= before + timeout);
-        assert!(deadline <= after + timeout + Duration::from_millis(50));
+            assert!(deadline >= before + budget, "timeout={timeout:?}");
+            assert!(
+                deadline <= after + budget + Duration::from_millis(50),
+                "timeout={timeout:?}"
+            );
+        }
     }
 
     /// A handler that finishes exactly at its deadline still gets its response out: the middleware

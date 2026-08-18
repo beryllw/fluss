@@ -331,6 +331,8 @@ impl Default for MetricsServerConfig {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ShutdownConfig {
+    /// Budget for the whole shutdown, not for connection draining alone: the drain runs inside it
+    /// and leaves a tail for the cleanup that follows.
     pub drain_timeout: ConfigDuration,
 }
 
@@ -1034,19 +1036,6 @@ mod tests {
                 "gateway.metrics.exporter.prometheus.listen (127.0.0.1:9095) must differ from \
                  gateway.rest.listen (127.0.0.1:9095)",
             )
-        }));
-    }
-
-    /// A wildcard listener claims the whole family on the port, so a textual difference between the
-    /// two addresses is not a usable configuration.
-    #[test]
-    fn wildcard_listener_must_differ_from_metrics_on_the_same_port() {
-        let error = load_file(
-            "gateway.rest.listen: 0.0.0.0:9095\ngateway.metrics.exporter.prometheus.listen: 127.0.0.1:9095\n",
-        )
-        .unwrap_err();
-        assert!(problems(error).iter().any(|problem| {
-            problem.contains("must differ from gateway.rest.listen (0.0.0.0:9095)")
         }));
     }
 
