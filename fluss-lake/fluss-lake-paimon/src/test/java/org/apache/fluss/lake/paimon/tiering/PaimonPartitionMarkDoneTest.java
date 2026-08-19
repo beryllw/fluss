@@ -26,6 +26,7 @@ import org.apache.fluss.lake.committer.LakeCommitter;
 import org.apache.fluss.lake.committer.PartitionMarkDoneMaintainer;
 import org.apache.fluss.lake.writer.LakeWriter;
 import org.apache.fluss.lake.writer.WriterInitContext;
+import org.apache.fluss.metadata.ResolvedPartitionSpec;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TableInfo;
@@ -52,12 +53,19 @@ import javax.annotation.Nullable;
 
 import java.io.File;
 import java.io.IOException;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.TimeZone;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.apache.fluss.lake.committer.LakeCommitter.FLUSS_LAKE_SNAP_BUCKET_OFFSET_PROPERTY;
@@ -78,6 +86,15 @@ class PaimonPartitionMarkDoneTest {
     private static final String DATABASE = "paimon";
     private static final String IDLE_TIME_KEY = "partition.idle-time-to-done";
     private static final String TIME_INTERVAL_KEY = "partition.time-interval";
+    private static final String TIMESTAMP_PATTERN_KEY = "partition.timestamp-pattern";
+    private static final String TIMESTAMP_FORMATTER_KEY = "partition.timestamp-formatter";
+
+    /** The partition keys of the hourly tables: a day key followed by an hour key. */
+    private static final List<String> HOURLY_PARTITION_KEYS = Arrays.asList("c3", "c4");
+
+    private static final DateTimeFormatter DAY_VALUE_FORMATTER =
+            DateTimeFormatter.ofPattern("yyyyMMdd");
+    private static final DateTimeFormatter HOUR_VALUE_FORMATTER = DateTimeFormatter.ofPattern("HH");
 
     private @TempDir File tempWarehouseDir;
     private PaimonLakeTieringFactory paimonLakeTieringFactory;
@@ -194,6 +211,152 @@ class PaimonPartitionMarkDoneTest {
         assertThat(state.getPendingPartitions()).containsOnlyKeys("99991231");
         assertThat(successFile(tablePath, "20200101")).exists();
         assertThat(successFile(tablePath, "99991231")).doesNotExist();
+    }
+
+    @Test
+    void testHourlyPartitionOfMultiPartitionKeyTable() throws Exception {
+        TablePath tablePath = TablePath.of(DATABASE, "test_mark_done_hourly_partition");
+        createHourlyPaimonTable(tablePath);
+        // a (day, hour) partitioned table needs a timestamp pattern covering both partition
+        // keys, then the partition end time is the end of the hour, not the end of the day
+        TableInfo tableInfo = hourlyTableInfo(tablePath, null, hourlyMarkDoneProperties());
+
+        // times are resolved in the JVM zone for a non auto-partitioned table
+        LocalDateTime now = LocalDateTime.now();
+        String elapsedHour = hourlyPartitionName(now.minusHours(2));
+        String openHour = hourlyPartitionName(now.plusHours(2));
+
+        long snapshot1 = writeAndCommitHourly(tablePath, tableInfo, elapsedHour, openHour);
+        assertThat(getMarkDoneState(tablePath, snapshot1).getPendingPartitions())
+                .containsOnlyKeys(elapsedHour, openHour);
+
+        Thread.sleep(50);
+        try (LakeCommitter<PaimonWriteResult, PaimonCommittable> lakeCommitter =
+                createLakeCommitter(tablePath, tableInfo)) {
+            assertThat(commitMarkDoneMaintenance(lakeCommitter, "offsets-2")).isNotNull();
+        }
+        // the elapsed hour is done, the hour that is still open is guarded by its end time
+        assertThat(getMarkDoneState(tablePath, snapshot1 + 1).getPendingPartitions())
+                .containsOnlyKeys(openHour);
+        assertThat(hourlySuccessFile(tablePath, elapsedHour)).exists();
+        assertThat(hourlySuccessFile(tablePath, openHour)).doesNotExist();
+    }
+
+    @Test
+    void testHourlyPartitionOfAutoPartitionedTable() throws Exception {
+        TablePath tablePath = TablePath.of(DATABASE, "test_mark_done_hourly_auto_partition");
+        createHourlyPaimonTable(tablePath);
+
+        // auto-partitioned by day on the day key while the hour key is left to the data:
+        // pin a zone where the current local time is noon, so that the hour partitions below
+        // are unambiguously elapsed or still open within the current local day
+        String timeZone = fixedOffsetZoneAtLocalNoon();
+        ZonedDateTime nowInZone = ZonedDateTime.now(TimeZone.getTimeZone(timeZone).toZoneId());
+        String elapsedHour = hourlyPartitionName(nowInZone.minusHours(3).toLocalDateTime());
+        String openHour = hourlyPartitionName(nowInZone.plusHours(3).toLocalDateTime());
+
+        // without a timestamp pattern the end time can only be derived from the
+        // auto-partition time unit, i.e. the end of the day: no hour partition of the
+        // current day is done yet
+        TableInfo dayEndTimeTableInfo =
+                hourlyTableInfo(
+                        tablePath, timeZone, Collections.singletonMap(IDLE_TIME_KEY, "1 ms"));
+        long snapshot1 =
+                writeAndCommitHourly(tablePath, dayEndTimeTableInfo, elapsedHour, openHour);
+        assertThat(getMarkDoneState(tablePath, snapshot1).getPendingPartitions())
+                .containsOnlyKeys(elapsedHour, openHour);
+
+        Thread.sleep(50);
+        try (LakeCommitter<PaimonWriteResult, PaimonCommittable> lakeCommitter =
+                createLakeCommitter(tablePath, dayEndTimeTableInfo)) {
+            assertThat(commitMarkDoneMaintenance(lakeCommitter, "offsets-2")).isNull();
+        }
+        assertThat(hourlySuccessFile(tablePath, elapsedHour)).doesNotExist();
+    }
+
+    @Test
+    void testExplicitTimeRuleOfAutoPartitionedTableUsesJvmTimeZone() throws Exception {
+        TablePath tablePath = TablePath.of(DATABASE, "test_mark_done_auto_partition_time_zone");
+        createHourlyPaimonTable(tablePath);
+
+        // Use an auto-partition zone at least twelve hours away from the current JVM offset. The
+        // explicit Paimon rule must still interpret the partition values in the JVM default zone.
+        String autoPartitionTimeZone = oppositeFixedOffsetZone();
+        LocalDateTime now = LocalDateTime.now();
+        String elapsedHour = hourlyPartitionName(now.minusHours(3));
+        String openHour = hourlyPartitionName(now.plusHours(3));
+        TableInfo tableInfo =
+                hourlyTableInfo(tablePath, autoPartitionTimeZone, hourlyMarkDoneProperties());
+
+        long snapshot1 = writeAndCommitHourly(tablePath, tableInfo, elapsedHour, openHour);
+        Thread.sleep(50);
+        try (LakeCommitter<PaimonWriteResult, PaimonCommittable> lakeCommitter =
+                createLakeCommitter(tablePath, tableInfo)) {
+            assertThat(commitMarkDoneMaintenance(lakeCommitter, "offsets-2")).isNotNull();
+        }
+        assertThat(getMarkDoneState(tablePath, snapshot1 + 1).getPendingPartitions())
+                .containsOnlyKeys(openHour);
+        assertThat(hourlySuccessFile(tablePath, elapsedHour)).exists();
+        assertThat(hourlySuccessFile(tablePath, openHour)).doesNotExist();
+    }
+
+    @Test
+    void testExplicitTimeRuleWinsOverAutoPartitionTimeUnit() throws Exception {
+        TablePath tablePath = TablePath.of(DATABASE, "test_mark_done_explicit_time_rule");
+        createHourlyPaimonTable(tablePath);
+
+        String timeZone = ZoneId.systemDefault().getId();
+        LocalDateTime now = LocalDateTime.now();
+        String elapsedHour = hourlyPartitionName(now.minusHours(3));
+        String openHour = hourlyPartitionName(now.plusHours(3));
+        TableInfo tableInfo = hourlyTableInfo(tablePath, timeZone, hourlyMarkDoneProperties());
+
+        // the hourly rule configured in the custom properties must win over the
+        // auto-partition time unit, otherwise hour partitions would only be done once the
+        // whole day has elapsed
+        long snapshot1 = writeAndCommitHourly(tablePath, tableInfo, elapsedHour, openHour);
+        assertThat(getMarkDoneState(tablePath, snapshot1).getPendingPartitions())
+                .containsOnlyKeys(elapsedHour, openHour);
+
+        Thread.sleep(50);
+        try (LakeCommitter<PaimonWriteResult, PaimonCommittable> lakeCommitter =
+                createLakeCommitter(tablePath, tableInfo)) {
+            assertThat(commitMarkDoneMaintenance(lakeCommitter, "offsets-2")).isNotNull();
+        }
+        assertThat(getMarkDoneState(tablePath, snapshot1 + 1).getPendingPartitions())
+                .containsOnlyKeys(openHour);
+        assertThat(hourlySuccessFile(tablePath, elapsedHour)).exists();
+        assertThat(hourlySuccessFile(tablePath, openHour)).doesNotExist();
+    }
+
+    @Test
+    void testHourlyPartitionWithDayOnlyTimestampPattern() throws Exception {
+        TablePath tablePath = TablePath.of(DATABASE, "test_mark_done_day_only_pattern");
+        createHourlyPaimonTable(tablePath);
+
+        // same as Paimon, the configured timestamp pattern and interval are authoritative: a
+        // pattern of the day key only derives 01:00 as the end time when combined with a one-hour
+        // interval, so a later hour can be marked done once it becomes idle
+        String timeZone = oppositeFixedOffsetZone();
+        LocalDateTime now = LocalDateTime.now();
+        // From 01:00 onwards, the current hour has not ended but $day + 1h has elapsed. During
+        // midnight's first hour, use the immediately preceding hour to keep the test deterministic.
+        LocalDateTime hourToMark = now.getHour() == 0 ? now.minusHours(1) : now;
+        String partition = hourlyPartitionName(hourToMark);
+
+        Map<String, String> dayOnlyPattern = new LinkedHashMap<>(hourlyMarkDoneProperties());
+        dayOnlyPattern.put(TIMESTAMP_PATTERN_KEY, "$" + HOURLY_PARTITION_KEYS.get(0));
+        dayOnlyPattern.put(TIMESTAMP_FORMATTER_KEY, "yyyyMMdd");
+        TableInfo tableInfo = hourlyTableInfo(tablePath, timeZone, dayOnlyPattern);
+
+        long snapshot1 = writeAndCommitHourly(tablePath, tableInfo, partition);
+        Thread.sleep(50);
+        try (LakeCommitter<PaimonWriteResult, PaimonCommittable> lakeCommitter =
+                createLakeCommitter(tablePath, tableInfo)) {
+            assertThat(commitMarkDoneMaintenance(lakeCommitter, "offsets-2")).isNotNull();
+        }
+        assertThat(getMarkDoneState(tablePath, snapshot1 + 1).getPendingPartitions()).isEmpty();
+        assertThat(hourlySuccessFile(tablePath, partition)).exists();
     }
 
     @Test
@@ -778,6 +941,38 @@ class PaimonPartitionMarkDoneTest {
         return options;
     }
 
+    /** The mark-done properties of an hourly partitioned table. */
+    private static Map<String, String> hourlyMarkDoneProperties() {
+        Map<String, String> properties = new LinkedHashMap<>();
+        properties.put(IDLE_TIME_KEY, "1 ms");
+        properties.put(TIME_INTERVAL_KEY, "1 h");
+        properties.put(
+                TIMESTAMP_PATTERN_KEY,
+                "$" + HOURLY_PARTITION_KEYS.get(0) + " $" + HOURLY_PARTITION_KEYS.get(1));
+        properties.put(TIMESTAMP_FORMATTER_KEY, "yyyyMMdd HH");
+        return properties;
+    }
+
+    /**
+     * A fixed offset time zone in which the current local time is around noon, so that the hours
+     * before and after it belong to the same local day.
+     */
+    private static String fixedOffsetZoneAtLocalNoon() {
+        int offsetHours = 12 - ZonedDateTime.now(ZoneOffset.UTC).getHour();
+        return String.format("GMT%s%02d:00", offsetHours < 0 ? "-" : "+", Math.abs(offsetHours));
+    }
+
+    /** A fixed offset zone at least twelve hours away from the current JVM offset. */
+    private static String oppositeFixedOffsetZone() {
+        return ZonedDateTime.now().getOffset().getTotalSeconds() >= 0 ? "GMT-12:00" : "GMT+14:00";
+    }
+
+    private static String hourlyPartitionName(LocalDateTime time) {
+        return DAY_VALUE_FORMATTER.format(time)
+                + ResolvedPartitionSpec.PARTITION_SPEC_SEPARATOR
+                + HOUR_VALUE_FORMATTER.format(time);
+    }
+
     private TableInfo tableInfo(TablePath tablePath, boolean autoPartition) {
         return TableInfo.of(
                 tablePath,
@@ -829,6 +1024,38 @@ class PaimonPartitionMarkDoneTest {
                             AutoPartitionTimeUnit.DAY);
         }
         return builder;
+    }
+
+    /**
+     * A table info of a table partitioned by a day key and an hour key, carrying the given
+     * mark-done properties in the Fluss custom properties. A non-null time zone auto-partitions the
+     * table by day on the day key in that zone.
+     */
+    private TableInfo hourlyTableInfo(
+            TablePath tablePath,
+            @Nullable String autoPartitionTimeZone,
+            Map<String, String> paimonProperties) {
+        TableDescriptor.Builder builder =
+                TableDescriptor.builder()
+                        .schema(
+                                org.apache.fluss.metadata.Schema.newBuilder()
+                                        .column("c1", org.apache.fluss.types.DataTypes.INT())
+                                        .column("c2", org.apache.fluss.types.DataTypes.STRING())
+                                        .column("c3", org.apache.fluss.types.DataTypes.STRING())
+                                        .column("c4", org.apache.fluss.types.DataTypes.STRING())
+                                        .build())
+                        .partitionedBy(HOURLY_PARTITION_KEYS)
+                        .distributedBy(1)
+                        .property(ConfigOptions.TABLE_DATALAKE_ENABLED, true);
+        if (autoPartitionTimeZone != null) {
+            builder.property(ConfigOptions.TABLE_AUTO_PARTITION_ENABLED, true)
+                    .property(
+                            ConfigOptions.TABLE_AUTO_PARTITION_TIME_UNIT, AutoPartitionTimeUnit.DAY)
+                    .property(ConfigOptions.TABLE_AUTO_PARTITION_KEY, HOURLY_PARTITION_KEYS.get(0))
+                    .property(ConfigOptions.TABLE_AUTO_PARTITION_TIMEZONE, autoPartitionTimeZone);
+        }
+        paimonProperties.forEach((key, value) -> builder.customProperty("paimon." + key, value));
+        return TableInfo.of(tablePath, 0, 1, builder.build(), DEFAULT_REMOTE_DATA_DIR, 1L, 1L);
     }
 
     /** Writes one record to each given partition and commits, returns the snapshot id. */
@@ -889,6 +1116,71 @@ class PaimonPartitionMarkDoneTest {
                 String.format(
                         "%s.db/%s/c3=%s/_SUCCESS",
                         tablePath.getDatabaseName(), tablePath.getTableName(), partition));
+    }
+
+    /** Writes one record to each given 'day$hour' partition, returns the snapshot id. */
+    private long writeAndCommitHourly(
+            TablePath tablePath, TableInfo tableInfo, String... partitions) throws Exception {
+        List<PaimonWriteResult> writeResults = new ArrayList<>();
+        long partitionId = 1;
+        for (String partition : partitions) {
+            List<String> partitionValues =
+                    ResolvedPartitionSpec.fromPartitionName(HOURLY_PARTITION_KEYS, partition)
+                            .getPartitionValues();
+            try (LakeWriter<PaimonWriteResult> lakeWriter =
+                    createLakeWriter(tablePath, partition, partitionId++, tableInfo)) {
+                GenericRow row = new GenericRow(4);
+                row.setField(0, 1);
+                row.setField(1, BinaryString.fromString("v1"));
+                row.setField(2, BinaryString.fromString(partitionValues.get(0)));
+                row.setField(3, BinaryString.fromString(partitionValues.get(1)));
+                lakeWriter.write(
+                        new GenericRecord(
+                                0, System.currentTimeMillis(), ChangeType.APPEND_ONLY, row));
+                writeResults.add(lakeWriter.complete());
+            }
+        }
+        try (LakeCommitter<PaimonWriteResult, PaimonCommittable> lakeCommitter =
+                createLakeCommitter(tablePath, tableInfo)) {
+            PaimonCommittable committable = lakeCommitter.toCommittable(writeResults);
+            return lakeCommitter
+                    .commit(
+                            committable,
+                            Collections.singletonMap(
+                                    FLUSS_LAKE_SNAP_BUCKET_OFFSET_PROPERTY, "offsets"))
+                    .getCommittedSnapshotId();
+        }
+    }
+
+    private File hourlySuccessFile(TablePath tablePath, String partition) {
+        List<String> partitionValues =
+                ResolvedPartitionSpec.fromPartitionName(HOURLY_PARTITION_KEYS, partition)
+                        .getPartitionValues();
+        return new File(
+                tempWarehouseDir,
+                String.format(
+                        "%s.db/%s/c3=%s/c4=%s/_SUCCESS",
+                        tablePath.getDatabaseName(),
+                        tablePath.getTableName(),
+                        partitionValues.get(0),
+                        partitionValues.get(1)));
+    }
+
+    /** Creates the Paimon table of an hourly table partitioned by a day key and an hour key. */
+    private void createHourlyPaimonTable(TablePath tablePath) throws Exception {
+        Schema.Builder builder =
+                Schema.newBuilder()
+                        .column("c1", org.apache.paimon.types.DataTypes.INT())
+                        .column("c2", org.apache.paimon.types.DataTypes.STRING())
+                        .column("c3", org.apache.paimon.types.DataTypes.STRING())
+                        .column("c4", org.apache.paimon.types.DataTypes.STRING())
+                        .partitionKeys(HOURLY_PARTITION_KEYS);
+        builder.column(BUCKET_COLUMN_NAME, org.apache.paimon.types.DataTypes.INT());
+        builder.column(OFFSET_COLUMN_NAME, org.apache.paimon.types.DataTypes.BIGINT());
+        builder.column(
+                TIMESTAMP_COLUMN_NAME, org.apache.paimon.types.DataTypes.TIMESTAMP_LTZ_MILLIS());
+        paimonCatalog.createDatabase(tablePath.getDatabaseName(), true);
+        paimonCatalog.createTable(toPaimon(tablePath), builder.build(), true);
     }
 
     private void createPaimonTable(TablePath tablePath, Map<String, String> options)

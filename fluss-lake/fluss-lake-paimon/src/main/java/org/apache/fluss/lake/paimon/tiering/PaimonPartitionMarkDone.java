@@ -67,8 +67,9 @@ import static org.apache.fluss.utils.Preconditions.checkState;
  * partition.timestamp-pattern/formatter}) but reads them exclusively from the {@code paimon.}
  * prefixed Fluss table custom properties as the single source of truth: options configured on the
  * Paimon table directly are deliberately not honored. It executes the idempotent Paimon mark-done
- * actions ({@code partition.mark-done-action}). For auto-partitioned tables the partition end time
- * is derived from the auto-partition time unit instead of {@code partition.time-interval}. See
+ * actions ({@code partition.mark-done-action}). Only if no Paimon partition time rule is configured
+ * ({@code partition.timestamp-pattern/formatter} plus {@code partition.time-interval}), the
+ * partition end time of an auto-partitioned table is derived from the auto-partition time unit. See
  * {@link MarkDoneState} for the state model.
  */
 public class PaimonPartitionMarkDone implements AutoCloseable {
@@ -107,12 +108,15 @@ public class PaimonPartitionMarkDone implements AutoCloseable {
     private final TableInfo tableInfo;
     private final List<String> partitionKeys;
     private final long idleTimeToDoneMillis;
-    // partition end time interval for non auto-partitioned tables (required by isEnabled,
-    // same as Paimon), null for auto-partitioned tables whose interval derives from the
-    // auto-partition time unit
+    // partition end time interval of Paimon's partition time rule (required by isEnabled for non
+    // auto-partitioned tables, same as Paimon), null if not configured
     @Nullable private final Long timeIntervalMillis;
     private final AutoPartitionStrategy autoPartitionStrategy;
     private final PartitionTimeExtractor partitionTimeExtractor;
+    // whether Paimon's partition time rule (timestamp-pattern/formatter plus time-interval) is
+    // configured; it takes precedence over the auto-partition time unit since it is the only rule
+    // covering all the time partition keys of a table
+    private final boolean partitionTimeRuleConfigured;
     private final InternalRowPartitionComputer partitionComputer;
     private final List<PartitionMarkDoneAction> markDoneActions;
 
@@ -130,6 +134,7 @@ public class PaimonPartitionMarkDone implements AutoCloseable {
         this.timeIntervalMillis = timeInterval == null ? null : timeInterval.toMillis();
         this.autoPartitionStrategy = tableInfo.getTableConfig().getAutoPartitionStrategy();
         // pattern/formatter may be null, then Paimon's default extraction rule applies
+        String timestampPattern = options.get(PARTITION_TIMESTAMP_PATTERN);
         String timestampFormatter = options.get(PARTITION_TIMESTAMP_FORMATTER);
         if (timestampFormatter != null) {
             // an invalid formatter syntax must disable mark-done as a whole: otherwise every
@@ -137,8 +142,30 @@ public class PaimonPartitionMarkDone implements AutoCloseable {
             DateTimeFormatter.ofPattern(timestampFormatter);
         }
         this.partitionTimeExtractor =
-                new PartitionTimeExtractor(
-                        options.get(PARTITION_TIMESTAMP_PATTERN), timestampFormatter);
+                new PartitionTimeExtractor(timestampPattern, timestampFormatter);
+        this.partitionTimeRuleConfigured =
+                (timestampPattern != null || timestampFormatter != null)
+                        && timeIntervalMillis != null;
+        if (!partitionTimeRuleConfigured
+                && autoPartitionStrategy.isAutoPartitionEnabled()
+                && partitionKeys.size() > 1) {
+            // e.g. a table partitioned by (date, hour) that is auto-partitioned by day: the
+            // end time of an hour partition can only be derived as the end of its day, so it
+            // is marked done up to one day late
+            LOG.warn(
+                    "Table {} is auto-partitioned by {} on the partition key {} of the partition "
+                            + "keys {}, the partition end time is derived from that time unit "
+                            + "which is coarser than the partition granularity. Configure the "
+                            + "options {} and {} covering all the time partition keys together "
+                            + "with {} to mark the partitions done in time.",
+                    tableInfo.getTablePath(),
+                    autoPartitionStrategy.timeUnit(),
+                    autoPartitionStrategy.key(),
+                    partitionKeys,
+                    PARTITION_TIMESTAMP_PATTERN.key(),
+                    PARTITION_TIMESTAMP_FORMATTER.key(),
+                    PARTITION_TIME_INTERVAL.key());
+        }
         this.partitionComputer =
                 new InternalRowPartitionComputer(
                         fileStoreTable.coreOptions().partitionDefaultName(),
@@ -364,11 +391,13 @@ public class PaimonPartitionMarkDone implements AutoCloseable {
     }
 
     /**
-     * Extracts the partition end time in epoch millis: partition start time (from the
-     * auto-partition time unit, or Paimon's partition.timestamp-pattern/formatter) plus one
-     * partition interval; null if it cannot be derived. Times are resolved in the zone that
-     * generated the partition name: the table's auto-partition time zone for auto-partitioned
-     * tables, or the JVM default zone otherwise (same as Paimon).
+     * Extracts the partition end time in epoch millis: partition start time (from Paimon's
+     * partition.timestamp-pattern/formatter, or the auto-partition time unit) plus one partition
+     * interval; null if it cannot be derived. Paimon's partition time rule wins over the
+     * auto-partition time unit since it is the only rule covering all the time partition keys of a
+     * table. Times extracted by Paimon's partition time rule are resolved in the JVM default zone,
+     * same as Paimon. The Fluss auto-partition fallback is resolved in the auto-partition time zone
+     * that generated the partition name.
      */
     @Nullable
     private Long extractPartitionEndTime(String partitionName) {
@@ -376,18 +405,18 @@ public class PaimonPartitionMarkDone implements AutoCloseable {
             List<String> partitionValues =
                     ResolvedPartitionSpec.fromPartitionName(partitionKeys, partitionName)
                             .getPartitionValues();
-            if (autoPartitionStrategy.isAutoPartitionEnabled()) {
+            if (partitionTimeRuleConfigured || !autoPartitionStrategy.isAutoPartitionEnabled()) {
+                LocalDateTime startTime =
+                        partitionTimeExtractor.extract(partitionKeys, partitionValues);
+                return startTime.atZone(ZoneId.systemDefault()).toInstant().toEpochMilli()
+                        + checkNotNull(timeIntervalMillis);
+            } else {
                 String timeValue = partitionValues.get(autoPartitionTimeKeyIndex());
                 LocalDateTime startTime = parseAutoPartitionTime(timeValue, autoPartitionStrategy);
                 LocalDateTime endTime = plusOneTimeUnit(startTime, autoPartitionStrategy);
                 return endTime.atZone(autoPartitionStrategy.timeZone().toZoneId())
                         .toInstant()
                         .toEpochMilli();
-            } else {
-                LocalDateTime startTime =
-                        partitionTimeExtractor.extract(partitionKeys, partitionValues);
-                return startTime.atZone(ZoneId.systemDefault()).toInstant().toEpochMilli()
-                        + checkNotNull(timeIntervalMillis);
             }
         } catch (Exception e) {
             LOG.debug(
