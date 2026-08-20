@@ -63,4 +63,4 @@ licenses:
 
 # Regenerate the checked-in dependency license inventory.
 deps:
-    cargo deny --locked list -f tsv -t 0.6 > DEPENDENCIES.rust.tsv
+    cargo deny --locked list -f tsv -t 0.6 | sed 's/[[:space:]]*$//' > DEPENDENCIES.rust.tsv

@@ -51,6 +51,8 @@ axum = { version = "0.8", default-features = false, features = ["http1", "matche
 clap = { version = "4.5.37", features = ["derive"] }
 # Only FutureExt/join_all are used; avoid the larger futures facade crate.
 futures-util = "0.3"
+# Build the native connection settings owned by the Gateway from the typed per-cluster configuration.
+fluss = { package = "fluss-rs", path = "../fluss-rust/crates/fluss" }
 # The listeners follow axum's official serve-with-hyper example: axum::serve does not expose the
 # hyper builder that the header read timeout lives on. The plain http1 builder (not auto) has no
 # HTTP/2 preface sniffing, so the header timer covers a connection from its first byte.

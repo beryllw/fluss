@@ -245,6 +245,7 @@ pub async fn start(config: GatewayConfig) -> Result<RunningGateway, RunError> {
 
 /// Binds the listeners, installs the router, and spawns every process-owned task.
 async fn start_internal(config: GatewayConfig) -> Result<RunningGateway, RunError> {
+    log::debug!("effective configuration: {}", config.redacted_debug());
     for warning in config.warnings() {
         log::warn!("{warning}");
     }

@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Gateway-only CI: gateway changes never build the fluss-rust workspace and vice versa.
+# Gateway CI also follows the native Rust client sources used by its configuration adapter.
 # `uses:` step inputs are relative to the repository root.
 name: Gateway CI
 
@@ -25,12 +25,16 @@ on:
       - main
     paths:
       - 'fluss-gateway/**'
+      - 'fluss-rust/crates/fluss/**'
+      - 'fluss-rpc/src/main/proto/**'
       - '.github/workflows/gateway-ci.yml'
   pull_request:
     branches:
       - main
     paths:
       - 'fluss-gateway/**'
+      - 'fluss-rust/crates/fluss/**'
+      - 'fluss-rpc/src/main/proto/**'
       - '.github/workflows/gateway-ci.yml'
   workflow_dispatch:
 
@@ -54,6 +58,14 @@ jobs:
           - macos-latest
     steps:
       - uses: actions/checkout@v6
+
+      - name: Install protobuf compiler
+        run: brew install protobuf
+        if: runner.os == 'macOS'
+
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        if: runner.os == 'Linux'
 
       - name: Rust Cache
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
@@ -91,6 +103,9 @@ jobs:
       - name: Install the MSRV toolchain
         run: rustup toolchain install 1.88.0 --profile minimal
 
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
       - name: Rust Cache
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
@@ -115,6 +130,9 @@ jobs:
         with:
           tool: cargo-deny@0.14.22
 
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
       - name: Check dependency licenses (Apache-compatible)
         run: cargo deny --locked check licenses
 
@@ -124,7 +142,7 @@ jobs:
       # The inventory ships with the source release, so a stale one is worse than none.
       - name: Dependency inventory drift check
         run: |
-          cargo deny --locked list -f tsv -t 0.6 > DEPENDENCIES.rust.tsv
+          cargo deny --locked list -f tsv -t 0.6 | sed 's/[[:space:]]*$//' > DEPENDENCIES.rust.tsv
           git diff --exit-code DEPENDENCIES.rust.tsv
 
       - name: Rust Cache
