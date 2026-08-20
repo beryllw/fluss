@@ -42,6 +42,28 @@ async fn an_invalid_configuration_fails_before_binding_with_exit_code_2() {
 }
 
 #[tokio::test]
+async fn an_empty_bootstrap_list_fails_before_binding_with_exit_code_2() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("gateway.yaml");
+    std::fs::write(
+        &path,
+        "gateway.rest.listen: 127.0.0.1:0\n\
+         gateway.metrics.enabled: false\n\
+         gateway.cluster.default.bootstrap.servers: \" , \"\n",
+    )
+    .expect("write");
+
+    let output = binary().arg("--config").arg(&path).output().expect("run");
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("gateway.cluster.default.bootstrap.servers")
+            && stderr.contains("must configure at least one server"),
+        "{stderr}"
+    );
+}
+
+#[tokio::test]
 async fn a_native_client_override_fails_before_binding_without_leaking_credentials() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("gateway.yaml");

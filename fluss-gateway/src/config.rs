@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! FIP-49 Gateway configuration with precedence CLI > environment > YAML > defaults.
+//! Gateway configuration with precedence CLI > environment > YAML > defaults.
 //!
 //! `gateway.clusters` is authoritative, `gateway.cluster.<id>.client.*` is reserved but unsupported,
 //! and credentials are redacted through [`Secret`].
@@ -229,6 +229,10 @@ const SECURITY_TRUSTED_HEADER_NAME_KEY: &str = "gateway.security.trusted-header.
 const REST_WRITE_MAX_ROWS_KEY: &str = "gateway.rest.write.max-rows";
 const REST_WRITE_MAX_CONCURRENT_REQUESTS_KEY: &str = "gateway.rest.write.max-concurrent-requests";
 const REST_WRITE_RATE_LIMIT_ENABLED_KEY: &str = "gateway.rest.write.rate-limit.enabled";
+const REST_WRITE_RATE_LIMIT_REQUESTS_PER_SECOND_KEY: &str =
+    "gateway.rest.write.rate-limit.requests-per-second";
+const REST_WRITE_RATE_LIMIT_BYTES_PER_SECOND_KEY: &str =
+    "gateway.rest.write.rate-limit.bytes-per-second";
 const REST_LOOKUP_MAX_KEYS_KEY: &str = "gateway.rest.lookup.max-keys";
 const REST_LOOKUP_MAX_KEY_BYTES_KEY: &str = "gateway.rest.lookup.max-key-bytes";
 const REST_LOOKUP_MAX_CONCURRENT_REQUESTS_KEY: &str = "gateway.rest.lookup.max-concurrent-requests";
@@ -433,6 +437,16 @@ const CONFIG_ENTRIES: &[GatewayConfigEntry] = &[
     ),
     typed_entry!(
         GatewayConfigEntry,
+        REST_WRITE_RATE_LIMIT_REQUESTS_PER_SECOND_KEY,
+        request_limits.write_rate_limit_requests_per_second
+    ),
+    typed_entry!(
+        GatewayConfigEntry,
+        REST_WRITE_RATE_LIMIT_BYTES_PER_SECOND_KEY,
+        request_limits.write_rate_limit_bytes_per_second
+    ),
+    typed_entry!(
+        GatewayConfigEntry,
         REST_LOOKUP_MAX_KEYS_KEY,
         request_limits.lookup_max_keys
     ),
@@ -599,6 +613,7 @@ pub enum IdentityMode {
 #[derive(Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ClusterConfig {
+    /// Comma-separated bootstrap addresses passed to the native Fluss client.
     pub bootstrap_servers: String,
     pub connect_timeout: ConfigDuration,
     /// Account used to authenticate to Fluss.
@@ -726,6 +741,8 @@ pub struct RequestLimitsConfig {
     pub write_max_rows: u32,
     pub write_max_concurrent_requests: u32,
     pub write_rate_limit_enabled: bool,
+    pub write_rate_limit_requests_per_second: u32,
+    pub write_rate_limit_bytes_per_second: ByteSize,
     pub lookup_max_keys: u32,
     pub lookup_max_key_bytes: ByteSize,
     pub lookup_max_concurrent_requests: u32,
@@ -740,6 +757,8 @@ impl Default for RequestLimitsConfig {
             write_max_rows: 10_000,
             write_max_concurrent_requests: 64,
             write_rate_limit_enabled: false,
+            write_rate_limit_requests_per_second: 1000,
+            write_rate_limit_bytes_per_second: ByteSize::new(64 * 1024 * 1024),
             lookup_max_keys: 128,
             lookup_max_key_bytes: ByteSize::new(1024 * 1024),
             lookup_max_concurrent_requests: 64,
@@ -757,6 +776,10 @@ impl RequestLimitsConfig {
             (
                 REST_WRITE_MAX_CONCURRENT_REQUESTS_KEY,
                 self.write_max_concurrent_requests,
+            ),
+            (
+                REST_WRITE_RATE_LIMIT_REQUESTS_PER_SECOND_KEY,
+                self.write_rate_limit_requests_per_second,
             ),
             (REST_LOOKUP_MAX_KEYS_KEY, self.lookup_max_keys),
             (
@@ -783,6 +806,11 @@ impl RequestLimitsConfig {
         if self.lookup_max_key_bytes.bytes() == 0 {
             problems.push(format!(
                 "{REST_LOOKUP_MAX_KEY_BYTES_KEY} must be greater than zero"
+            ));
+        }
+        if self.write_rate_limit_bytes_per_second.bytes() == 0 {
+            problems.push(format!(
+                "{REST_WRITE_RATE_LIMIT_BYTES_PER_SECOND_KEY} must be greater than zero"
             ));
         }
     }
@@ -867,9 +895,13 @@ impl GatewayConfig {
                     "cluster ID {id:?} must be at most 63 characters, start with a lowercase letter, and contain only lowercase letters, digits, or underscores"
                 ));
             }
-            if cluster.bootstrap_servers.trim().is_empty() {
+            if !cluster
+                .bootstrap_servers
+                .split(',')
+                .any(|server| !server.trim().is_empty())
+            {
                 problems.push(format!(
-                    "{} must not be blank",
+                    "{} must configure at least one server",
                     cluster_key(id, CLUSTER_BOOTSTRAP_SERVERS_KEY)
                 ));
             }
@@ -1957,14 +1989,24 @@ mod tests {
     }
 
     #[test]
-    fn programmatically_constructed_zero_byte_limit_is_validated() {
+    fn programmatically_constructed_zero_byte_limits_are_validated() {
         let mut config = GatewayConfig::default();
         config.server.rest.max_body_bytes = ByteSize::new(0);
+        config.request_limits.write_rate_limit_bytes_per_second = ByteSize::new(0);
 
         let errors = problems(config.validate().unwrap_err());
-        assert_eq!(
-            errors,
-            vec!["gateway.rest.write.max-request-bytes must be greater than zero"]
+        assert!(
+            errors
+                .iter()
+                .any(|error| error
+                    == "gateway.rest.write.max-request-bytes must be greater than zero"),
+            "{errors:?}"
+        );
+        assert!(
+            errors.iter().any(|error| {
+                error == "gateway.rest.write.rate-limit.bytes-per-second must be greater than zero"
+            }),
+            "{errors:?}"
         );
     }
 
@@ -2115,6 +2157,9 @@ mod tests {
              gateway.security.authentication: password\n\
              gateway.security.users: alice:secret\n\
              gateway.rest.write.max-rows: 500\n\
+             gateway.rest.write.rate-limit.enabled: true\n\
+             gateway.rest.write.rate-limit.requests-per-second: 100\n\
+             gateway.rest.write.rate-limit.bytes-per-second: 4MiB\n\
              gateway.rest.lookup.max-keys: 32\n\
              gateway.rest.lookup.max-key-bytes: 2MiB\n",
         )
@@ -2150,12 +2195,48 @@ mod tests {
         assert_eq!(analytics_native.connect_timeout_ms, 5_000);
         assert_eq!(analytics_native.security_protocol, "PLAINTEXT");
         assert_eq!(config.request_limits.write_max_rows, 500);
-        assert!(!config.request_limits.write_rate_limit_enabled);
+        assert!(config.request_limits.write_rate_limit_enabled);
+        assert_eq!(
+            config.request_limits.write_rate_limit_requests_per_second,
+            100
+        );
+        assert_eq!(
+            config
+                .request_limits
+                .write_rate_limit_bytes_per_second
+                .bytes(),
+            4 * 1024 * 1024
+        );
         assert_eq!(config.request_limits.lookup_max_keys, 32);
         assert_eq!(
             config.request_limits.lookup_max_key_bytes.bytes(),
             2 * 1024 * 1024
         );
+    }
+
+    #[test]
+    fn bootstrap_servers_are_scalar_and_require_at_least_one_server() {
+        let csv = load_file("gateway.cluster.default.bootstrap.servers: a:9123, b:9123\n").unwrap();
+        assert_eq!(cluster(&csv, "default").bootstrap_servers, "a:9123, b:9123");
+
+        let env = BTreeMap::from([(
+            "FLUSS_GATEWAY__CLUSTER__DEFAULT__BOOTSTRAP__SERVERS".to_string(),
+            "env-a:9123, env-b:9123".to_string(),
+        )]);
+        let from_env = load(None, &env, &CliOverrides::default()).unwrap();
+        assert_eq!(
+            cluster(&from_env, "default").bootstrap_servers,
+            "env-a:9123, env-b:9123"
+        );
+
+        for contents in [
+            "gateway.cluster.default.bootstrap.servers: \" , \"\n",
+            "gateway.cluster.default.bootstrap.servers: []\n",
+            "gateway.cluster.default.bootstrap.servers: [a:9123, b:9123]\n",
+        ] {
+            let error = load_file(contents).unwrap_err().to_string();
+            assert!(error.contains(CLUSTER_BOOTSTRAP_SERVERS_KEY), "{error}");
+        }
     }
 
     #[test]
@@ -2347,6 +2428,7 @@ mod tests {
             "gateway.cluster.default.connection.service.secret: gw-pass\n",
             "gateway.cluster.default.connection.max: 0\n",
             "gateway.cluster.default.bootstrap.servers: \" \"\n",
+            "gateway.rest.write.rate-limit.requests-per-second: 0\n",
             // The mode's credential table is missing.
             "gateway.security.authentication: password\n",
             "gateway.security.authentication: token\n",
@@ -2478,12 +2560,15 @@ mod tests {
                 METRICS_ENABLED_KEY | REST_WRITE_RATE_LIMIT_ENABLED_KEY => ("true", "false"),
                 REST_WRITE_MAX_ROWS_KEY
                 | REST_WRITE_MAX_CONCURRENT_REQUESTS_KEY
+                | REST_WRITE_RATE_LIMIT_REQUESTS_PER_SECOND_KEY
                 | REST_LOOKUP_MAX_KEYS_KEY
                 | REST_LOOKUP_MAX_CONCURRENT_REQUESTS_KEY
                 | REST_PREFIX_LOOKUP_MAX_PREFIXES_KEY
                 | REST_PREFIX_LOOKUP_MAX_ROWS_PER_PREFIX_KEY
                 | REST_PREFIX_LOOKUP_MAX_CONCURRENT_REQUESTS_KEY => ("11", "22"),
-                REST_MAX_REQUEST_BYTES_KEY | REST_LOOKUP_MAX_KEY_BYTES_KEY => ("1MiB", "2MiB"),
+                REST_MAX_REQUEST_BYTES_KEY
+                | REST_WRITE_RATE_LIMIT_BYTES_PER_SECOND_KEY
+                | REST_LOOKUP_MAX_KEY_BYTES_KEY => ("1MiB", "2MiB"),
                 REST_LISTEN_KEY => ("127.0.0.1:11111", "127.0.0.1:22222"),
                 METRICS_LISTEN_KEY => ("127.0.0.1:11112", "127.0.0.1:22223"),
                 REST_HEADER_READ_TIMEOUT_KEY
