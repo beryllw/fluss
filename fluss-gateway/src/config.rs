@@ -930,12 +930,11 @@ impl GatewayConfig {
     fn validate_credentials(&self, id: &str, cluster: &ClusterConfig, problems: &mut Vec<String>) {
         let account = cluster.service_account();
         let secret = cluster.service_secret();
-        for (key, value) in [
-            (CLUSTER_SERVICE_ACCOUNT_KEY, account),
-            (CLUSTER_SERVICE_SECRET_KEY, secret),
-        ] {
+        let account_key = cluster_key(id, CLUSTER_SERVICE_ACCOUNT_KEY);
+        let secret_key = cluster_key(id, CLUSTER_SERVICE_SECRET_KEY);
+        for (key, value) in [(&account_key, account), (&secret_key, secret)] {
             if value.is_some_and(|value| value.trim().is_empty()) {
-                problems.push(format!("{} must not be blank", cluster_key(id, key)));
+                problems.push(format!("{key} must not be blank"));
             }
         }
 
@@ -943,22 +942,21 @@ impl GatewayConfig {
         let credentials_usable = usable(account) && usable(secret);
         if account.is_some() != secret.is_some() {
             problems.push(format!(
-                "{} and {CLUSTER_SERVICE_SECRET_KEY} must be set together",
-                cluster_key(id, CLUSTER_SERVICE_ACCOUNT_KEY)
+                "{account_key} and {secret_key} must be set together"
             ));
         }
 
         if cluster.identity_mode == IdentityMode::User {
+            let identity_mode_key = cluster_key(id, CLUSTER_IDENTITY_MODE_KEY);
             if self.security.authentication == AuthenticationMode::Trust {
                 problems.push(format!(
                     "{} user requires verified client identities; set {SECURITY_AUTHENTICATION_KEY} to password, token, or trusted-header",
-                    cluster_key(id, CLUSTER_IDENTITY_MODE_KEY)
+                    identity_mode_key
                 ));
             }
             if !credentials_usable {
                 problems.push(format!(
-                    "{} user requires {CLUSTER_SERVICE_ACCOUNT_KEY} and {CLUSTER_SERVICE_SECRET_KEY}",
-                    cluster_key(id, CLUSTER_IDENTITY_MODE_KEY)
+                    "{identity_mode_key} user requires {account_key} and {secret_key}"
                 ));
             }
         }
@@ -1040,10 +1038,13 @@ impl GatewayConfig {
             if cluster.identity_mode == IdentityMode::Service
                 && (cluster.connection_max.is_some() || cluster.connection_idle_timeout.is_some())
             {
+                let connection_max_key = cluster_key(id, CLUSTER_CONNECTION_MAX_KEY);
+                let connection_idle_timeout_key =
+                    cluster_key(id, CLUSTER_CONNECTION_IDLE_TIMEOUT_KEY);
+                let identity_mode_key = cluster_key(id, CLUSTER_IDENTITY_MODE_KEY);
                 warnings.push(format!(
-                    "{} and {CLUSTER_CONNECTION_IDLE_TIMEOUT_KEY} are ignored because \
-                     {CLUSTER_IDENTITY_MODE_KEY} is service",
-                    cluster_key(id, CLUSTER_CONNECTION_MAX_KEY)
+                    "{connection_max_key} and {connection_idle_timeout_key} are ignored because \
+                     {identity_mode_key} is service"
                 ));
             }
         }
@@ -2440,6 +2441,16 @@ mod tests {
             assert!(load_file(contents).is_err(), "accepted: {contents}");
         }
 
+        let errors = problems(
+            load_file("gateway.cluster.default.connection.service.account: gateway_svc\n")
+                .unwrap_err(),
+        );
+        assert!(errors.iter().any(|error| {
+            error
+                == "gateway.cluster.default.connection.service.account and \
+                    gateway.cluster.default.connection.service.secret must be set together"
+        }));
+
         // Directly constructed configurations are subject to the same validation.
         let mut config = GatewayConfig::default();
         config.clusters.clear();
@@ -2458,7 +2469,28 @@ mod tests {
         assert!(
             problems(config.validate().unwrap_err())
                 .iter()
-                .any(|error| error.contains("identity-mode user requires"))
+                .any(|error| {
+                    error
+                        == "gateway.cluster.default.connection.identity-mode user requires \
+                            gateway.cluster.default.connection.service.account and \
+                            gateway.cluster.default.connection.service.secret"
+                })
+        );
+
+        let mut config = GatewayConfig::default();
+        config
+            .clusters
+            .get_mut(DEFAULT_CLUSTER_ID)
+            .expect("default cluster")
+            .connection_max = Some(1);
+        assert_eq!(
+            config.warnings(),
+            vec![
+                "gateway.cluster.default.connection.max and \
+                 gateway.cluster.default.connection.idle-timeout are ignored because \
+                 gateway.cluster.default.connection.identity-mode is service"
+                    .to_string()
+            ]
         );
 
         assert!(
