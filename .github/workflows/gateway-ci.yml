@@ -25,6 +25,7 @@ on:
       - main
     paths:
       - 'fluss-gateway/**'
+      - 'fluss-rust/Cargo.toml'
       - 'fluss-rust/crates/fluss/**'
       - 'fluss-rpc/src/main/proto/**'
       - '.github/workflows/gateway-ci.yml'
@@ -33,6 +34,7 @@ on:
       - main
     paths:
       - 'fluss-gateway/**'
+      - 'fluss-rust/Cargo.toml'
       - 'fluss-rust/crates/fluss/**'
       - 'fluss-rpc/src/main/proto/**'
       - '.github/workflows/gateway-ci.yml'

@@ -42,25 +42,33 @@ async fn an_invalid_configuration_fails_before_binding_with_exit_code_2() {
 }
 
 #[tokio::test]
-async fn an_empty_bootstrap_list_fails_before_binding_with_exit_code_2() {
+async fn invalid_bootstrap_servers_fail_before_binding_with_exit_code_2() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("gateway.yaml");
-    std::fs::write(
-        &path,
-        "gateway.rest.listen: 127.0.0.1:0\n\
-         gateway.metrics.enabled: false\n\
-         gateway.cluster.default.bootstrap.servers: \" , \"\n",
-    )
-    .expect("write");
+    for (bootstrap_servers, detail) in [
+        (" , ", "must configure at least one server"),
+        ("host", "expected host:port"),
+        ("host:99999", "expected host:port"),
+        ("http://host:9123", "expected host:port"),
+    ] {
+        std::fs::write(
+            &path,
+            format!(
+                "gateway.rest.listen: 127.0.0.1:0\n\
+                 gateway.metrics.enabled: false\n\
+                 gateway.cluster.default.bootstrap.servers: {bootstrap_servers:?}\n"
+            ),
+        )
+        .expect("write");
 
-    let output = binary().arg("--config").arg(&path).output().expect("run");
-    assert_eq!(output.status.code(), Some(2));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("gateway.cluster.default.bootstrap.servers")
-            && stderr.contains("must configure at least one server"),
-        "{stderr}"
-    );
+        let output = binary().arg("--config").arg(&path).output().expect("run");
+        assert_eq!(output.status.code(), Some(2), "{bootstrap_servers}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("gateway.cluster.default.bootstrap.servers") && stderr.contains(detail),
+            "{bootstrap_servers}: {stderr}"
+        );
+    }
 }
 
 #[tokio::test]

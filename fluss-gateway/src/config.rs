@@ -20,6 +20,7 @@
 //! `gateway.clusters` is authoritative, `gateway.cluster.<id>.client.*` is reserved but unsupported,
 //! and credentials are redacted through [`Secret`].
 
+use axum::http::uri::Authority;
 use fluss::config::Config as NativeClientConfig;
 use serde::Deserialize;
 use serde::de::{self, Deserializer};
@@ -57,7 +58,7 @@ impl fmt::Debug for Secret {
     }
 }
 
-/// A duration written as `<integer><ms|s|m|h>`.
+/// A duration written as `<integer><ms|s|m|h|d>`, allowing whitespace around or before the unit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConfigDuration(Duration);
 
@@ -85,7 +86,7 @@ impl ConfigDuration {
         let (digits, unit) = split_number_and_unit(s);
         if digits.is_empty() {
             return Err(format!(
-                "invalid duration {s:?}: expected <integer><ms|s|m|h>"
+                "invalid duration {s:?}: expected <integer><ms|s|m|h|d>"
             ));
         }
         let value: u64 = digits
@@ -97,14 +98,15 @@ impl ConfigDuration {
                 MAX_CONFIG_DURATION.as_secs()
             )
         };
-        let duration = match unit {
+        let duration = match unit.to_ascii_lowercase().as_str() {
             "ms" => Duration::from_millis(value),
             "s" => Duration::from_secs(value),
             "m" => Duration::from_secs(value.checked_mul(60).ok_or_else(too_large)?),
             "h" => Duration::from_secs(value.checked_mul(3600).ok_or_else(too_large)?),
+            "d" => Duration::from_secs(value.checked_mul(86400).ok_or_else(too_large)?),
             _ => {
                 return Err(format!(
-                    "invalid duration {s:?}: unit must be one of ms, s, m, h"
+                    "invalid duration {s:?}: unit must be one of ms, s, m, h, d"
                 ));
             }
         };
@@ -125,7 +127,7 @@ impl<'de> Deserialize<'de> for ConfigDuration {
     }
 }
 
-/// A positive byte size with an optional decimal or binary unit.
+/// A positive byte size with an optional binary unit using Fluss's 1024-based multipliers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ByteSize(u64);
 
@@ -149,17 +151,15 @@ impl ByteSize {
         let value: u64 = digits
             .parse()
             .map_err(|e| format!("invalid byte size {s:?}: {e}"))?;
-        let multiplier: u64 = match unit {
-            "" | "B" => 1,
-            "KB" => 1000,
-            "KiB" => 1024,
-            "MB" => 1_000_000,
-            "MiB" => 1024 * 1024,
-            "GB" => 1_000_000_000,
-            "GiB" => 1024 * 1024 * 1024,
+        let multiplier: u64 = match unit.to_ascii_lowercase().as_str() {
+            "" | "b" | "bytes" => 1,
+            "k" | "kb" | "kib" | "kibibyte" | "kibibytes" => 1024,
+            "m" | "mb" | "mib" | "mebibyte" | "mebibytes" => 1024 * 1024,
+            "g" | "gb" | "gib" | "gibibyte" | "gibibytes" => 1024 * 1024 * 1024,
+            "t" | "tb" | "tib" | "tebibyte" | "tebibytes" => 1024_u64 * 1024 * 1024 * 1024,
             _ => {
                 return Err(format!(
-                    "invalid byte size {s:?}: unit must be one of B, KB, KiB, MB, MiB, GB, GiB"
+                    "invalid byte size {s:?}: unit must be one of B, KB/KiB, MB/MiB, GB/GiB, TB/TiB"
                 ));
             }
         };
@@ -175,11 +175,13 @@ impl ByteSize {
 }
 
 fn split_number_and_unit(value: &str) -> (&str, &str) {
+    let value = value.trim();
     let split = value
         .char_indices()
         .find(|(_, character)| !character.is_ascii_digit())
         .map_or(value.len(), |(index, _)| index);
-    value.split_at(split)
+    let (number, unit) = value.split_at(split);
+    (number, unit.trim())
 }
 
 impl<'de> Deserialize<'de> for ByteSize {
@@ -610,7 +612,7 @@ pub enum IdentityMode {
 }
 
 /// Connection settings for one Fluss cluster.
-#[derive(Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ClusterConfig {
     /// Comma-separated bootstrap addresses passed to the native Fluss client.
@@ -667,20 +669,6 @@ impl ClusterConfig {
     }
 }
 
-impl fmt::Debug for ClusterConfig {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ClusterConfig")
-            .field("bootstrap_servers", &self.bootstrap_servers)
-            .field("connect_timeout", &self.connect_timeout)
-            .field("service_account", &self.service_account)
-            .field("service_secret", &self.service_secret)
-            .field("identity_mode", &self.identity_mode)
-            .field("connection_max", &self.connection_max)
-            .field("connection_idle_timeout", &self.connection_idle_timeout)
-            .finish()
-    }
-}
-
 /// HTTP caller authentication mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -694,7 +682,7 @@ pub enum AuthenticationMode {
 }
 
 /// Client-to-gateway authentication settings. Every credential-bearing field is a [`Secret`].
-#[derive(Clone, PartialEq, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct SecurityConfig {
     pub authentication: AuthenticationMode,
@@ -720,17 +708,6 @@ impl SecurityConfig {
 
     fn parsed_token_count(&self) -> Result<usize, String> {
         parse_token_table(self.tokens.as_ref().map(Secret::expose).unwrap_or(""))
-    }
-}
-
-impl fmt::Debug for SecurityConfig {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SecurityConfig")
-            .field("authentication", &self.authentication)
-            .field("users", &self.users)
-            .field("tokens", &self.tokens)
-            .field("trusted_header_name", &self.trusted_header_name)
-            .finish()
     }
 }
 
@@ -895,13 +872,9 @@ impl GatewayConfig {
                     "cluster ID {id:?} must be at most 63 characters, start with a lowercase letter, and contain only lowercase letters, digits, or underscores"
                 ));
             }
-            if !cluster
-                .bootstrap_servers
-                .split(',')
-                .any(|server| !server.trim().is_empty())
-            {
+            if let Err(problem) = validate_bootstrap_servers(&cluster.bootstrap_servers) {
                 problems.push(format!(
-                    "{} must configure at least one server",
+                    "{} {problem}",
                     cluster_key(id, CLUSTER_BOOTSTRAP_SERVERS_KEY)
                 ));
             }
@@ -1033,10 +1006,29 @@ impl GatewayConfig {
     pub fn warnings(&self) -> Vec<String> {
         let mut warnings = Vec::new();
         if !self.server.rest.bind_address.ip().is_loopback() {
+            let risk = if self.security.authentication == AuthenticationMode::Trust {
+                "accepts unauthenticated requests and has no TLS"
+            } else {
+                "has no TLS"
+            };
             warnings.push(format!(
-                "{} {} is not loopback. The REST listener accepts \
-                 unauthenticated requests and has no TLS",
+                "{} {} is not loopback. The REST listener {risk}",
                 REST_LISTEN_KEY, self.server.rest.bind_address
+            ));
+        }
+        if self.server.metrics.enabled && !self.server.metrics.bind_address.ip().is_loopback() {
+            warnings.push(format!(
+                "{} {} is not loopback. Metrics are exposed without authentication or TLS",
+                METRICS_LISTEN_KEY, self.server.metrics.bind_address
+            ));
+        }
+        if self.security.authentication == AuthenticationMode::TrustedHeader
+            && !self.server.rest.bind_address.ip().is_loopback()
+        {
+            warnings.push(format!(
+                "{SECURITY_AUTHENTICATION_KEY} trusted-header on non-loopback {REST_LISTEN_KEY} \
+                 trusts the {} header. Expose it only behind a trusted proxy",
+                self.security.trusted_header_name()
             ));
         }
         for (id, cluster) in &self.clusters {
@@ -1067,6 +1059,37 @@ fn valid_cluster_id(id: &str) -> bool {
     let mut bytes = id.bytes();
     bytes.next().is_some_and(|first| first.is_ascii_lowercase())
         && bytes.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn validate_bootstrap_servers(bootstrap_servers: &str) -> Result<(), String> {
+    let mut configured = false;
+    for server in bootstrap_servers.split(',') {
+        let server = server.trim();
+        if server.is_empty() {
+            continue;
+        }
+        configured = true;
+        if !valid_bootstrap_server(server) {
+            return Err(format!(
+                "contains invalid server {server:?}; expected host:port with a port from 1 to 65535"
+            ));
+        }
+    }
+    if configured {
+        Ok(())
+    } else {
+        Err("must configure at least one server".to_string())
+    }
+}
+
+fn valid_bootstrap_server(server: &str) -> bool {
+    let Ok(authority) = server.parse::<Authority>() else {
+        return false;
+    };
+    !server.contains('@')
+        && !authority.host().is_empty()
+        && authority.port_u16().is_some_and(|port| port != 0)
+        && (!server.starts_with('[') || server.parse::<SocketAddr>().is_ok())
 }
 
 /// True when two listeners cannot both bind: the addresses are equal, or either is a wildcard
@@ -1941,7 +1964,7 @@ mod tests {
 
     #[test]
     fn invalid_duration_rejected() {
-        for bad in ["0ms", "60", "60 s", "6.5s", "s", "60d", "-1s"] {
+        for bad in ["0ms", "60", "6.5s", "s", "366d", "-1s"] {
             let error =
                 load_file(&format!("gateway.shutdown.drain-timeout: \"{bad}\"\n")).unwrap_err();
             assert!(matches!(error, ConfigError::Parse(_)), "{bad}: {error:?}");
@@ -1959,6 +1982,7 @@ mod tests {
             "18446744073709551615s",
             "18446744073709551615m",
             "18446744073709551615h",
+            "18446744073709551615d",
         ] {
             let error = ConfigDuration::parse(bad).unwrap_err();
             assert!(error.contains("must not exceed"), "{bad}: {error}");
@@ -2016,7 +2040,7 @@ mod tests {
 
     #[test]
     fn invalid_byte_size_rejected() {
-        for bad in ["0", "\"4Mb\"", "\"MiB\"", "-1", "\"1.5MiB\""] {
+        for bad in ["0", "\"4XB\"", "\"MiB\"", "-1", "\"1.5MiB\""] {
             let error =
                 load_file(&format!("gateway.rest.write.max-request-bytes: {bad}\n")).unwrap_err();
             assert!(matches!(error, ConfigError::Parse(_)), "{bad}: {error:?}");
@@ -2105,6 +2129,52 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_non_loopback_rest_does_not_warn_about_unauthenticated_requests() {
+        for contents in [
+            "gateway.rest.listen: 0.0.0.0:8080\n\
+             gateway.security.authentication: password\n\
+             gateway.security.users: alice:secret\n",
+            "gateway.rest.listen: 0.0.0.0:8080\n\
+             gateway.security.authentication: token\n\
+             gateway.security.tokens: token:alice\n",
+        ] {
+            let warnings = load_file(contents).unwrap().warnings();
+            assert!(
+                warnings
+                    .iter()
+                    .any(|warning| warning.contains("has no TLS"))
+            );
+            assert!(
+                warnings
+                    .iter()
+                    .all(|warning| !warning.contains("accepts unauthenticated requests")),
+                "{warnings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn exposed_metrics_and_trusted_headers_warn() {
+        let config =
+            load_file("gateway.metrics.exporter.prometheus.listen: 0.0.0.0:9095\n").unwrap();
+        assert!(config.warnings().iter().any(|warning| {
+            warning.contains(METRICS_LISTEN_KEY)
+                && warning.contains("without authentication or TLS")
+        }));
+
+        let config = load_file(
+            "gateway.rest.listen: 0.0.0.0:8080\n\
+             gateway.security.authentication: trusted-header\n",
+        )
+        .unwrap();
+        assert!(config.warnings().iter().any(|warning| {
+            warning.contains(SECURITY_AUTHENTICATION_KEY)
+                && warning.contains(DEFAULT_TRUSTED_HEADER_NAME)
+                && warning.contains("trusted proxy")
+        }));
+    }
+
+    #[test]
     fn malformed_instance_id_rejected() {
         let error = load_file("gateway.instance-id: has space\n").unwrap_err();
         assert!(
@@ -2128,6 +2198,14 @@ mod tests {
             ConfigDuration::parse("2h").unwrap().get(),
             Duration::from_secs(7200)
         );
+        assert_eq!(
+            ConfigDuration::parse("1 d").unwrap().get(),
+            Duration::from_secs(24 * 60 * 60)
+        );
+        assert_eq!(
+            ConfigDuration::parse(" 1 S ").unwrap().get(),
+            Duration::from_secs(1)
+        );
         assert!(ConfigDuration::parse("0s").is_err());
     }
 
@@ -2135,10 +2213,14 @@ mod tests {
     fn byte_size_units() {
         assert_eq!(ByteSize::parse("512").unwrap().bytes(), 512);
         assert_eq!(ByteSize::parse("512B").unwrap().bytes(), 512);
-        assert_eq!(ByteSize::parse("4KB").unwrap().bytes(), 4000);
+        assert_eq!(ByteSize::parse("4KB").unwrap().bytes(), 4096);
         assert_eq!(ByteSize::parse("4KiB").unwrap().bytes(), 4096);
+        assert_eq!(ByteSize::parse(" 4 kb ").unwrap().bytes(), 4096);
         assert_eq!(ByteSize::parse("1GiB").unwrap().bytes(), 1024 * 1024 * 1024);
-        assert!(ByteSize::parse("4TB").is_err());
+        assert_eq!(
+            ByteSize::parse("1TB").unwrap().bytes(),
+            1024_u64 * 1024 * 1024 * 1024
+        );
         assert!(ByteSize::parse("0").is_err());
     }
 
@@ -2220,8 +2302,13 @@ mod tests {
 
     #[test]
     fn bootstrap_servers_are_scalar_and_require_at_least_one_server() {
-        let csv = load_file("gateway.cluster.default.bootstrap.servers: a:9123, b:9123\n").unwrap();
-        assert_eq!(cluster(&csv, "default").bootstrap_servers, "a:9123, b:9123");
+        let csv =
+            load_file("gateway.cluster.default.bootstrap.servers: a:9123, b:9123, [::1]:9123\n")
+                .unwrap();
+        assert_eq!(
+            cluster(&csv, "default").bootstrap_servers,
+            "a:9123, b:9123, [::1]:9123"
+        );
 
         let env = BTreeMap::from([(
             "FLUSS_GATEWAY__CLUSTER__DEFAULT__BOOTSTRAP__SERVERS".to_string(),
@@ -2237,6 +2324,13 @@ mod tests {
             "gateway.cluster.default.bootstrap.servers: \" , \"\n",
             "gateway.cluster.default.bootstrap.servers: []\n",
             "gateway.cluster.default.bootstrap.servers: [a:9123, b:9123]\n",
+            "gateway.cluster.default.bootstrap.servers: host\n",
+            "gateway.cluster.default.bootstrap.servers: host:99999\n",
+            "gateway.cluster.default.bootstrap.servers: http://host:9123\n",
+            "gateway.cluster.default.bootstrap.servers: user@host:9123\n",
+            "gateway.cluster.default.bootstrap.servers: '[not-ip]:9123'\n",
+            "gateway.cluster.default.bootstrap.servers: '[::1]suffix:9123'\n",
+            "gateway.cluster.default.bootstrap.servers: host:0\n",
         ] {
             let error = load_file(contents).unwrap_err().to_string();
             assert!(error.contains(CLUSTER_BOOTSTRAP_SERVERS_KEY), "{error}");
