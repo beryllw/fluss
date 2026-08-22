@@ -223,6 +223,9 @@ impl PartialSchema for ErrorCode {
 
 impl ToSchema for ErrorCode {}
 
+/// The result of any gateway operation that can fail with a client-visible condition.
+pub type GatewayResult<T> = Result<T, GatewayError>;
+
 /// Gateway-internal error: a condition kind plus a client-safe message.
 ///
 /// Messages must never contain stack traces, internal addresses, or wire payloads. Operational detail belongs

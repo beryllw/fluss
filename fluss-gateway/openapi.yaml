@@ -1,5 +1,30 @@
 components:
   schemas:
+    ClustersResponse:
+      description: 'Response of `GET /v1/clusters`: the IDs used in the cluster-scoped paths of the other APIs.'
+      properties:
+        clusters:
+          items:
+            type: string
+          type: array
+      required:
+      - clusters
+      type: object
+    DatabasesResponse:
+      description: Response of `GET /v1/clusters/{cluster}/databases`.
+      properties:
+        databases:
+          items:
+            type: string
+          type: array
+        next_page_token:
+          description: Present only while more entries follow.
+          type:
+          - string
+          - 'null'
+      required:
+      - databases
+      type: object
     ErrorBody:
       description: Body of the REST error envelope.
       properties:
@@ -81,6 +106,21 @@ components:
       required:
       - status
       type: object
+    TablesResponse:
+      description: Response of `GET /v1/clusters/{cluster}/databases/{database}/tables`.
+      properties:
+        next_page_token:
+          description: Present only while more entries follow.
+          type:
+          - string
+          - 'null'
+        tables:
+          items:
+            type: string
+          type: array
+      required:
+      - tables
+      type: object
 info:
   description: Stateless REST gateway for Apache Fluss
   license:
@@ -139,6 +179,201 @@ paths:
       summary: Readiness for load balancers and readiness probes.
       tags:
       - health
+  /v1/clusters:
+    get:
+      description: |-
+        This is a configuration echo: it touches no connection, so it answers at the same speed whether
+        Fluss is up or down, and a caller polling it cannot turn into a burst of connection attempts. It
+        deliberately carries **no** reachability field — the gateway has no background probe, so any such
+        field would report the outcome of some earlier request rather than the current state. Whether a
+        cluster can be served shows up in the errors of its own requests and in the `connections_*` metrics.
+      operationId: listClusters
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClustersResponse'
+          description: Configured cluster IDs in lexical order
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: This operation accepts no query parameters
+        '405':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Wrong method for this route
+        '413':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Request body above the configured limit
+        '503':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Gateway starting or shutting down
+        '504':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Request deadline exceeded
+      summary: Lists the configured clusters.
+      tags:
+      - metadata
+  /v1/clusters/{cluster}/databases:
+    get:
+      operationId: listDatabases
+      parameters:
+      - description: Configured cluster ID
+        in: path
+        name: cluster
+        required: true
+        schema:
+          type: string
+      - description: Maximum entries to return. Defaults to 100, capped at 1000.
+        in: query
+        name: max_results
+        required: false
+        schema:
+          maximum: 1000
+          minimum: 1
+          type: integer
+      - description: Opaque token from the `next_page_token` of the previous response.
+        in: query
+        name: page_token
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatabasesResponse'
+          description: Databases in lexical order
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Invalid page parameter or page token
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Fluss refused the operation
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Unknown cluster
+        '429':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: The cluster's connection limit is reached
+        '503':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Fluss is unavailable, or the gateway is starting or shutting down
+        '504':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Request deadline exceeded
+      summary: Lists the databases of one configured cluster.
+      tags:
+      - metadata
+  /v1/clusters/{cluster}/databases/{database}/tables:
+    get:
+      operationId: listTables
+      parameters:
+      - description: Configured cluster ID
+        in: path
+        name: cluster
+        required: true
+        schema:
+          type: string
+      - description: Database name
+        in: path
+        name: database
+        required: true
+        schema:
+          type: string
+      - description: Maximum entries to return. Defaults to 100, capped at 1000.
+        in: query
+        name: max_results
+        required: false
+        schema:
+          maximum: 1000
+          minimum: 1
+          type: integer
+      - description: Opaque token from the `next_page_token` of the previous response.
+        in: query
+        name: page_token
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TablesResponse'
+          description: Tables in lexical order
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Invalid page parameter or page token
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Fluss refused the operation
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Unknown cluster or database
+        '429':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: The cluster's connection limit is reached
+        '503':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Fluss is unavailable, or the gateway is starting or shutting down
+        '504':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Request deadline exceeded
+      summary: Lists the tables of one database.
+      tags:
+      - metadata
   /v1/openapi.json:
     get:
       operationId: getOpenApi

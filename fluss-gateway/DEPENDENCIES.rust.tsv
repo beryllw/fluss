@@ -22,6 +22,7 @@ arrow-row@59.2.0	X
 arrow-schema@59.2.0	X
 arrow-select@59.2.0	X
 arrow-string@59.2.0	X
+async-trait@0.1.92	X									X
 atoi@2.0.0										X
 atomic-waker@1.1.2	X									X
 autocfg@1.5.1	X									X

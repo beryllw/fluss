@@ -22,11 +22,18 @@
 //! here.
 //!
 //! The middleware applies two per-request input-validation bounds — a maximum body size (413) and the
-//! per-request deadline (504).
+//! per-request deadline (504) — and assigns the request identity, deadline, and cancellation signal that
+//! [`RequestContext`] carries into the backend.
 
+pub mod clusters;
 pub mod health;
+pub mod metadata;
 pub mod openapi;
+pub mod pagination;
 
+use crate::backend::FlussBackend;
+use crate::backend::context::{Principal, RequestContext};
+use crate::backend::types::ClusterId;
 use crate::config::RestServerConfig;
 use crate::error::{ErrorEnvelope, ErrorKind, GatewayError, panic_message};
 use crate::lifecycle::Readiness;
@@ -44,6 +51,7 @@ use std::net::SocketAddr;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
+use tokio_util::sync::CancellationToken;
 use utoipa_axum::router::OpenApiRouter;
 
 /// The deadline handed to a request whose configured timeout cannot be added to the current instant.
@@ -62,6 +70,9 @@ const RESPONSE_GRACE: Duration = Duration::from_secs(1);
 /// request, a session, or a client.
 #[derive(Clone)]
 pub struct RestState {
+    /// The gateway's single backend dependency: it answers cluster discovery, validates the cluster a
+    /// request names, and serves every cluster-scoped operation.
+    pub backend: Arc<dyn FlussBackend>,
     pub readiness: Arc<Readiness>,
     pub bind_address: SocketAddr,
     pub started_at: Instant,
@@ -99,6 +110,14 @@ impl RequestDeadline {
         self.0
     }
 }
+
+/// Cancellation signal for the work of one request.
+///
+/// The middleware that inserts it holds the token's drop guard, so a request future that is dropped —
+/// the caller disconnected, the deadline layer gave up, shutdown aborted the connection — cancels the
+/// backend work instead of leaving it to notice on its own.
+#[derive(Clone, Debug)]
+pub struct RequestCancellation(CancellationToken);
 
 /// Middleware limits, extracted from `[server.rest]`.
 #[derive(Debug, Clone)]
@@ -207,6 +226,40 @@ pub fn ensure_no_query(uri: &Uri) -> Result<(), GatewayError> {
     Ok(())
 }
 
+/// The request ID the outermost middleware assigned, for a handler rendering its own envelope.
+pub(crate) fn request_id(request: &Request) -> RequestId {
+    request
+        .extensions()
+        .get::<RequestId>()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Builds the backend context of one cluster-scoped request from the middleware-assigned metadata.
+///
+/// The principal is anonymous until the authenticator lands; the deadline and the cancellation signal
+/// are the ones the middleware also enforces, so a backend call cannot outlive its request.
+pub(crate) fn request_context(cluster_id: ClusterId, request: &Request) -> RequestContext {
+    let deadline = request
+        .extensions()
+        .get::<RequestDeadline>()
+        .copied()
+        .unwrap_or_else(|| deadline_from_now(MAX_REQUEST_DEADLINE));
+    let cancellation = request
+        .extensions()
+        .get::<RequestCancellation>()
+        .map_or_else(CancellationToken::new, |cancellation| {
+            cancellation.0.clone()
+        });
+    RequestContext::new(
+        Arc::from(request_id(request).as_str()),
+        cluster_id,
+        deadline.instant(),
+        cancellation,
+        Principal::anonymous(),
+    )
+}
+
 /// Marks a response as final so the error-normalising middleware does not rewrite its body. Use it for handler
 /// responses that already carry their own envelope.
 pub fn shaped(mut response: Response) -> Response {
@@ -222,10 +275,12 @@ pub fn shaped(mut response: Response) -> Response {
 /// configured one when the port is 0.
 pub fn build(
     rest_config: &RestServerConfig,
+    backend: Arc<dyn FlussBackend>,
     readiness: &Arc<Readiness>,
     local_addr: SocketAddr,
 ) -> Router {
     let state = RestState {
+        backend,
         readiness: readiness.clone(),
         bind_address: local_addr,
         started_at: Instant::now(),
@@ -234,14 +289,16 @@ pub fn build(
     build_router(state, &RestOptions::from(rest_config))
 }
 
-/// Builds the P1 router: the health routes (`GET /health` for liveness, `GET /ready` for
-/// readiness) sit outside both the acceptance guard and the body/deadline budget so they answer
-/// while draining and never carry a body; every guarded route (today `/v1/openapi.json`, later all
-/// data/control routes) carries the request-body size and deadline budget, with the acceptance
-/// guard outermost so draining answers 503 without consuming bodies.
+/// Builds the router: the health routes (`GET /health` for liveness, `GET /ready` for readiness) sit
+/// outside both the acceptance guard and the body/deadline budget so they answer while draining and
+/// never carry a body; every guarded route (`/v1/openapi.json`, `/v1/clusters`, the metadata routes,
+/// and later all data/control routes) carries the request-body size and deadline budget, with the
+/// acceptance guard outermost so draining answers 503 without consuming bodies.
 pub fn build_router(state: RestState, options: &RestOptions) -> Router {
     let (guarded_router, guarded_api) = OpenApiRouter::new()
         .merge(openapi::routes())
+        .merge(clusters::routes())
+        .merge(metadata::routes())
         .split_for_parts();
     let (open_router, open_api) = OpenApiRouter::new()
         .merge(health::routes())
@@ -251,6 +308,7 @@ pub fn build_router(state: RestState, options: &RestOptions) -> Router {
     api.merge(open_api);
     let _ = state.openapi.set(openapi::finalize(api));
 
+    let backend = state.backend.clone();
     // `apply_data_limits` also stamps the request deadline, so the guarded side needs no separate
     // `assign_request_deadline` layer.
     let guarded = apply_data_limits(guarded_router.with_state(state.clone()), options);
@@ -261,7 +319,7 @@ pub fn build_router(state: RestState, options: &RestOptions) -> Router {
         .layer(middleware::from_fn(assign_request_deadline(
             options.request_timeout,
         )));
-    apply_common_middleware(open.merge(guarded))
+    apply_common_middleware(open.merge(guarded), Some(backend))
 }
 
 /// Rejects new application work after graceful draining starts while keeping `GET /health` available.
@@ -291,7 +349,7 @@ fn apply_acceptance_guard(router: Router, readiness: Arc<Readiness>) -> Router {
 /// Order (outermost first): request-id assignment and error normalisation, then access logging, then the
 /// body size and deadline limits.
 pub fn apply_middleware(router: Router, options: &RestOptions) -> Router {
-    apply_common_middleware(apply_data_limits(router, options))
+    apply_common_middleware(apply_data_limits(router, options), None)
 }
 
 /// The deadline of a request starting now, ending [`RESPONSE_GRACE`] before the middleware timeout.
@@ -340,6 +398,13 @@ fn apply_data_limits(router: Router, options: &RestOptions) -> Router {
         request
             .extensions_mut()
             .insert(deadline_from_now(request_timeout));
+        // The guard lives in this future, so whatever drops the request — the timeout below, a
+        // disconnected caller, an aborted connection during shutdown — cancels the handler's work.
+        let cancellation = CancellationToken::new();
+        request
+            .extensions_mut()
+            .insert(RequestCancellation(cancellation.clone()));
+        let _cancel_on_drop = cancellation.drop_guard();
 
         let oversized = declared_content_length(&request).filter(|length| *length > max_body_bytes);
         if let Some(length) = oversized {
@@ -383,11 +448,11 @@ fn apply_data_limits(router: Router, options: &RestOptions) -> Router {
         .layer(middleware::from_fn(limits))
 }
 
-fn apply_common_middleware(router: Router) -> Router {
+fn apply_common_middleware(router: Router, backend: Option<Arc<dyn FlussBackend>>) -> Router {
     router
         .layer(middleware::from_fn(catch_panic))
-        .layer(middleware::from_fn(request_log))
-        .layer(middleware::from_fn(request_context))
+        .layer(middleware::from_fn(request_log(backend)))
+        .layer(middleware::from_fn(request_context_id))
 }
 
 /// Turns a panic below this layer into the error envelope a client is promised.
@@ -414,31 +479,64 @@ async fn catch_panic(request: Request, next: Next) -> Response {
     }
 }
 
-async fn request_log(request: Request, next: Next) -> Response {
-    let started = Instant::now();
-    let method = request.method().clone();
-    let route = request
-        .extensions()
-        .get::<MatchedPath>()
-        .map(MatchedPath::as_str)
-        .unwrap_or("<unmatched>")
-        .to_string();
-    let request_id = request
-        .extensions()
-        .get::<RequestId>()
-        .cloned()
-        .unwrap_or_default();
-    let response = next.run(request).await;
-    let elapsed = started.elapsed();
-    let status = response.status();
-    // No route carries a `{cluster}` segment, so every request gets the static `none` label;
-    // caller-supplied values never become label values.
-    observability::http_request("none", method.as_str(), &route, status.as_u16(), elapsed);
-    log::info!(
-        "{}",
-        format_request_log(&method, &route, &request_id, status, elapsed.as_millis())
-    );
-    response
+/// Logs and counts one completed request.
+///
+/// The `cluster` label stays bounded: a route without a `{cluster}` segment reports `none`, and a
+/// segment that names no configured cluster reports `unknown`, so a caller-supplied value can never
+/// become a label value.
+fn request_log(
+    backend: Option<Arc<dyn FlussBackend>>,
+) -> impl Fn(Request, Next) -> std::pin::Pin<Box<dyn Future<Output = Response> + Send>> + Clone {
+    move |request: Request, next: Next| {
+        let backend = backend.clone();
+        Box::pin(async move {
+            let started = Instant::now();
+            let method = request.method().clone();
+            let route = request
+                .extensions()
+                .get::<MatchedPath>()
+                .map(MatchedPath::as_str)
+                .unwrap_or("<unmatched>")
+                .to_string();
+            let cluster =
+                cluster_label(backend.as_deref(), &route, request.uri().path()).to_string();
+            let request_id = request
+                .extensions()
+                .get::<RequestId>()
+                .cloned()
+                .unwrap_or_default();
+            let response = next.run(request).await;
+            let elapsed = started.elapsed();
+            let status = response.status();
+            observability::http_request(
+                &cluster,
+                method.as_str(),
+                &route,
+                status.as_u16(),
+                elapsed,
+            );
+            log::info!(
+                "{}",
+                format_request_log(&method, &route, &request_id, status, elapsed.as_millis())
+            );
+            response
+        })
+    }
+}
+
+/// The bounded `cluster` label of one request: a configured ID, `unknown`, or `none`.
+fn cluster_label<'a>(backend: Option<&dyn FlussBackend>, route: &str, path: &'a str) -> &'a str {
+    let Some(position) = route
+        .split('/')
+        .position(|segment| segment == "{cluster}")
+        .filter(|_| backend.is_some())
+    else {
+        return "none";
+    };
+    path.split('/')
+        .nth(position)
+        .filter(|candidate| backend.is_some_and(|backend| backend.has_cluster(candidate)))
+        .unwrap_or("unknown")
 }
 
 fn format_request_log(
@@ -455,7 +553,7 @@ fn format_request_log(
     )
 }
 
-async fn request_context(mut request: Request, next: Next) -> Response {
+async fn request_context_id(mut request: Request, next: Next) -> Response {
     let request_id = RequestId(Arc::from(uuid::Uuid::new_v4().to_string()));
     request.extensions_mut().insert(request_id.clone());
 
@@ -547,7 +645,13 @@ pub mod test_support {
 
     /// Builds handler state over a fresh readiness gate, which starts neither serving nor draining.
     pub fn test_state() -> RestState {
+        state_with_backend(Arc::new(crate::backend::fake::FakeFlussBackend::new()))
+    }
+
+    /// Builds handler state over one backend fixture.
+    pub fn state_with_backend(backend: Arc<dyn FlussBackend>) -> RestState {
         RestState {
+            backend,
             readiness: Arc::new(Readiness::new()),
             bind_address: "127.0.0.1:0".parse().expect("valid"),
             started_at: Instant::now(),
@@ -833,6 +937,38 @@ mod tests {
                 .unwrap()
                 .contains("handler bug"),
             "the panic payload stays in the log, never in the response: {json}"
+        );
+    }
+
+    /// The `cluster` metric label stays inside its bounded vocabulary: a configured ID, `unknown` for
+    /// anything else a caller can put in the path, and `none` for a route without a cluster segment.
+    #[test]
+    fn the_cluster_metric_label_never_carries_a_caller_supplied_value() {
+        let backend = crate::backend::fake::FakeFlussBackend::new();
+        let route = "/v1/clusters/{cluster}/databases";
+
+        assert_eq!(
+            cluster_label(Some(&backend), route, "/v1/clusters/default/databases"),
+            "default"
+        );
+        for path in [
+            "/v1/clusters/other/databases",
+            "/v1/clusters/Not%20A%20Cluster/databases",
+            "/v1/clusters",
+        ] {
+            assert_eq!(
+                cluster_label(Some(&backend), route, path),
+                "unknown",
+                "{path}"
+            );
+        }
+        assert_eq!(
+            cluster_label(Some(&backend), "/v1/clusters", "/v1/clusters"),
+            "none"
+        );
+        assert_eq!(
+            cluster_label(None, route, "/v1/clusters/default/databases"),
+            "none"
         );
     }
 

@@ -26,8 +26,7 @@ name = "fluss-gateway"
 edition = "2024"
 version = "1.0.0"
 license = "Apache-2.0"
-# The shipped dependency set only needs 1.85; the declared floor stays at 1.88 to match fluss-rust,
-# which the gateway depends on once the FlussBackend capability lands.
+# The floor matches fluss-rust, which the native backend links against.
 rust-version = "1.88"
 authors = ["Apache Fluss <dev@fluss.apache.org>"]
 repository = "https://github.com/apache/fluss"
@@ -47,11 +46,15 @@ path = "src/main.rs"
 name = "fluss_gateway"
 
 [dependencies]
+# `FlussBackend` is used behind `Arc<dyn ...>`, which native `async fn` in traits cannot be.
+async-trait = "0.1"
 axum = { version = "0.8", default-features = false, features = ["http1", "matched-path", "tokio"] }
+# Encodes the self-describing keyset page token; already in the graph transitively.
+base64 = "0.22"
 clap = { version = "4.5.37", features = ["derive"] }
 # Only FutureExt/join_all are used; avoid the larger futures facade crate.
 futures-util = "0.3"
-# Build the native connection settings owned by the Gateway from the typed per-cluster configuration.
+# The native backend and the connection settings owned by the Gateway.
 fluss = { package = "fluss-rs", path = "../fluss-rust/crates/fluss" }
 # The listeners follow axum's official serve-with-hyper example: axum::serve does not expose the
 # hyper builder that the header read timeout lives on. The plain http1 builder (not auto) has no

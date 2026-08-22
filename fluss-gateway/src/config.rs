@@ -264,6 +264,11 @@ const CLUSTER_IDENTITY_MODE_KEY: &str = "connection.identity-mode";
 const CLUSTER_CONNECTION_MAX_KEY: &str = "connection.max";
 const CLUSTER_CONNECTION_IDLE_TIMEOUT_KEY: &str = "connection.idle-timeout";
 
+/// Cap on pooled per-user connections when none is configured (FIP-49 sample configuration).
+const DEFAULT_CONNECTION_MAX: u32 = 512;
+/// Idle reclamation deadline for pooled per-user connections when none is configured.
+const DEFAULT_CONNECTION_IDLE_TIMEOUT: ConfigDuration = ConfigDuration::from_secs(600);
+
 type ApplyConfigValue<C> = fn(&mut C, &Value) -> Result<(), String>;
 
 #[derive(Debug, Clone, Copy)]
@@ -624,7 +629,7 @@ pub struct ClusterConfig {
     pub identity_mode: IdentityMode,
     /// Cap on pooled per-user connections. User identity mode only.
     pub connection_max: Option<u32>,
-    /// Idle reclamation for pooled per-user connections. User identity mode only.
+    /// Idle reclamation deadline for pooled connections, in both identity modes.
     pub connection_idle_timeout: Option<ConfigDuration>,
 }
 
@@ -649,6 +654,22 @@ impl ClusterConfig {
 
     pub fn service_secret(&self) -> Option<&str> {
         self.service_secret.as_ref().map(Secret::expose)
+    }
+
+    /// Upper bound on pooled per-user connections. User identity mode only.
+    pub fn connection_max(&self) -> usize {
+        usize::try_from(self.connection_max.unwrap_or(DEFAULT_CONNECTION_MAX)).unwrap_or(usize::MAX)
+    }
+
+    /// How long a pooled connection may sit unused before it is released.
+    ///
+    /// Applies in both identity modes, unlike `connection.max`: a connection idle this long has almost
+    /// certainly been dropped by a NAT or load balancer already, so rebuilding it on the next request
+    /// is cheaper than discovering that through a failed one.
+    pub fn connection_idle_timeout(&self) -> Duration {
+        self.connection_idle_timeout
+            .unwrap_or(DEFAULT_CONNECTION_IDLE_TIMEOUT)
+            .get()
     }
 
     /// Builds native settings owned by the Gateway.
@@ -912,8 +933,8 @@ impl GatewayConfig {
             }
         }
 
-        let usable = |value: Option<&str>| value.is_some_and(|value| !value.trim().is_empty());
-        let credentials_usable = usable(account) && usable(secret);
+        // The native client only authenticates with a complete SASL PLAIN credential, so half of one
+        // would silently connect as an anonymous caller instead.
         if account.is_some() != secret.is_some() {
             problems.push(format!(
                 "{} and {} must be set together",
@@ -923,20 +944,15 @@ impl GatewayConfig {
         }
 
         if cluster.identity_mode == IdentityMode::User {
-            if self.security.authentication == AuthenticationMode::Trust {
-                problems.push(format!(
-                    "{} user requires verified client identities; set {SECURITY_AUTHENTICATION_KEY} to password, token, or trusted-header",
-                    cluster_key(id, CLUSTER_IDENTITY_MODE_KEY)
-                ));
-            }
-            if !credentials_usable {
-                problems.push(format!(
-                    "{} user requires {} and {}",
-                    cluster_key(id, CLUSTER_IDENTITY_MODE_KEY),
-                    cluster_key(id, CLUSTER_SERVICE_ACCOUNT_KEY),
-                    cluster_key(id, CLUSTER_SERVICE_SECRET_KEY)
-                ));
-            }
+            // Refused rather than silently downgraded to the shared service account: turning
+            // "isolated per caller" into "everyone shares one identity" is a security problem, not a
+            // degradation (FIP-49: configuring user mode fails at startup until Fluss ships act-as).
+            problems.push(format!(
+                "{} user is not supported yet: fluss-rust cannot send a SASL authorization ID, and \
+                 client authentication is not implemented, so every request would act as {}",
+                cluster_key(id, CLUSTER_IDENTITY_MODE_KEY),
+                cluster_key(id, CLUSTER_SERVICE_ACCOUNT_KEY)
+            ));
         }
     }
 
@@ -1032,13 +1048,10 @@ impl GatewayConfig {
             ));
         }
         for (id, cluster) in &self.clusters {
-            if cluster.identity_mode == IdentityMode::Service
-                && (cluster.connection_max.is_some() || cluster.connection_idle_timeout.is_some())
-            {
+            if cluster.identity_mode == IdentityMode::Service && cluster.connection_max.is_some() {
                 warnings.push(format!(
-                    "{} and {} are ignored because {} is service",
+                    "{} is ignored because {} is service, which shares a single connection",
                     cluster_key(id, CLUSTER_CONNECTION_MAX_KEY),
-                    cluster_key(id, CLUSTER_CONNECTION_IDLE_TIMEOUT_KEY),
                     cluster_key(id, CLUSTER_IDENTITY_MODE_KEY)
                 ));
             }
@@ -1052,7 +1065,7 @@ impl GatewayConfig {
     }
 }
 
-fn valid_cluster_id(id: &str) -> bool {
+pub(crate) fn valid_cluster_id(id: &str) -> bool {
     if id.len() > 63 {
         return false;
     }
@@ -2016,6 +2029,46 @@ mod tests {
         );
     }
 
+    /// `user` identity mode is refused at startup instead of running as the shared service account,
+    /// and the message names the two upstream gaps that have to close first.
+    #[test]
+    fn user_identity_mode_is_refused_at_startup() {
+        let mut config = GatewayConfig::default();
+        let cluster = config.clusters.get_mut("default").expect("default cluster");
+        cluster.identity_mode = IdentityMode::User;
+        cluster.service_account = Some("gateway_svc".to_string());
+        cluster.service_secret = Some(Secret("secret".to_string()));
+
+        let errors = problems(config.validate().unwrap_err());
+        let refusal = errors
+            .iter()
+            .find(|error| error.contains("connection.identity-mode"))
+            .unwrap_or_else(|| panic!("{errors:?}"));
+        assert!(refusal.contains("authorization ID"), "{refusal}");
+        assert!(refusal.contains("client authentication"), "{refusal}");
+
+        assert!(GatewayConfig::default().validate().is_ok());
+    }
+
+    /// The pooled per-user bounds fall back to the FIP-49 sample values.
+    #[test]
+    fn the_connection_bounds_have_defaults() {
+        let cluster = ClusterConfig::default();
+        assert_eq!(cluster.connection_max(), 512);
+        assert_eq!(cluster.connection_idle_timeout(), Duration::from_secs(600));
+
+        let configured = ClusterConfig {
+            connection_max: Some(4),
+            connection_idle_timeout: Some(ConfigDuration::from_secs(30)),
+            ..ClusterConfig::default()
+        };
+        assert_eq!(configured.connection_max(), 4);
+        assert_eq!(
+            configured.connection_idle_timeout(),
+            Duration::from_secs(30)
+        );
+    }
+
     #[test]
     fn programmatically_constructed_zero_byte_limits_are_validated() {
         let mut config = GatewayConfig::default();
@@ -2233,7 +2286,7 @@ mod tests {
         let config = load_file(
             "gateway.clusters: default, analytics\n\
              gateway.cluster.default.bootstrap.servers: fluss-1:9123,fluss-2:9123\n\
-             gateway.cluster.default.connection.identity-mode: user\n\
+             gateway.cluster.default.connection.identity-mode: service\n\
              gateway.cluster.default.connection.service.account: gateway_svc\n\
              gateway.cluster.default.connection.service.secret: gw-pass\n\
              gateway.cluster.default.connection.max: 512\n\
@@ -2253,7 +2306,7 @@ mod tests {
 
         let default = cluster(&config, "default");
         assert_eq!(default.bootstrap_servers, "fluss-1:9123,fluss-2:9123");
-        assert_eq!(default.identity_mode, IdentityMode::User);
+        assert_eq!(default.identity_mode, IdentityMode::Service);
         assert_eq!(default.service_account(), Some("gateway_svc"));
         assert_eq!(default.service_secret(), Some("gw-pass"));
         let native = default.native_client_config();
@@ -2534,6 +2587,12 @@ mod tests {
              gateway.security.trusted-header.name: \"bad header\"\n",
             "gateway.rest.lookup.max-keys: 0\n",
             "gateway.rest.prefix-lookup.max-prefixes: 0\n",
+            // User identity mode, however it is spelled out, cannot be served yet.
+            "gateway.security.authentication: password\n\
+             gateway.security.users: alice:secret\n\
+             gateway.cluster.default.connection.identity-mode: user\n\
+             gateway.cluster.default.connection.service.account: gateway_svc\n\
+             gateway.cluster.default.connection.service.secret: gw-pass\n",
         ] {
             assert!(load_file(contents).is_err(), "accepted: {contents}");
         }
@@ -2545,29 +2604,6 @@ mod tests {
             problems(config.validate().unwrap_err())
                 .iter()
                 .any(|error| error == "gateway.clusters must declare at least one cluster")
-        );
-
-        let mut config = GatewayConfig::default();
-        config
-            .clusters
-            .get_mut(DEFAULT_CLUSTER_ID)
-            .expect("default cluster")
-            .identity_mode = IdentityMode::User;
-        assert!(
-            problems(config.validate().unwrap_err())
-                .iter()
-                .any(|error| error.contains("identity-mode user requires"))
-        );
-
-        assert!(
-            load_file(
-                "gateway.security.authentication: password\n\
-                 gateway.security.users: alice:secret\n\
-                 gateway.cluster.default.connection.identity-mode: user\n\
-                 gateway.cluster.default.connection.service.account: gateway_svc\n\
-                 gateway.cluster.default.connection.service.secret: gw-pass\n"
-            )
-            .is_ok()
         );
     }
 

@@ -17,12 +17,15 @@
 
 //! Process lifecycle for listeners and graceful shutdown.
 //!
-//! Listener binding and process readiness are independent from Fluss availability.
+//! Listener binding and process readiness are independent from Fluss availability: the cluster registry is
+//! built from configuration and opens no connection, so the process serves while a cluster is down and the
+//! first request to it establishes the connection.
 //!
-//! Shutdown drains in-flight requests. Because the gateway holds no request-spanning
-//! state, there is nothing to hand over, flush, or migrate: a terminated instance leaves no work that another
-//! instance would have to pick up.
+//! Shutdown drains in-flight requests and then releases the backend connections. Because the gateway holds
+//! no request-spanning state, there is nothing to hand over, flush, or migrate: a terminated instance leaves
+//! no work that another instance would have to pick up.
 
+use crate::backend::client::NativeFlussBackend;
 use crate::config::GatewayConfig;
 use crate::error::{GatewayError, panic_message};
 use crate::observability;
@@ -164,6 +167,9 @@ impl Readiness {
 pub struct RunningGateway {
     local_addr: std::net::SocketAddr,
     metrics_addr: Option<std::net::SocketAddr>,
+    /// Held as the concrete type: shutdown and idle reclamation are not part of the backend contract a
+    /// protocol adapter sees.
+    backend: Arc<NativeFlussBackend>,
     readiness: Arc<Readiness>,
     drain_timeout: Duration,
     shutdown: CancellationToken,
@@ -187,7 +193,7 @@ impl RunningGateway {
     }
 
     /// Stops accepting, drains in-flight requests within the configured drain timeout, then closes the
-    /// background tasks. Consumes the gateway.
+    /// background tasks and the backend connections. Consumes the gateway.
     pub async fn shutdown(self) -> Result<(), RunError> {
         self.finish(None).await
     }
@@ -195,13 +201,17 @@ impl RunningGateway {
     async fn finish(mut self, unexpected_exit: Option<String>) -> Result<(), RunError> {
         let shutdown_started = Instant::now();
         self.readiness.begin_quiescing();
-        // Draining gets the whole configured budget: the gateway holds no request-spanning state, so there is
-        // no cleanup step after the tasks stop that would need a reserved tail. The deadline comes from the
-        // timer's own clock, so it cannot skew against it.
+        // The drain gets the budget minus the tail that closing the backend connections needs. The
+        // deadline comes from the timer's own clock, so it cannot skew against it.
         let deadline = tokio::time::Instant::now() + self.drain_timeout;
+        let task_deadline = deadline - cleanup_reserve(self.drain_timeout);
         self.readiness.begin_draining();
         self.shutdown.cancel();
-        let cleanup_error = drain_tasks(&mut self.tasks, deadline).await;
+        let mut cleanup_error = drain_tasks(&mut self.tasks, task_deadline).await;
+        if let Err(error) = self.close_backend(deadline).await {
+            log::warn!("{error}");
+            cleanup_error = cleanup_error.or(Some(error));
+        }
         self.readiness.set_stopped();
 
         // The metrics listener is one of the drained tasks, so nothing recorded from here on could ever be
@@ -217,6 +227,21 @@ impl RunningGateway {
         }
         log::info!("fluss-gateway stopped after {elapsed:?}");
         Ok(())
+    }
+
+    /// Closes every backend connection within whatever is left of the process deadline.
+    ///
+    /// The remaining budget can be zero if draining used all of it; the close is still attempted, bounded by
+    /// that budget, so shutdown cannot hang on an unresponsive cluster.
+    async fn close_backend(&self, deadline: tokio::time::Instant) -> Result<(), String> {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, self.backend.close(remaining)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(format!("failed to close a Fluss backend: {error}")),
+            Err(_) => {
+                Err("the Fluss backends did not close before the process deadline".to_string())
+            }
+        }
     }
 }
 
@@ -240,11 +265,15 @@ pub async fn run(config: GatewayConfig) -> Result<(), RunError> {
 /// available.
 pub async fn start(config: GatewayConfig) -> Result<RunningGateway, RunError> {
     config.validate()?;
-    start_internal(config).await
+    let backend = Arc::new(NativeFlussBackend::from_config(&config));
+    start_internal(config, backend).await
 }
 
 /// Binds the listeners, installs the router, and spawns every process-owned task.
-async fn start_internal(config: GatewayConfig) -> Result<RunningGateway, RunError> {
+async fn start_internal(
+    config: GatewayConfig,
+    backend: Arc<NativeFlussBackend>,
+) -> Result<RunningGateway, RunError> {
     log::debug!("effective configuration: {}", config.redacted_debug());
     for warning in config.warnings() {
         log::warn!("{warning}");
@@ -268,7 +297,7 @@ async fn start_internal(config: GatewayConfig) -> Result<RunningGateway, RunErro
         .map_err(|error| format!("failed to read the bound metrics listener address: {error}"))?;
 
     let readiness = Arc::new(Readiness::new());
-    let router = rest::build(&config.server.rest, &readiness, local_addr);
+    let router = rest::build(&config.server.rest, backend.clone(), &readiness, local_addr);
     let header_read_timeout = config.server.rest.header_read_timeout.get();
     let connection_drain = connection_drain_budget(config.shutdown.drain_timeout.get());
     let shutdown = CancellationToken::new();
@@ -310,6 +339,21 @@ async fn start_internal(config: GatewayConfig) -> Result<RunningGateway, RunErro
         });
     }
 
+    // Releases connections no request has used for the configured idle timeout. A cluster that stops
+    // receiving requests never reaches the pool's admission path again, so without this its connection
+    // would live until shutdown — long after any NAT or load balancer has dropped it.
+    let reclaim_backend = backend.clone();
+    let reclaim_shutdown = shutdown.clone();
+    spawn_named(&mut tasks, "connection reclaimer", async move {
+        let mut interval = tokio::time::interval(CONNECTION_RECLAIM_INTERVAL);
+        loop {
+            tokio::select! {
+                () = reclaim_shutdown.cancelled() => return Ok(()),
+                _ = interval.tick() => reclaim_backend.reclaim_idle().await,
+            }
+        }
+    });
+
     readiness.set_serving();
     log::info!("fluss-gateway REST listener serving at {local_addr}");
     if let Some(address) = metrics_addr {
@@ -318,6 +362,7 @@ async fn start_internal(config: GatewayConfig) -> Result<RunningGateway, RunErro
     Ok(RunningGateway {
         local_addr,
         metrics_addr,
+        backend,
         readiness,
         drain_timeout: config.shutdown.drain_timeout.get(),
         shutdown,
@@ -325,16 +370,30 @@ async fn start_internal(config: GatewayConfig) -> Result<RunningGateway, RunErro
     })
 }
 
-/// Upper bound on the tail `connection_drain_budget` reserves for cleanup.
+/// How often idle pooled connections are reclaimed.
+///
+/// Reclaiming is cheap and never urgent — a connection released a minute late costs nothing — so the
+/// interval keeps the steady-state cost invisible rather than being prompt.
+const CONNECTION_RECLAIM_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Upper bound on the tail [`cleanup_reserve`] keeps for post-drain cleanup.
 const MAX_CLEANUP_HEADROOM: Duration = Duration::from_secs(2);
 
-/// Splits the configured shutdown budget into the connection drain and a cleanup tail.
+/// The tail of the shutdown budget reserved for what happens after the request drain: closing the backend
+/// connections, and joining whatever the connection drain did not finish.
+///
+/// The tail scales rather than being a fixed subtraction, which would leave short budgets with no drain at
+/// all.
+fn cleanup_reserve(total: Duration) -> Duration {
+    std::cmp::min(total / 10, MAX_CLEANUP_HEADROOM)
+}
+
+/// Splits the configured shutdown budget into the connection drain and the cleanup tail.
 ///
 /// The drain has to end before the process deadline: otherwise `drain_tasks` aborts `serve()`
-/// mid-drain and the connection abort loses its join. The tail scales rather than being a fixed
-/// subtraction, which would leave short budgets with no drain at all.
+/// mid-drain and the connection abort loses its join.
 fn connection_drain_budget(total: Duration) -> Duration {
-    total.saturating_sub(std::cmp::min(total / 10, MAX_CLEANUP_HEADROOM))
+    total.saturating_sub(cleanup_reserve(total))
 }
 
 /// Binds one configured HTTP listener and adds a contextual startup error.
@@ -673,6 +732,22 @@ mod tests {
                 .contains("gateway.rest.write.request-timeout must be greater than zero"),
             "got: {error}"
         );
+    }
+
+    /// Shutdown releases the backend connections after the request drain, so a stopped process leaves no
+    /// Fluss connection behind. That the pool actually drains its connections is the pool's own test;
+    /// this one covers the lifecycle reaching it within the process deadline.
+    #[tokio::test]
+    async fn shutdown_closes_every_backend_connection() {
+        let mut config = GatewayConfig::default();
+        config.server.rest.bind_address = "127.0.0.1:0".parse().expect("valid address");
+        config.server.metrics.enabled = false;
+        let backend = Arc::new(NativeFlussBackend::from_config(&config));
+
+        let gateway = start_internal(config, backend)
+            .await
+            .expect("the gateway starts");
+        gateway.shutdown().await.expect("clean shutdown");
     }
 
     /// Timed-out tasks are aborted and joined before cleanup returns.

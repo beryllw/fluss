@@ -105,6 +105,30 @@ pub const METRIC_DEFINITIONS: &[MetricDefinition] = &[
         "REST request duration.",
         &["cluster", "method", "operation"],
     ),
+    // FIP-49 connection families, reported per configured cluster by the backend runtime. The per-user
+    // act-as pool of the user identity mode reports into the same families when it arrives: they count the
+    // Fluss connections the gateway holds for a cluster, whoever they are opened for.
+    metric(
+        "fluss_gateway_connections_active",
+        MetricKind::Gauge,
+        None,
+        "Fluss connections the gateway currently holds for a configured cluster.",
+        &["cluster"],
+    ),
+    metric(
+        "fluss_gateway_connections_created_total",
+        MetricKind::Counter,
+        None,
+        "Fluss connections opened for a configured cluster.",
+        &["cluster"],
+    ),
+    metric(
+        "fluss_gateway_connections_closed_total",
+        MetricKind::Counter,
+        None,
+        "Fluss connections released for a configured cluster, by why they were released.",
+        &["cluster", "reason"],
+    ),
     // FIP-49 process and Tokio runtime families, sampled periodically by the runtime sampler.
     metric(
         "process_cpu_seconds_total",
@@ -223,6 +247,36 @@ pub fn http_request(cluster: &str, method: &str, operation: &str, code: u16, dur
 /// Returns the installed recorder handle for the dedicated metrics listener.
 pub fn metrics_handle() -> Option<PrometheusHandle> {
     METRICS_HANDLE.get().cloned()
+}
+
+/// Records one Fluss connection opened for a configured cluster.
+pub fn connection_created(cluster: &str) {
+    metrics::counter!(
+        "fluss_gateway_connections_created_total",
+        "cluster" => cluster.to_string()
+    )
+    .increment(1);
+}
+
+/// Records one Fluss connection released for a configured cluster.
+///
+/// `reason` comes from a fixed vocabulary, never from an error message, so the label stays bounded.
+pub fn connection_closed(cluster: &str, reason: &'static str) {
+    metrics::counter!(
+        "fluss_gateway_connections_closed_total",
+        "cluster" => cluster.to_string(),
+        "reason" => reason
+    )
+    .increment(1);
+}
+
+/// Sets how many Fluss connections the gateway currently holds for a configured cluster.
+pub fn connections_active(cluster: &str, active: usize) {
+    metrics::gauge!(
+        "fluss_gateway_connections_active",
+        "cluster" => cluster.to_string()
+    )
+    .set(active as f64);
 }
 
 /// Samples the FIP-49 process and Tokio runtime gauges once.

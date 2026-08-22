@@ -30,11 +30,20 @@ lock file or its generated dependency inventories.
 
 ## Status
 
-This module currently contains only the scaffolding: the manifest with
-placeholder bin/lib targets, the pinned toolchain, lint and license
-configuration, and the developer recipes. The runtime — configuration,
-lifecycle management, the REST layer, and the test suites — lands in follow-up
-pull requests.
+The gateway currently serves the process runtime and REST metadata discovery:
+configuration loading and validation (`gateway.yaml` with flat dotted keys), the
+HTTP listener with its request-id, body-size and deadline middleware,
+`GET /health`, `GET /ready`, `GET /v1/openapi.json`, `GET /v1/clusters`,
+`GET /v1/clusters/{cluster}/databases`,
+`GET /v1/clusters/{cluster}/databases/{database}/tables`, the Prometheus
+listener, and the backend runtime that owns one connection pool per configured
+cluster: a connection is opened lazily on the first request that needs it, shared
+by every request of the same identity, and drained and released once it has been
+idle for `connection.idle-timeout`. A broken transport is left to the native
+client, which reconnects the affected server on its own.
+`connection.identity-mode: user` is refused at startup until Fluss supports
+act-as. The describe-table, partition, DDL, write, and lookup APIs, and client
+authentication, land in follow-up pull requests.
 
 ## Prerequisites
 
