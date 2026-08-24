@@ -161,8 +161,7 @@ pub(crate) async fn list_tables(
 /// Everything that reads the HTTP request happens here, before the backend is called: a malformed page
 /// token is therefore always a 400, never the 404 of a parent resource that happens not to exist. The
 /// cluster is checked first, because a path resource that does not exist outranks a bad query
-/// parameter. This is input validation, not routing — the backend resolves the cluster to a connection
-/// on its own, and this layer never sees either.
+/// parameter.
 fn prepare(
     state: &RestState,
     request: &Request,

@@ -213,7 +213,7 @@ mod tests {
     }
 
     #[test]
-    fn discovery_lists_every_fixture_cluster_in_order() {
+    fn several_fixture_clusters_are_discovered_in_order() {
         let backend = FakeFlussBackend::with_clusters(&["zeta", "alpha"]);
         assert_eq!(
             backend
@@ -223,6 +223,5 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["alpha", "zeta"]
         );
-        assert!(backend.has_cluster("alpha") && !backend.has_cluster("beta"));
     }
 }

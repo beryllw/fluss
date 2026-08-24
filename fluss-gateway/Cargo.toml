@@ -37,6 +37,9 @@ repository = "https://github.com/apache/fluss"
 publish = false
 description = "Stateless REST gateway for Apache Fluss"
 
+[features]
+integration_tests = []
+
 [[bin]]
 name = "fluss-gateway"
 path = "src/main.rs"
@@ -95,6 +98,10 @@ tower = { version = "0.5", features = ["util"] }
 
 [[test]]
 name = "http_api"
+
+[[test]]
+name = "e2e_cluster"
+required-features = ["integration_tests"]
 
 [[test]]
 name = "process"

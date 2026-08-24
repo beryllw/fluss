@@ -19,14 +19,11 @@
 //!
 //! Protocol adapters reach Fluss only through [`FlussBackend`], which is their single dependency: the
 //! cluster a request names, the identity it acts as, and the connection that serves it are all resolved
-//! below this trait. That boundary is what lets the REST layer be tested without a cluster, keeps HTTP
-//! status codes and JSON out of everything under it, and lets a second protocol be added without
-//! reimplementing any of it.
+//! below this trait. That boundary is what lets the REST layer be tested without a cluster and lets a
+//! second protocol be added without reimplementing any of it.
 //!
-//! A backend **owns its connections**: [`client::NativeFlussBackend`] holds one connection pool per
-//! configured cluster, establishes a connection lazily, and releases one once it has been idle.
-//! Shutdown and idle reclamation are methods on the concrete type rather than on this trait, so a
-//! protocol adapter cannot reach them.
+//! A backend **owns its connections**. Shutdown and idle reclamation are methods on the concrete type
+//! rather than on this trait, so a protocol adapter cannot reach them.
 //!
 //! Every capability method is a complete request-response operation: the contract deliberately exposes
 //! **no** way to open a stream, scanner, cursor, or any other handle that would outlive the call,
@@ -53,14 +50,12 @@ use async_trait::async_trait;
 /// owns the translation from native failures into [`GatewayError`].
 ///
 /// The remaining FIP-49 capabilities — describe table, partitions, DDL, write, lookup — are appended
-/// here in the same shape, which is why neither the connection layer nor the protocol layer has to
-/// change again to carry them.
+/// here in the same shape, so carrying them changes neither the connection layer nor the protocol layer.
 #[async_trait]
 pub trait FlussBackend: Send + Sync + 'static {
     /// The clusters this gateway serves, in lexical ID order.
     ///
-    /// A configuration echo, which is why it is synchronous, cannot fail, and takes no request: it
-    /// touches no connection and answers at the same speed whether Fluss is up or down.
+    /// A configuration echo, which is why it is synchronous, cannot fail, and takes no request.
     fn clusters(&self) -> Vec<ClusterId>;
 
     /// Whether `id` names a cluster this gateway serves. Allocation-free, for per-request validation.

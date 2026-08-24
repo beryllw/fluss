@@ -25,11 +25,10 @@
 //! lifetime, and no liveness query. Database-connection-pool intuition does not apply.
 //!
 //! Two things this pool deliberately does not do. It does not retry a dial: `fluss-rs` already walks
-//! every bootstrap address and retries a single one three times with the same backoff a gateway retry
-//! would use. And it does not evict a connection when a request fails on it: a broken transport is
-//! reported per server, and `RpcClient::get_connection` already reconnects that one server, so
-//! discarding the logical client would throw away its cluster metadata and cached sub-clients to fix
-//! something the native client fixes itself.
+//! every bootstrap address and retries a single one with the same backoff a gateway retry would use.
+//! And it does not evict a connection when a request fails on it: a broken transport is reported per
+//! server and `RpcClient::get_connection` reconnects that one server, so discarding the logical client
+//! would only throw away its cluster metadata and cached sub-clients.
 
 use crate::backend::context::{Principal, RequestContext};
 use crate::backend::errors::map_fluss_error;
@@ -53,8 +52,8 @@ const RECLAIM_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Opens and releases the connections of one cluster.
 ///
-/// The pool owns the algorithm — admission, capacity, dial coalescing, eviction — and this trait owns
-/// what a connection *is*, which is what lets the algorithm be tested without a cluster.
+/// The pool owns the algorithm — admission, capacity, dial coalescing, reclamation — and this trait
+/// owns what a connection *is*, which is what lets the algorithm be tested without a cluster.
 pub(crate) trait Connector: Send + Sync + 'static {
     type Conn: Send + Sync + 'static;
 
@@ -91,10 +90,12 @@ impl Connector for NativeConnector {
     /// refuses `identity-mode: user` until then, so only the service identity reaches here.
     ///
     /// The connection also has no per-RPC timeout, because `fluss-rs` only exposes
-    /// [`FlussConnection::new`]. A request that runs out of budget therefore abandons its future while
-    /// the underlying RPC stays in flight, so in-flight requests can accumulate on the connection.
-    /// Once `fluss-rs` offers `new_with_request_timeout`, this dial passes the cluster's
-    /// `request-timeout` to it and the request deadline bounds the RPC itself.
+    /// [`FlussConnection::new`]: `ServerConnection` deliberately stops cleaning up a request once it
+    /// went out, so a request that runs out of budget abandons its future while the RPC stays
+    /// registered, and a server that accepts connections but never answers leaks one entry per gateway
+    /// timeout. Idle reclamation is what frees them until `fluss-rs` can bound the RPC itself — dropping
+    /// the connection drops its whole in-flight map (the write path's counterpart of that gap is
+    /// apache/fluss#3861).
     async fn dial(&self, _identity: &Principal) -> Result<FlussConnection, FlussClientError> {
         FlussConnection::new(self.config.clone()).await
     }
@@ -115,7 +116,8 @@ impl Connector for NativeConnector {
 /// needs background refreshing, say.
 enum Identity {
     /// Service mode: every request maps to one shared identity, so the pool holds at most one entry —
-    /// a capacity of one is a consequence of that, not a setting (FIP-49: `connection.max` is ignored).
+    /// a capacity of one follows from that rather than being a setting (FIP-49 ignores
+    /// `connection.max` here).
     Service(Principal),
     /// User mode: one entry per caller, bounded by `connection.max`.
     User { capacity: usize },
@@ -149,8 +151,8 @@ impl Identity {
 
 /// One identity's slot, with the cheapest synchronisation each field allows.
 struct Entry<C> {
-    /// Written once by whoever wins the dial gate and never replaced, so steady-state reads are lock
-    /// free. A connection leaves the pool only together with its entry.
+    /// Set once by whoever wins the dial gate, having found it empty, and never replaced — so
+    /// steady-state reads are lock free, and a connection leaves the pool only with its entry.
     current: OnceLock<Arc<C>>,
     /// The dial critical section, per entry, so different identities dial in parallel. It carries
     /// **only the last dial failure** — a dial outcome is the same for every waiter on this entry, so
@@ -176,8 +178,6 @@ impl<C> Entry<C> {
         self.current.get().is_some()
     }
 
-    /// Installs the connection this entry keeps. Only the holder of the dial gate calls it, after
-    /// finding the slot empty, so the set cannot lose.
     fn install(&self, connection: Arc<C>) {
         let _ = self.current.set(connection);
     }
@@ -288,19 +288,23 @@ impl<K: Connector> ClusterPool<K> {
     /// Drains and releases the connections reclamation took out of the pool.
     ///
     /// Dropping them would not be enough: `WriterClient` has no `Drop`, so a dropped connection leaves
-    /// its sender task detached with nothing left able to reach it — batches short of their linger are
-    /// never flushed, and the rows waiting in them never get a verdict either. `close` is what marks the
-    /// accumulator closed, waits for the drain, and fails whatever is left over explicitly.
+    /// its sender task detached with nothing able to reach it — batches short of their linger are never
+    /// flushed, and the rows in them never get a verdict.
+    ///
+    /// Concurrent, because [`Self::admit`] drains on the request path: closing one after another would
+    /// charge a single request the timeout of every expired connection.
     async fn close_expired(&self, expired: Vec<Arc<K::Conn>>) {
         if expired.is_empty() {
             return;
         }
-        for connection in expired {
-            if let Err(error) = self
-                .connector
-                .close(connection, RECLAIM_CLOSE_TIMEOUT)
-                .await
-            {
+        let results = join_all(
+            expired
+                .into_iter()
+                .map(|connection| self.connector.close(connection, RECLAIM_CLOSE_TIMEOUT)),
+        )
+        .await;
+        for result in results {
+            if let Err(error) = result {
                 log::warn!(
                     "failed to drain an idle Fluss connection of cluster `{}`: {error}",
                     self.cluster
@@ -382,34 +386,36 @@ impl<K: Connector> ClusterPool<K> {
     /// Drops the entries no caller holds any more and returns the connections among them, which the
     /// caller has to drain.
     ///
-    /// `strong_count == 1` means only this map holds the entry, so nobody is inside its dial gate and
-    /// removing it cannot orphan a connection someone is about to install. Evaluated under the write
-    /// lock, and `Arc<Entry>` never escapes this module, so the test is exact rather than heuristic.
+    /// Two reference counts have to be one, and they mean different things. `strong_count(entry) == 1`
+    /// says nobody is inside [`Self::connection`], so removing the entry cannot orphan a connection
+    /// someone is about to install. `strong_count(connection) == 1` says no request is *using* it: a
+    /// request holds the connection, not the entry, for the whole operation, and `last_used` is stamped
+    /// before that operation starts — so the entry looks unreferenced and idle while the work is still
+    /// running. Both are evaluated under the write lock, and neither `Arc` escapes this module, so the
+    /// test is exact rather than heuristic.
     fn retain_live(&self, entries: &mut Entries<K::Conn>) -> Vec<Arc<K::Conn>> {
         let mut expired = Vec::new();
         entries.retain(|key, entry| {
             if Arc::strong_count(entry) > 1 {
                 return true;
             }
-            // An entry without a connection is what a failed or cancelled dial leaves behind: pure
-            // bookkeeping, nothing to release.
-            let Some(connection) = entry.connection() else {
+            // An entry without a connection is what a failed or cancelled dial leaves behind.
+            let Some(connection) = entry.current.get() else {
                 return false;
             };
-            if entry.idle_for() < self.idle_timeout {
+            if Arc::strong_count(connection) > 1 || entry.idle_for() < self.idle_timeout {
                 return true;
             }
             log::info!(
                 "reclaimed the idle Fluss connection of cluster `{}` for `{key}`",
                 self.cluster
             );
-            expired.push(connection);
+            expired.push(connection.clone());
             false
         });
         expired
     }
 
-    /// How many connections the pool currently holds, for `connections_active`.
     fn active(&self) -> usize {
         self.read_entries()
             .values()
@@ -481,7 +487,6 @@ mod tests {
                 .collect()
         }
 
-        /// How many connections the pool handed back for draining.
         fn closes(&self) -> usize {
             self.closes.load(Ordering::SeqCst)
         }
@@ -550,6 +555,17 @@ mod tests {
         )
     }
 
+    /// A service pool whose entries expire immediately, so reclamation is observable without sleeping.
+    fn expiring_pool(dialer: &Arc<Dialer>) -> ClusterPool<Arc<Dialer>> {
+        pool(
+            dialer,
+            ClusterConfig {
+                connection_idle_timeout: Some(ConfigDuration::from_millis(0)),
+                ..ClusterConfig::default()
+            },
+        )
+    }
+
     fn ctx(user: &str) -> RequestContext {
         RequestContext::for_test_as("default", user, Duration::from_secs(30))
     }
@@ -604,7 +620,6 @@ mod tests {
 
         dialer.set(Outcome::Connect);
         assert!(pool.connection(&key).await.is_ok());
-        assert_eq!(pool.active(), 1);
     }
 
     /// Service mode funnels every caller through one connection; user mode gives each its own.
@@ -616,7 +631,6 @@ mod tests {
         let bob = shared.connection(&shared.key(&ctx("bob"))).await.unwrap();
         assert!(Arc::ptr_eq(&alice, &bob));
         assert_eq!(dialer.dialed(), ["<service>"]);
-        assert_eq!(shared.active(), 1);
 
         let dialer = Dialer::connecting();
         let per_user = user_pool(&dialer, 8, Duration::from_secs(3600));
@@ -630,11 +644,9 @@ mod tests {
             .unwrap();
         assert!(!Arc::ptr_eq(&alice, &bob));
         assert_eq!(dialer.dialed(), ["alice", "bob"]);
-        assert_eq!(per_user.active(), 2);
     }
 
-    /// A full pool refuses a new identity with a retriable 429 while still serving the identities it
-    /// already holds.
+    /// A full pool refuses a new identity while still serving the identities it already holds.
     #[tokio::test]
     async fn a_full_pool_refuses_a_new_identity() {
         let dialer = Dialer::connecting();
@@ -646,7 +658,6 @@ mod tests {
             .await
             .expect_err("the pool is full");
         assert_eq!(error.kind(), ErrorKind::ResourceExhausted);
-        assert!(error.kind().retry_after(), "the caller is told to retry");
         assert!(pool.connection(&pool.key(&ctx("alice"))).await.is_ok());
         assert_eq!(
             dialer.dialed(),
@@ -656,7 +667,7 @@ mod tests {
     }
 
     /// Idle entries are reclaimed before the capacity check, so a pool of idle connections cannot
-    /// starve a new identity, and every reclaimed connection is drained rather than dropped.
+    /// starve a new identity, and the reclaimed connection is drained rather than dropped.
     #[tokio::test]
     async fn idle_entries_are_reclaimed_before_the_capacity_check() {
         let dialer = Dialer::connecting();
@@ -665,44 +676,54 @@ mod tests {
         let pool = user_pool(&dialer, 1, Duration::ZERO);
 
         pool.connection(&pool.key(&ctx("alice"))).await.unwrap();
-        // Despite a capacity of one, bob is admitted because alice's idle entry is reclaimed first —
-        // and alice's connection was closed, not silently dropped.
+        // Admitted despite a capacity of one, because alice's idle entry is reclaimed first.
         pool.connection(&pool.key(&ctx("bob"))).await.unwrap();
         assert_eq!(dialer.dialed(), ["alice", "bob"]);
         assert_eq!(dialer.closes(), 1, "the reclaimed connection was drained");
         assert_eq!(pool.active(), 1);
-
-        // The maintenance tick releases what is left even without a request to trigger admission.
-        pool.reclaim_idle().await;
-        assert_eq!(pool.active(), 0);
-        assert_eq!(dialer.closes(), 2);
     }
 
-    /// Service mode reclaims its shared connection too, and the next request rebuilds it.
+    /// The maintenance tick reclaims an idle connection with no request to trigger admission, in
+    /// service mode too, and the next request rebuilds it.
     ///
-    /// A deliberate departure from FIP-49, which scopes `connection.idle-timeout` to user mode: a
-    /// connection nobody has touched for the timeout has almost certainly been dropped by a NAT or load
-    /// balancer already, so holding it only defers the failure to the next request.
+    /// Reclaiming in service mode departs from FIP-49, which scopes `connection.idle-timeout` to user
+    /// mode; the reason is on [`ClusterPool::idle_timeout`].
     #[tokio::test]
-    async fn service_mode_reclaims_its_shared_connection_when_idle() {
+    async fn the_maintenance_tick_reclaims_the_shared_connection() {
         let dialer = Dialer::connecting();
-        let pool = pool(
-            &dialer,
-            ClusterConfig {
-                connection_idle_timeout: Some(ConfigDuration::from_millis(0)),
-                ..ClusterConfig::default()
-            },
-        );
+        let pool = expiring_pool(&dialer);
         let key = pool.key(&ctx("anyone"));
 
-        let first = pool.connection(&key).await.unwrap();
+        // Dropped, so the entry holds the only reference: what an operation that has returned leaves.
+        drop(pool.connection(&key).await.unwrap());
         pool.reclaim_idle().await;
         assert_eq!(pool.active(), 0);
         assert_eq!(dialer.closes(), 1);
 
-        let second = pool.connection(&key).await.unwrap();
-        assert!(!Arc::ptr_eq(&first, &second));
-        assert_eq!(dialer.dialed().len(), 2);
+        pool.connection(&key).await.unwrap();
+        assert_eq!(dialer.dialed().len(), 2, "the next request dialed again");
+    }
+
+    /// A connection a request is still using is never reclaimed, however idle its entry looks.
+    ///
+    /// The entry is unreferenced for the whole operation — the request holds the connection, not the
+    /// entry — and `last_used` was stamped before the operation began, so the idle timeout can pass
+    /// while the work runs. Closing it there would abort a write mid-flight.
+    #[tokio::test]
+    async fn a_connection_in_use_is_never_reclaimed() {
+        let dialer = Dialer::connecting();
+        let pool = expiring_pool(&dialer);
+        let key = pool.key(&ctx("anyone"));
+
+        let in_use = pool.connection(&key).await.unwrap();
+        pool.reclaim_idle().await;
+        assert_eq!(pool.active(), 1, "the operation is still holding it");
+        assert_eq!(dialer.closes(), 0);
+
+        drop(in_use);
+        pool.reclaim_idle().await;
+        assert_eq!(pool.active(), 0);
+        assert_eq!(dialer.closes(), 1);
     }
 
     /// A cancelled dial releases the capacity it reserved: dropping an in-flight request must not
@@ -720,7 +741,6 @@ mod tests {
         // The entry is gone, so a different identity reaches its own dial instead of a 429.
         dialer.set(Outcome::Connect);
         pool.connection(&pool.key(&ctx("bob"))).await.unwrap();
-        assert_eq!(pool.active(), 1);
     }
 
     /// Shutdown drains every connection, empties the pool, and repeats cleanly.

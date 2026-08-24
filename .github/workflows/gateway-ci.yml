@@ -93,6 +93,66 @@ jobs:
       - name: OpenAPI external validation
         run: npx --yes @redocly/cli@1 lint openapi.yaml
 
+  integration-test:
+    name: "Gateway + Fluss Integration Test"
+    timeout-minutes: 60
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # Share the same cache key as client-integration.yml. Gateway-only changes restore the
+      # same-revision server image instead of rebuilding the Java distribution.
+      - name: Cache server image
+        id: image-cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/fluss-dev.tar
+          key: fluss-dev-image-${{ hashFiles('fluss-server/**', 'fluss-common/**', 'fluss-rpc/**', 'fluss-dist/**', 'docker/fluss/**', 'pom.xml') }}
+
+      - name: Set up JDK 17
+        if: steps.image-cache.outputs.cache-hit != 'true'
+        uses: actions/setup-java@v5
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Build server image (fluss:dev)
+        if: steps.image-cache.outputs.cache-hit != 'true'
+        working-directory: ${{ github.workspace }}
+        run: |
+          ./mvnw -B --no-transfer-progress clean package -pl fluss-dist -am -DskipTests
+          rm -rf docker/fluss/build-target
+          mkdir -p docker/fluss/build-target
+          cp -r build-target/* docker/fluss/build-target/
+          docker build -t fluss:dev docker/fluss
+          docker save fluss:dev -o /tmp/fluss-dev.tar
+
+      - name: Load server image
+        run: docker load -i /tmp/fluss-dev.tar
+
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: |
+            fluss-gateway
+            fluss-rust
+
+      - name: Build Fluss test cluster helper
+        run: cargo build --locked --manifest-path ../fluss-rust/Cargo.toml -p fluss-test-cluster
+
+      - name: Integration Test
+        run: cargo test --locked --features integration_tests --test e2e_cluster
+        env:
+          FLUSS_TEST_CLUSTER_BIN: ${{ github.workspace }}/fluss-rust/target/debug/fluss-test-cluster
+          FLUSS_IMAGE: fluss
+          FLUSS_VERSION: dev
+          RUST_LOG: DEBUG
+          RUST_BACKTRACE: full
+
   msrv:
     name: "Gateway MSRV (1.88)"
     # rust-toolchain.toml floats to stable, so a plain build never catches features newer

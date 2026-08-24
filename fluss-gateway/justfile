@@ -30,6 +30,12 @@ build-release:
 test:
     cargo test --all-targets
 
+# Run the full HTTP-to-Fluss integration test. Requires Docker and a locally available Fluss image;
+# FLUSS_IMAGE and FLUSS_VERSION select it (the client integration CI uses fluss:dev).
+test-e2e:
+    cargo build --manifest-path ../fluss-rust/Cargo.toml -p fluss-test-cluster
+    FLUSS_TEST_CLUSTER_BIN=../fluss-rust/target/debug/fluss-test-cluster cargo test --features integration_tests --test e2e_cluster
+
 # Format the gateway sources in place.
 fmt:
     cargo fmt --all

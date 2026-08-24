@@ -167,11 +167,8 @@ fn encode_token(cluster: &str, collection: Collection, scope: Option<&str>, afte
     URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).expect("the page token is serializable"))
 }
 
-/// Decodes a token and refuses one that was minted for another cluster or endpoint.
-///
-/// A mismatch is an error rather than a silent reinterpretation: continuing a database listing with a
-/// table token, or one cluster's listing with another cluster's cursor, would answer a different
-/// question than the caller asked.
+/// Decodes a token and refuses one minted for another cluster or endpoint, rather than reinterpreting
+/// it against the collection at hand.
 fn decode_token(
     token: &str,
     cluster: &str,
@@ -278,9 +275,6 @@ mod tests {
     }
 
     /// A token only continues the endpoint that issued it, on the cluster that issued it.
-    ///
-    /// The cluster case matters most: without it the token would be accepted and silently skip every
-    /// entry of the other cluster up to this cursor, which the caller cannot detect.
     #[test]
     fn a_token_from_another_cluster_endpoint_or_version_is_refused() {
         let token = encode_token("alpha", Collection::Tables, Some("sales"), "orders");

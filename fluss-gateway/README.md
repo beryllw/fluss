@@ -60,11 +60,19 @@ Run everything from this directory, or use the `just` recipes:
 ```bash
 just build        # cargo build --all-targets
 just test         # cargo test --all-targets
+just test-e2e     # real Gateway + Dockerized Fluss cluster
 just fmt-check    # cargo fmt --all -- --check
 just clippy       # cargo clippy --all-targets -- -D warnings
 just doc          # RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 just licenses     # cargo deny check licenses
 ```
+
+The E2E test requires Docker. It builds and invokes the `fluss-test-cluster`
+helper from the `fluss-rust` workspace, creates catalog objects with `fluss-rs`,
+starts the compiled Gateway binary, and verifies the cluster, database, and
+table REST APIs over a real TCP listener. Set `FLUSS_IMAGE` and `FLUSS_VERSION`
+to select the Fluss image; CI builds and uses `fluss:dev` from the same source
+revision.
 
 The MSRV can be verified locally with `cargo +1.88.0 check --all-targets`.
 

@@ -40,7 +40,6 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// A backend serving every configured cluster from its own pool of connections.
 pub struct NativeFlussBackend {
     /// The cluster routing table. Built from configuration and never mutated, so it needs no lock and
     /// no request can add, remove, or reorder a cluster.
@@ -48,8 +47,8 @@ pub struct NativeFlussBackend {
 }
 
 impl NativeFlussBackend {
-    /// Builds one pool per configured cluster. Performs no I/O: the process starts while Fluss is
-    /// down, and the first request of a cluster dials it.
+    /// Performs no I/O: the process starts while Fluss is down, and the first request of a cluster
+    /// dials it.
     pub fn from_config(config: &GatewayConfig) -> Self {
         let pools = config
             .clusters
@@ -73,7 +72,6 @@ impl NativeFlussBackend {
         let mut first_failure = None;
         for (id, result) in self.pools.keys().zip(closes) {
             if let Err(error) = result {
-                // Every cluster gets its own attempt, and the first failure is the one reported.
                 log::warn!("failed to close the connections of cluster `{id}`: {error}");
                 first_failure = first_failure.or(Some(error));
             }
@@ -89,7 +87,7 @@ impl NativeFlussBackend {
         join_all(self.pools.values().map(ClusterPool::reclaim_idle)).await;
     }
 
-    /// Routes a request to its cluster's pool. The only place `cluster_not_found` originates.
+    /// The only place `cluster_not_found` originates.
     fn pool_for(&self, ctx: &RequestContext) -> GatewayResult<&ClusterPool<NativeConnector>> {
         self.pools
             .get(ctx.cluster_id())
@@ -102,6 +100,9 @@ impl NativeFlussBackend {
     /// A failure never evicts the connection. `fluss-rs` reports a broken transport per server and
     /// reconnects that server on the next use, so the logical client recovers on its own; discarding it
     /// would only throw away its cluster metadata and cached sub-clients.
+    ///
+    /// `connection` stays bound for the whole call on purpose: holding it is what keeps idle
+    /// reclamation off a connection still in use, and the admin client alone would not.
     async fn admin_call<T, F, Fut>(
         &self,
         ctx: &RequestContext,
@@ -171,15 +172,6 @@ mod tests {
         })
     }
 
-    /// An unreachable cluster: the connect timeout bounds the attempt on a port with no listener.
-    fn unreachable() -> ClusterConfig {
-        ClusterConfig {
-            bootstrap_servers: "127.0.0.1:1".to_string(),
-            connect_timeout: ConfigDuration::from_millis(200),
-            ..ClusterConfig::default()
-        }
-    }
-
     /// Every configured cluster is routable in lexical order, and a malformed or unconfigured ID is
     /// the same 404 — resolved from configuration alone, without any connection attempt.
     #[tokio::test]
@@ -209,46 +201,73 @@ mod tests {
         );
     }
 
-    /// The backend constructs without touching the network, and a request to an unreachable cluster
-    /// answers 503 rather than failing startup or hanging. Shutdown then has nothing to close.
+    /// The backend constructs without touching the network, so both ways a dial can fail surface on
+    /// the first request rather than at startup. Shutdown then has nothing to close.
     #[tokio::test]
-    async fn an_unreachable_cluster_answers_unavailable_on_the_first_request() {
-        let backend = backend(&[("default", unreachable())]);
-        let ctx = RequestContext::for_test("default", Duration::from_secs(5));
+    async fn a_dial_failure_reaches_the_caller_classified() {
+        let unreachable = ClusterConfig {
+            // Port 1 has no listener in any test environment; the connect timeout bounds the attempt.
+            bootstrap_servers: "127.0.0.1:1".to_string(),
+            connect_timeout: ConfigDuration::from_millis(200),
+            ..ClusterConfig::default()
+        };
+        let illegal = ClusterConfig {
+            bootstrap_servers: "not-a-host-port".to_string(),
+            ..ClusterConfig::default()
+        };
+        let backend = backend(&[("down", unreachable), ("bad_address", illegal)]);
 
-        assert_eq!(
-            failure(backend.list_databases(&ctx).await).0,
-            ErrorKind::Unavailable
-        );
+        for (cluster, expected) in [
+            ("down", ErrorKind::Unavailable),
+            ("bad_address", ErrorKind::InvalidArgument),
+        ] {
+            let ctx = RequestContext::for_test(cluster, Duration::from_secs(5));
+            assert_eq!(
+                failure(backend.list_databases(&ctx).await).0,
+                expected,
+                "{cluster}"
+            );
+        }
         backend.close(Duration::from_secs(1)).await.unwrap();
-    }
-
-    /// An illegal bootstrap address fails as a caller-visible argument error without burning the
-    /// request budget on retries.
-    #[tokio::test]
-    async fn an_illegal_bootstrap_address_fails_fast() {
-        let backend = backend(&[(
-            "default",
-            ClusterConfig {
-                bootstrap_servers: "not-a-host-port".to_string(),
-                ..ClusterConfig::default()
-            },
-        )]);
-        let ctx = RequestContext::for_test("default", Duration::from_secs(30));
-
-        let started = std::time::Instant::now();
-        assert_eq!(
-            failure(backend.list_databases(&ctx).await).0,
-            ErrorKind::InvalidArgument
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "nothing was retried"
-        );
     }
 
     fn failure<T>(result: GatewayResult<T>) -> (ErrorKind, &'static str) {
         let error = result.err().expect("the call fails");
         (error.kind(), error.code())
+    }
+
+    /// A server that accepts the connection and never answers must still end at the deadline.
+    ///
+    /// Nothing below the gateway ends this wait: `fluss-rs` has no per-RPC timeout, and the connect
+    /// timeout is already satisfied by the accepted TCP connection. Only [`RequestContext::run`] does.
+    /// The abandoned RPC stays registered on the native connection — see the note on
+    /// `NativeConnector::dial`.
+    #[tokio::test]
+    async fn a_server_that_never_answers_ends_at_the_request_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a bound listener");
+        let address = listener.local_addr().expect("a bound address");
+        tokio::spawn(async move {
+            let mut accepted = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                // Held open and never answered.
+                accepted.push(stream);
+            }
+        });
+
+        let backend = backend(&[(
+            "default",
+            ClusterConfig {
+                bootstrap_servers: address.to_string(),
+                ..ClusterConfig::default()
+            },
+        )]);
+        let ctx = RequestContext::for_test("default", Duration::from_millis(300));
+
+        assert_eq!(
+            failure(backend.list_databases(&ctx).await).0,
+            ErrorKind::DeadlineExceeded
+        );
     }
 }
