@@ -272,8 +272,7 @@ public class SaslAuthenticationITCase {
                 "security.sasl.plain.jaas.config",
                 "org.apache.fluss.security.auth.sasl.plain.PlainLoginModule required"
                         + " user_admin=\"admin-secret\""
-                        + " user_alice=\"alice-secret\""
-                        + " impersonate_admin=\"alice\";");
+                        + " user_alice=\"alice-secret\";");
         serverConfig.setString(ConfigOptions.NETTY_SERVER_NUM_WORKER_THREADS.key(), "3");
 
         MetricGroup metricGroup = NOPMetricsGroup.newInstance();
@@ -325,10 +324,6 @@ public class SaslAuthenticationITCase {
                 verifyListTables(client, serverNode);
             }
             try (NettyClient client = createSaslClient("bob", "bob-secret")) {
-                verifyListTables(client, serverNode);
-            }
-            // Non-user JAAS options must survive credential materialization.
-            try (NettyClient client = createSaslClient("admin", "admin-secret", "alice")) {
                 verifyListTables(client, serverNode);
             }
 
@@ -480,18 +475,11 @@ public class SaslAuthenticationITCase {
     }
 
     private NettyClient createSaslClient(String username, String password) {
-        return createSaslClient(username, password, null);
-    }
-
-    private NettyClient createSaslClient(String username, String password, String authorizationId) {
         Configuration clientConfig = new Configuration();
         clientConfig.setString("client.security.protocol", "sasl");
         clientConfig.setString("client.security.sasl.mechanism", "plain");
         clientConfig.setString("client.security.sasl.username", username);
         clientConfig.setString("client.security.sasl.password", password);
-        if (authorizationId != null) {
-            clientConfig.setString("client.security.sasl.authorization-id", authorizationId);
-        }
         return new NettyClient(clientConfig, TestingClientMetricGroup.newInstance());
     }
 

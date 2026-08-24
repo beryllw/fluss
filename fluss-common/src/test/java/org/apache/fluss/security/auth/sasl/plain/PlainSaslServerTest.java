@@ -46,8 +46,8 @@ public class PlainSaslServerTest {
     private static final String PASSWORD_B = "passwordB";
     private static final String USER_C = "userC";
     private static final String PASSWORD_C = "passwordC";
-    private static final String USER_D = "userD";
 
+    private JaasContext jaasContext;
     private SaslServer saslServer;
     private LoginManager loginManager;
 
@@ -58,19 +58,10 @@ public class PlainSaslServerTest {
         options.put("user_" + USER_A, PASSWORD_A);
         options.put("user_" + USER_B, PASSWORD_B);
         options.put("user_" + USER_C, PASSWORD_C);
-        options.put("impersonate_" + USER_A, "*");
-        options.put("impersonate_" + USER_B, USER_C + ", " + USER_D);
         jaasConfig.addEntry("jaasContext", PlainLoginModule.class.getName(), options);
-        JaasContext jaasContext =
-                new JaasContext("jaasContext", JaasContext.Type.SERVER, jaasConfig, null);
+        jaasContext = new JaasContext("jaasContext", JaasContext.Type.SERVER, jaasConfig, null);
         loginManager = LoginManager.acquireLoginManager(jaasContext);
-        saslServer =
-                SaslServerFactory.createSaslServer(
-                        "PLAIN",
-                        "127.0.0.1",
-                        options,
-                        loginManager,
-                        jaasContext.configurationEntries());
+        saslServer = createSaslServer(false);
     }
 
     @AfterEach
@@ -95,39 +86,51 @@ public class PlainSaslServerTest {
     }
 
     @Test
-    public void testImpersonationRejected() {
-        // userC has no impersonate_userC option configured
-        assertThatThrownBy(
-                        () -> saslServer.evaluateResponse(saslMessage(USER_A, USER_C, PASSWORD_C)))
-                .isExactlyInstanceOf(AuthenticationException.class)
-                .hasMessage(
-                        "Authentication failed: user 'userC' is not authorized to impersonate 'userA'");
-
-        // userA is not in userB's allowlist
+    public void testDifferentAuthorizationIdRejectedByDefault() {
         assertThatThrownBy(
                         () -> saslServer.evaluateResponse(saslMessage(USER_A, USER_B, PASSWORD_B)))
                 .isExactlyInstanceOf(AuthenticationException.class)
                 .hasMessage(
-                        "Authentication failed: user 'userB' is not authorized to impersonate 'userA'");
-
-        // authentication is always checked before impersonation authorization
-        assertThatThrownBy(
-                        () -> saslServer.evaluateResponse(saslMessage(USER_C, USER_A, PASSWORD_B)))
-                .isExactlyInstanceOf(AuthenticationException.class)
-                .hasMessage("Authentication failed: Invalid username or password");
+                        "Authentication failed: Client requested an authorization id that is different from username");
     }
 
     @Test
-    public void testImpersonationAllowed() throws SaslException {
-        // Wildcard allows any authorization id.
-        assertThat(saslServer.evaluateResponse(saslMessage(USER_C, USER_A, PASSWORD_A))).isEmpty();
-        assertThat(saslServer.getAuthorizationID()).isEqualTo(USER_C);
+    public void testDifferentAuthorizationIdIsOnlyReportedWhenEnabled() throws SaslException {
+        SaslServer impersonatingServer = createSaslServer(true);
 
-        // Allowlist entries are trimmed and need not have a user_<name> option.
-        assertThat(saslServer.evaluateResponse(saslMessage(USER_C, USER_B, PASSWORD_B))).isEmpty();
-        assertThat(saslServer.getAuthorizationID()).isEqualTo(USER_C);
-        assertThat(saslServer.evaluateResponse(saslMessage(USER_D, USER_B, PASSWORD_B))).isEmpty();
-        assertThat(saslServer.getAuthorizationID()).isEqualTo(USER_D);
+        assertThat(impersonatingServer.evaluateResponse(saslMessage(USER_A, USER_B, PASSWORD_B)))
+                .isEmpty();
+        // The mechanism never grants the requested id on its own, it only reports the request.
+        assertThat(impersonatingServer.getAuthorizationID()).isEqualTo(USER_B);
+        assertThat(
+                        impersonatingServer.getNegotiatedProperty(
+                                PlainSaslServer.REQUESTED_AUTHORIZATION_ID_PROP))
+                .isEqualTo(USER_A);
+    }
+
+    @Test
+    public void testNoRequestedAuthorizationIdReportedWhenIdMatches() throws SaslException {
+        SaslServer impersonatingServer = createSaslServer(true);
+
+        assertThat(impersonatingServer.evaluateResponse(saslMessage(USER_A, USER_A, PASSWORD_A)))
+                .isEmpty();
+        assertThat(impersonatingServer.getAuthorizationID()).isEqualTo(USER_A);
+        assertThat(
+                        impersonatingServer.getNegotiatedProperty(
+                                PlainSaslServer.REQUESTED_AUTHORIZATION_ID_PROP))
+                .isNull();
+    }
+
+    @Test
+    public void testAuthenticationIsCheckedBeforeReportingAuthorizationId() throws SaslException {
+        SaslServer impersonatingServer = createSaslServer(true);
+
+        assertThatThrownBy(
+                        () ->
+                                impersonatingServer.evaluateResponse(
+                                        saslMessage(USER_C, USER_A, PASSWORD_B)))
+                .isExactlyInstanceOf(AuthenticationException.class)
+                .hasMessage("Authentication failed: Invalid username or password");
     }
 
     @Test
@@ -165,6 +168,15 @@ public class PlainSaslServerTest {
                                         String.format("%s%s%s", "", nul, "u")
                                                 .getBytes(StandardCharsets.UTF_8)))
                 .hasMessage("Invalid SASL/PLAIN response: expected 3 tokens, got 2");
+    }
+
+    private SaslServer createSaslServer(boolean impersonationEnabled) throws SaslException {
+        Map<String, String> props = new HashMap<>();
+        if (impersonationEnabled) {
+            props.put(PlainSaslServer.IMPERSONATION_ENABLED_PROP, "true");
+        }
+        return SaslServerFactory.createSaslServer(
+                "PLAIN", "127.0.0.1", props, loginManager, jaasContext.configurationEntries());
     }
 
     private byte[] saslMessage(String authorizationId, String userName, String password) {

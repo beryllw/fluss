@@ -19,13 +19,10 @@ package org.apache.fluss.security.auth.sasl.plain;
 
 import org.apache.fluss.exception.AuthenticationException;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
+import javax.annotation.Nullable;
 import javax.security.auth.callback.Callback;
 import javax.security.auth.callback.CallbackHandler;
 import javax.security.auth.callback.NameCallback;
-import javax.security.sasl.AuthorizeCallback;
 import javax.security.sasl.Sasl;
 import javax.security.sasl.SaslException;
 import javax.security.sasl.SaslServer;
@@ -44,16 +41,33 @@ import java.util.Map;
 /** A {@link SaslServer} implementation for the PLAIN mechanism. */
 public class PlainSaslServer implements SaslServer {
 
-    private static final Logger LOG = LoggerFactory.getLogger(PlainSaslServer.class);
-
     public static final String PLAIN_MECHANISM = "PLAIN";
 
+    /**
+     * SASL property enabling impersonation passthrough. Disabled by default; enabled by
+     * authenticators that separately verify whether the authenticated user may act as the requested
+     * authorization id.
+     */
+    public static final String IMPERSONATION_ENABLED_PROP =
+            "fluss.sasl.plain.impersonation.enabled";
+
+    /** Negotiated property exposing the client-requested authorization id, or {@code null}. */
+    public static final String REQUESTED_AUTHORIZATION_ID_PROP =
+            "fluss.sasl.plain.requested.authorization.id";
+
     private final CallbackHandler callbackHandler;
+    private final boolean impersonationEnabled;
     private boolean complete;
     private String authorizationId;
+    @Nullable private String requestedAuthorizationId;
 
     public PlainSaslServer(CallbackHandler callbackHandler) {
+        this(callbackHandler, false);
+    }
+
+    public PlainSaslServer(CallbackHandler callbackHandler, boolean impersonationEnabled) {
         this.callbackHandler = callbackHandler;
+        this.impersonationEnabled = impersonationEnabled;
     }
 
     @Override
@@ -98,31 +112,16 @@ public class PlainSaslServer implements SaslServer {
                     "Authentication failed: Invalid username or password");
         }
         if (!authorizationIdFromClient.isEmpty() && !authorizationIdFromClient.equals(username)) {
-            AuthorizeCallback authorizeCallback =
-                    new AuthorizeCallback(username, authorizationIdFromClient);
-            try {
-                callbackHandler.handle(new Callback[] {authorizeCallback});
-            } catch (Throwable e) {
+            if (!impersonationEnabled) {
                 throw new AuthenticationException(
-                        "Authentication failed: impersonation authorization could not be verified",
-                        e);
+                        "Authentication failed: Client requested an authorization id that is different from username");
             }
-            if (!authorizeCallback.isAuthorized()) {
-                throw new AuthenticationException(
-                        "Authentication failed: user '"
-                                + username
-                                + "' is not authorized to impersonate '"
-                                + authorizationIdFromClient
-                                + "'");
-            }
-            LOG.debug(
-                    "SASL/PLAIN: user '{}' authenticated and is impersonating '{}'",
-                    username,
-                    authorizationIdFromClient);
-            this.authorizationId = authorizationIdFromClient;
-        } else {
-            this.authorizationId = username;
+            // Record only; authorization is left to the caller that enabled the flag.
+            this.requestedAuthorizationId = authorizationIdFromClient;
         }
+
+        // Always the authenticated user, never the requested id.
+        this.authorizationId = username;
 
         complete = true;
         return new byte[0];
@@ -166,6 +165,9 @@ public class PlainSaslServer implements SaslServer {
     public Object getNegotiatedProperty(String propName) {
         if (!complete) {
             throw new IllegalStateException("Authentication exchange has not completed");
+        }
+        if (REQUESTED_AUTHORIZATION_ID_PROP.equals(propName)) {
+            return requestedAuthorizationId;
         }
         return null;
     }
@@ -213,7 +215,7 @@ public class PlainSaslServer implements SaslServer {
                                 mechanism));
             }
 
-            return new PlainSaslServer(cbh);
+            return new PlainSaslServer(cbh, isImpersonationEnabled(props));
         }
 
         @Override
@@ -227,6 +229,14 @@ public class PlainSaslServer implements SaslServer {
             } else {
                 return new String[] {PLAIN_MECHANISM};
             }
+        }
+
+        private static boolean isImpersonationEnabled(Map<String, ?> props) {
+            if (props == null) {
+                return false;
+            }
+            Object enabled = props.get(IMPERSONATION_ENABLED_PROP);
+            return enabled != null && Boolean.parseBoolean(String.valueOf(enabled));
         }
     }
 }

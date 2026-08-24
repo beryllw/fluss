@@ -609,6 +609,19 @@ public class ConfigOptions {
                                     + "from 'security.sasl.plain.credentials' when that credential map is set, "
                                     + "and can also be configured directly for compatibility.");
 
+    public static final ConfigOption<Map<String, String>> SERVER_IMPERSONATION_PROXY_USERS =
+            key("security.impersonation.proxy-users")
+                    .mapType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "Map granting users the right to act as other users when a listener uses the "
+                                    + "`sasl-impersonation` protocol. The format is "
+                                    + "`proxyUser1:targetUsers1,proxyUser2:targetUsers2`, where the target users are "
+                                    + "separated by semicolons, e.g. `proxy:alice;bob,gateway:*`. The wildcard `*` "
+                                    + "allows the proxy user to act as any user. Users that are not listed can never "
+                                    + "act as another user. Impersonating a user listed in `super.users` is always "
+                                    + "rejected, including via the wildcard.");
+
     public static final ConfigOption<Integer> TABLET_SERVER_ID =
             key("tablet-server.id")
                     .intType()
@@ -1625,11 +1638,12 @@ public class ConfigOptions {
                     .stringType()
                     .noDefaultValue()
                     .withDescription(
-                            "The authorization id (i.e. the user to impersonate) requested during SASL/PLAIN "
-                                    + "authentication, as defined by RFC 4616. The server permits it only if the "
-                                    + "authenticated user is granted impersonation via the 'impersonate_<username>' "
-                                    + "option in the server-side JAAS configuration. If not set, the client acts as "
-                                    + "the authenticated user itself.");
+                            "The authorization id (i.e. the user to act as) requested during SASL authentication, "
+                                    + "as defined by RFC 4616. This option only takes effect when "
+                                    + "`client.security.protocol` is set to `sasl-impersonation`. The server permits "
+                                    + "it only if the authenticated user is granted impersonation of the requested id "
+                                    + "by the server-side `security.impersonation.proxy-users` option. If not set, the "
+                                    + "client acts as the authenticated user itself.");
 
     // ------------------------------------------------------------------------
     //  ConfigOptions for Fluss Table

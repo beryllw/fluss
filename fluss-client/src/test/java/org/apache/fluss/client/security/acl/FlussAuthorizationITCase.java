@@ -349,6 +349,7 @@ public class FlussAuthorizationITCase {
         // proxy authenticates with its own credentials but acts as guest,
         // so authorization is evaluated against the guest principal
         Configuration proxyConf = new Configuration(guestConf);
+        proxyConf.set(ConfigOptions.CLIENT_SECURITY_PROTOCOL, "sasl-impersonation");
         proxyConf.setString("client.security.sasl.username", "proxy");
         proxyConf.setString("client.security.sasl.password", "password3");
         proxyConf.setString("client.security.sasl.authorization-id", "guest");
@@ -372,6 +373,18 @@ public class FlussAuthorizationITCase {
             assertThat(proxyAdmin.getTableInfo(DATA1_TABLE_PATH_PK).get().getTablePath())
                     .isEqualTo(DATA1_TABLE_PATH_PK);
         }
+    }
+
+    @Test
+    void testImpersonationRejectedForUngrantedUser() {
+        // guest is not granted the right to act as any user, and root is additionally a super user,
+        // so the server rejects the connection during authentication
+        Configuration proxyConf = new Configuration(guestConf);
+        proxyConf.set(ConfigOptions.CLIENT_SECURITY_PROTOCOL, "sasl-impersonation");
+        proxyConf.setString("client.security.sasl.authorization-id", "root");
+        assertThatThrownBy(() -> ConnectionFactory.createConnection(proxyConf))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("is not allowed to act as 'root'");
     }
 
     @Test
@@ -1432,16 +1445,18 @@ public class FlussAuthorizationITCase {
         conf.set(ConfigOptions.CLIENT_WRITER_BUFFER_MEMORY_SIZE, MemorySize.parse("1mb"));
         conf.set(ConfigOptions.CLIENT_WRITER_BATCH_SIZE, MemorySize.parse("1kb"));
 
-        // set security information.
-        conf.setString(ConfigOptions.SERVER_SECURITY_PROTOCOL_MAP.key(), "CLIENT:sasl");
+        // set security information. The CLIENT listener uses the impersonation protocol, which
+        // authenticates like SASL and additionally lets granted users act as another user.
+        conf.setString(
+                ConfigOptions.SERVER_SECURITY_PROTOCOL_MAP.key(), "CLIENT:sasl-impersonation");
         conf.setString("security.sasl.enabled.mechanisms", "plain");
         conf.setString(
                 "security.sasl.plain.jaas.config",
                 "org.apache.fluss.security.auth.sasl.plain.PlainLoginModule required "
                         + "    user_root=\"password\" "
                         + "    user_guest=\"password2\" "
-                        + "    user_proxy=\"password3\" "
-                        + "    impersonate_proxy=\"guest\";");
+                        + "    user_proxy=\"password3\";");
+        conf.setString(ConfigOptions.SERVER_IMPERSONATION_PROXY_USERS.key(), "proxy:guest");
         conf.set(ConfigOptions.SUPER_USERS, "User:root");
         conf.set(ConfigOptions.AUTHORIZER_ENABLED, true);
         return conf;
