@@ -18,8 +18,8 @@
 //! The production [`FlussBackend`] over `fluss-rs`.
 //!
 //! It owns one `ClusterPool` per configured cluster, which is the whole of the gateway's connection
-//! management: routing a request to its cluster and choosing the connection of its identity. None of
-//! that is visible above this module.
+//! management: routing a request to its cluster and sharing the connection of its configured service
+//! account. None of that is visible above this module.
 //!
 //! Only this module and [`crate::backend::connection`] link against the Fluss client, so a native type
 //! never appears in a signature the protocol layer can see.
@@ -95,7 +95,7 @@ impl NativeFlussBackend {
     }
 
     /// The single entry point of every admin call: route, run under the request budget, take the
-    /// connection of the request's identity, then classify the failure.
+    /// cluster's service connection, then classify the failure.
     ///
     /// A failure never evicts the connection. `fluss-rs` reports a broken transport per server and
     /// reconnects that server on the next use, so the logical client recovers on its own; discarding it
@@ -115,7 +115,7 @@ impl NativeFlussBackend {
     {
         let pool = self.pool_for(ctx)?;
         ctx.run(async {
-            let connection = pool.connection(&pool.key(ctx)).await?;
+            let connection = pool.connection().await?;
             let result = match connection.get_admin() {
                 Ok(admin) => operation(admin).await,
                 Err(error) => Err(error),

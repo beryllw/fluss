@@ -22,48 +22,50 @@
 
 use crate::backend::types::ClusterId;
 use crate::error::{GatewayError, GatewayResult};
-use std::fmt;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
-/// The identity a request acts as.
+/// The caller identity produced by the Gateway authenticator.
 ///
-/// Until the authenticator lands every request is anonymous, and `user` identity mode is refused at
-/// startup, so nothing consumes a named principal yet. It stays in the signatures because it is what
-/// selects a per-user connection: adding per-user credentials must not change a single call site.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Principal(Arc<str>);
+/// A principal describes only the client-to-Gateway request. It is deliberately not hashable and
+/// carries no service-account sentinel: the connection layer derives its own key from cluster
+/// configuration and, in future user mode, from the effective authorization ID.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Principal {
+    name: Arc<str>,
+    attributes: Arc<BTreeMap<String, String>>,
+}
 
 impl Principal {
-    pub fn anonymous() -> Self {
-        Self(Arc::from("anonymous"))
-    }
-
-    /// The gateway's own service identity, which every request shares under `identity-mode: service`.
-    ///
-    /// The angle brackets keep it outside the shape any authenticated name can take, so it cannot
-    /// collide with a caller who happens to be called `service`.
-    pub fn service() -> Self {
-        Self(Arc::from("<service>"))
-    }
-
-    pub fn named(name: &str) -> Self {
-        Self(Arc::from(name))
+    pub fn new(name: impl Into<Arc<str>>, attributes: BTreeMap<String, String>) -> Self {
+        Self {
+            name: name.into(),
+            attributes: Arc::new(attributes),
+        }
     }
 
     pub fn name(&self) -> &str {
-        &self.0
+        &self.name
+    }
+
+    pub fn attributes(&self) -> &BTreeMap<String, String> {
+        &self.attributes
     }
 }
 
-impl fmt::Display for Principal {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.name())
-    }
+/// Whether a request has passed through an authenticator.
+///
+/// Anonymous is a state rather than the reserved principal name `anonymous`, so a future real user
+/// with that name cannot collide with an unauthenticated caller.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CallerIdentity {
+    Anonymous,
+    Authenticated(Principal),
 }
 
-/// One request's deadline, cancellation signal, principal, and cluster.
+/// One request's deadline, cancellation signal, caller identity, and cluster.
 #[derive(Clone, Debug)]
 pub struct RequestContext {
     request_id: Arc<str>,
@@ -72,7 +74,7 @@ pub struct RequestContext {
     deadline: Instant,
     /// Cancelled when the caller goes away or the process drains.
     cancellation: CancellationToken,
-    principal: Principal,
+    caller: CallerIdentity,
 }
 
 impl RequestContext {
@@ -81,14 +83,14 @@ impl RequestContext {
         cluster_id: ClusterId,
         deadline: Instant,
         cancellation: CancellationToken,
-        principal: Principal,
+        caller: CallerIdentity,
     ) -> Self {
         Self {
             request_id: request_id.into(),
             cluster_id,
             deadline,
             cancellation,
-            principal,
+            caller,
         }
     }
 
@@ -131,8 +133,16 @@ impl RequestContext {
         &self.cancellation
     }
 
-    pub fn principal(&self) -> &Principal {
-        &self.principal
+    pub fn caller(&self) -> &CallerIdentity {
+        &self.caller
+    }
+
+    /// The authenticated caller, once authentication is implemented.
+    pub fn principal(&self) -> Option<&Principal> {
+        match &self.caller {
+            CallerIdentity::Anonymous => None,
+            CallerIdentity::Authenticated(principal) => Some(principal),
+        }
     }
 
     pub fn cluster_id(&self) -> &ClusterId {
@@ -151,17 +161,8 @@ impl RequestContext {
             ClusterId::try_from(cluster).expect("valid test cluster ID"),
             Instant::now() + budget,
             CancellationToken::new(),
-            Principal::anonymous(),
+            CallerIdentity::Anonymous,
         )
-    }
-
-    /// A context acting as `user`, for the per-user pool key tests.
-    #[cfg(test)]
-    pub(crate) fn for_test_as(cluster: &str, user: &str, budget: Duration) -> Self {
-        Self {
-            principal: Principal::named(user),
-            ..Self::for_test(cluster, budget)
-        }
     }
 }
 
@@ -177,6 +178,19 @@ fn expired() -> GatewayError {
 mod tests {
     use super::*;
     use crate::error::ErrorKind;
+
+    #[test]
+    fn an_authenticated_principal_is_distinct_from_the_anonymous_state() {
+        let principal = Principal::new(
+            "anonymous",
+            BTreeMap::from([("tenant".to_string(), "sales".to_string())]),
+        );
+        let caller = CallerIdentity::Authenticated(principal.clone());
+
+        assert_ne!(caller, CallerIdentity::Anonymous);
+        assert_eq!(principal.name(), "anonymous");
+        assert_eq!(principal.attributes()["tenant"], "sales");
+    }
 
     /// The three outcomes `run` has to keep apart, and the fact that the operation is abandoned in two
     /// of them rather than left running.

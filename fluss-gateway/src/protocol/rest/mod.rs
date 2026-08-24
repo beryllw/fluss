@@ -32,7 +32,7 @@ pub mod openapi;
 pub mod pagination;
 
 use crate::backend::FlussBackend;
-use crate::backend::context::{Principal, RequestContext};
+use crate::backend::context::{CallerIdentity, RequestContext};
 use crate::backend::types::ClusterId;
 use crate::config::RestServerConfig;
 use crate::error::{ErrorEnvelope, ErrorKind, GatewayError, panic_message};
@@ -237,8 +237,8 @@ pub(crate) fn request_id(request: &Request) -> RequestId {
 
 /// Builds the backend context of one cluster-scoped request from the middleware-assigned metadata.
 ///
-/// The principal is anonymous until the authenticator lands; the deadline and the cancellation signal
-/// are the ones the middleware also enforces, so a backend call cannot outlive its request.
+/// The caller is anonymous until the authenticator lands; the deadline and the cancellation signal are
+/// the ones the middleware also enforces, so a backend call cannot outlive its request.
 pub(crate) fn request_context(cluster_id: ClusterId, request: &Request) -> RequestContext {
     let deadline = request
         .extensions()
@@ -256,7 +256,7 @@ pub(crate) fn request_context(cluster_id: ClusterId, request: &Request) -> Reque
         cluster_id,
         deadline.instant(),
         cancellation,
-        Principal::anonymous(),
+        CallerIdentity::Anonymous,
     )
 }
 

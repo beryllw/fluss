@@ -38,9 +38,10 @@ HTTP listener with its request-id, body-size and deadline middleware,
 `GET /v1/clusters/{cluster}/databases/{database}/tables`, the Prometheus
 listener, and the backend runtime that owns one connection pool per configured
 cluster: a connection is opened lazily on the first request that needs it, shared
-by every request of the same identity, and drained and released once it has been
-idle for `connection.idle-timeout`. A broken transport is left to the native
-client, which reconnects the affected server on its own.
+by every request to that cluster under its configured service account, and
+drained and released once it has been idle for `connection.idle-timeout`. A
+broken transport is left to the native client, which reconnects the affected
+server on its own.
 `connection.identity-mode: user` is refused at startup until Fluss supports
 act-as. The describe-table, partition, DDL, write, and lookup APIs, and client
 authentication, land in follow-up pull requests.
