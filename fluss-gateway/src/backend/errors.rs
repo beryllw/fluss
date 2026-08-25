@@ -89,14 +89,14 @@ fn map_api_error(what: &str, api_error: FlussError) -> Option<GatewayError> {
                 "Fluss rejected the name while trying to {what}"
             ))
         }
-        // Service mode makes both failures deployment faults. User mode may later map a
-        // caller-specific authorization failure to 403 while keeping authentication as 500.
+        // In service mode, both failures are deployment faults, including protocol mismatches.
+        // User mode may later map a caller-specific authorization failure to 403.
         FlussError::AuthenticateException => {
-            log::error!("Fluss rejected the gateway's service identity while trying to {what}");
+            log::error!("Fluss rejected the gateway connection while trying to {what}");
             GatewayError::backend(format!("Fluss rejected the gateway while trying to {what}"))
         }
         FlussError::AuthorizationException => {
-            log::error!("Fluss denied the gateway's service identity while trying to {what}");
+            log::error!("Fluss denied the gateway while trying to {what}");
             GatewayError::backend(format!("Fluss denied the gateway while trying to {what}"))
         }
         _ => return None,
