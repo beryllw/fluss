@@ -15,11 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! End-to-end metadata API tests against a real Dockerized Fluss cluster.
-//!
-//! The test crosses every production boundary: a real HTTP client calls the compiled Gateway binary,
-//! which reaches the Docker cluster through the native `fluss-rs` backend. Run it with
-//! `just test-e2e`.
+//! End-to-end Gateway tests against a Dockerized Fluss cluster (`just test-e2e`).
 
 mod support;
 
@@ -34,6 +30,7 @@ use support::{Api, ChildGuard, await_http_ok, binary, free_port};
 
 const DATABASE: &str = "gateway_e2e";
 const TABLE: &str = "events";
+const JOURNEY_DATABASE: &str = "gateway_e2e_journey";
 const SERVICE_ACCOUNT: &str = "admin";
 const SERVICE_SECRET: &str = "admin-secret";
 
@@ -187,7 +184,11 @@ fn write_gateway_config(
     path
 }
 
-async fn assert_metadata_apis(bootstrap_servers: &str, security_protocol: &str) {
+async fn assert_metadata_apis(
+    bootstrap_servers: &str,
+    security_protocol: &str,
+    catalog_journey: bool,
+) {
     let gateway_port = free_port();
     let directory = tempfile::tempdir().expect("temporary Gateway config directory");
     let config = write_gateway_config(
@@ -228,10 +229,125 @@ async fn assert_metadata_apis(bootstrap_servers: &str, security_protocol: &str) 
             .await,
         serde_json::json!({"tables": [TABLE]})
     );
+    if catalog_journey {
+        assert_catalog_journey(&api).await;
+    }
 
     gateway.send_sigterm();
     let status = gateway.wait_for_exit(Duration::from_secs(35)).await;
     assert_eq!(status.code(), Some(0), "Gateway drains cleanly");
+}
+
+/// Drives the catalog life cycle using only the REST API.
+async fn assert_catalog_journey(api: &Api) {
+    let databases = "/v1/clusters/default/databases";
+    let database = format!("{databases}/{JOURNEY_DATABASE}");
+    let tables = format!("{database}/tables");
+    let table = format!("{tables}/orders");
+    let partitions = format!("{table}/partitions");
+
+    let (location, created) = api
+        .post_created(
+            databases,
+            &serde_json::json!({"database": JOURNEY_DATABASE}),
+        )
+        .await;
+    assert_eq!(location, database);
+    assert_eq!(created, serde_json::json!({"database": JOURNEY_DATABASE}));
+
+    // A dry run reaches Fluss for nothing, so the table is still absent afterwards.
+    let definition = serde_json::json!({
+        "table_name": "orders",
+        "columns": [
+            {"name": "id", "data_type": {"type": "BIGINT"}, "nullable": false},
+            {"name": "dt", "data_type": {"type": "STRING"}, "nullable": false},
+            {"name": "amount", "data_type": {"type": "DECIMAL", "precision": 18, "scale": 2}},
+        ],
+        "primary_key": ["id", "dt"],
+        "partitioned_by": ["dt"],
+        "distribution": {"bucket_count": 2, "bucket_keys": ["id"]},
+        "comment": "the E2E journey table",
+    });
+    let mut dry_run = definition.clone();
+    dry_run["validate_only"] = serde_json::json!(true);
+    let (status, _, summary) = api.post(&tables, &dry_run).await;
+    assert_eq!(status, 200, "the dry run is accepted: {summary}");
+    assert_eq!(summary["validate_only"], true);
+    assert_eq!(
+        api.get(&table).await.status(),
+        404,
+        "the dry run created nothing"
+    );
+
+    let (location, created) = api.post_created(&tables, &definition).await;
+    assert_eq!(location, table);
+    assert_eq!(created["distribution"]["bucket_count"], 2);
+    // The declared type survives the round trip through Fluss's own schema serialization.
+    assert_eq!(
+        created["columns"][2]["data_type"],
+        serde_json::json!({"type": "DECIMAL", "precision": 18, "scale": 2})
+    );
+    assert_eq!(api.get_ok(&table).await, created);
+
+    // Fluss currently requires schema and config changes in separate requests.
+    let (status, _, altered) = api
+        .patch(
+            &table,
+            &serde_json::json!({
+                "changes": [
+                    {"kind": "add_column", "name": "note", "data_type": {"type": "STRING"}}
+                ]
+            }),
+        )
+        .await;
+    assert_eq!(status, 200, "the alteration is applied: {altered}");
+    assert_eq!(altered["columns"][3]["name"], "note");
+
+    let (status, _, altered) = api
+        .patch(
+            &table,
+            &serde_json::json!({
+                "changes": [
+                    {"kind": "set_config", "key": "table.log.ttl", "value": "30d"}
+                ]
+            }),
+        )
+        .await;
+    assert_eq!(status, 200, "the alteration is applied: {altered}");
+    assert_eq!(altered["configs"]["table.log.ttl"], "30d");
+    assert_eq!(api.get_ok(&table).await, altered);
+
+    let (location, partition) = api
+        .post_created(
+            &partitions,
+            &serde_json::json!({"partition": {"dt": "2026-08-25"}}),
+        )
+        .await;
+    assert_eq!(location, format!("{partitions}/2026-08-25"));
+    assert_eq!(
+        partition["partition"],
+        serde_json::json!({"dt": "2026-08-25"})
+    );
+    assert_eq!(
+        api.get_ok(&partitions).await,
+        serde_json::json!({"partitions": [{"dt": "2026-08-25"}]})
+    );
+
+    // Drop without cascade requires leaf-to-root cleanup.
+    assert_eq!(
+        api.delete(&database).await,
+        409,
+        "the database is not empty"
+    );
+    assert_eq!(api.delete(&format!("{partitions}/2026-08-25")).await, 204);
+    assert_eq!(api.delete(&table).await, 204);
+    assert_eq!(api.delete(&database).await, 204);
+    assert!(
+        !api.get_ok(databases).await["databases"]
+            .as_array()
+            .expect("database list")
+            .contains(&serde_json::json!(JOURNEY_DATABASE))
+    );
 }
 
 #[tokio::test]
@@ -270,8 +386,8 @@ async fn metadata_apis_support_plaintext_and_sasl_fluss_clusters() {
         .await
         .expect("create the E2E table");
 
-    assert_metadata_apis(&cluster.plaintext_bootstrap_servers, "plaintext").await;
-    assert_metadata_apis(&cluster.sasl_bootstrap_servers, "sasl").await;
+    assert_metadata_apis(&cluster.plaintext_bootstrap_servers, "plaintext", false).await;
+    assert_metadata_apis(&cluster.sasl_bootstrap_servers, "sasl", true).await;
 
     connection
         .close(Duration::from_secs(10))

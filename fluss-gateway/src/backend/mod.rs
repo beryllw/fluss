@@ -15,20 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The gateway's HTTP-independent backend component.
-//!
-//! Protocol adapters reach Fluss only through [`FlussBackend`], which is their single dependency: the
-//! cluster a request names, the identity it acts as, and the connection that serves it are all resolved
-//! below this trait. That boundary is what lets the REST layer be tested without a cluster and lets a
-//! second protocol be added without reimplementing any of it.
-//!
-//! A backend **owns its connections**. Shutdown is a method on the concrete type rather than on this
-//! trait, so a protocol adapter cannot reach it.
-//!
-//! Every capability method is a complete request-response operation: the contract deliberately exposes
-//! **no** way to open a stream, scanner, cursor, or any other handle that would outlive the call,
-//! because the gateway keeps no request-spanning state. There is also no cluster-health method —
-//! reachability is not a queryable state, it is the outcome of the next request.
+//! HTTP-independent Fluss operations used by protocol adapters.
 
 pub mod client;
 pub mod connection;
@@ -43,33 +30,76 @@ use crate::backend::context::RequestContext;
 use crate::backend::types::ClusterId;
 use crate::error::{GatewayError, GatewayResult, Resource};
 use async_trait::async_trait;
+use fluss::metadata::{
+    AlterTableChanges, PartitionInfo, PartitionSpec, TableDescriptor, TableInfo, TablePath,
+};
 
 /// The backend capabilities the protocol adapters depend on.
 ///
-/// Implementations never return HTTP or JSON types: the adapter owns status mapping, and the backend
-/// owns the translation from native failures into [`GatewayError`].
-///
-/// The remaining FIP-49 capabilities — describe table, partitions, DDL, write, lookup — are appended
-/// here in the same shape, so carrying them changes neither the connection layer nor the protocol layer.
+/// Native metadata crosses this boundary unchanged; protocol adapters own wire shapes.
 #[async_trait]
 pub trait FlussBackend: Send + Sync + 'static {
-    /// The clusters this gateway serves, in lexical ID order.
-    ///
-    /// A configuration echo, which is why it is synchronous, cannot fail, and takes no request.
+    /// The configured clusters, in lexical order.
     fn clusters(&self) -> Vec<ClusterId>;
 
-    /// Whether `id` names a cluster this gateway serves. Allocation-free, for per-request validation.
+    /// Whether `id` names a configured cluster.
     fn has_cluster(&self, id: &str) -> bool;
 
     async fn list_databases(&self, ctx: &RequestContext) -> GatewayResult<Vec<String>>;
 
+    async fn create_database(&self, ctx: &RequestContext, database: &str) -> GatewayResult<()>;
+
+    /// Drops an empty database without cascading.
+    async fn drop_database(&self, ctx: &RequestContext, database: &str) -> GatewayResult<()>;
+
     async fn list_tables(&self, ctx: &RequestContext, database: &str)
     -> GatewayResult<Vec<String>>;
+
+    async fn describe_table(
+        &self,
+        ctx: &RequestContext,
+        table: &TablePath,
+    ) -> GatewayResult<TableInfo>;
+
+    async fn create_table(
+        &self,
+        ctx: &RequestContext,
+        table: &TablePath,
+        descriptor: &TableDescriptor,
+    ) -> GatewayResult<TableInfo>;
+
+    /// Applies the change group in one native request.
+    async fn alter_table(
+        &self,
+        ctx: &RequestContext,
+        table: &TablePath,
+        changes: AlterTableChanges,
+    ) -> GatewayResult<TableInfo>;
+
+    async fn drop_table(&self, ctx: &RequestContext, table: &TablePath) -> GatewayResult<()>;
+
+    async fn list_partitions(
+        &self,
+        ctx: &RequestContext,
+        table: &TablePath,
+    ) -> GatewayResult<Vec<PartitionInfo>>;
+
+    async fn create_partition(
+        &self,
+        ctx: &RequestContext,
+        table: &TablePath,
+        spec: &PartitionSpec,
+    ) -> GatewayResult<()>;
+
+    async fn drop_partition(
+        &self,
+        ctx: &RequestContext,
+        table: &TablePath,
+        spec: &PartitionSpec,
+    ) -> GatewayResult<()>;
 }
 
-/// The answer to a cluster this gateway does not serve.
-///
-/// A malformed ID and an unconfigured one are the same answer to a caller, so they share one error.
+/// Returns the error for an unconfigured cluster.
 pub fn unknown_cluster(id: &str) -> GatewayError {
     GatewayError::not_found(format!("unknown cluster `{id}`")).with_resource(Resource::Cluster)
 }

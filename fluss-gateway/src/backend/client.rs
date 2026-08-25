@@ -15,15 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The production [`FlussBackend`] over `fluss-rs`.
-//!
-//! It owns one `ConnectionCache` per configured cluster, which is the whole of the gateway's connection
-//! management: routing a request to its cluster and sharing its service-mode connection. None of that
-//! is visible above this module.
-//!
-//! This module and [`crate::backend::connection`] own native client handles, connection lifecycle, and
-//! transport error translation. Protocol adapters may still reuse stable `fluss-rs` domain types, such
-//! as metadata descriptors, when they fit the API instead of defining duplicate models.
+//! The production [`FlussBackend`] over one connection cache per configured cluster.
 
 use crate::backend::FlussBackend;
 use crate::backend::connection::{ConnectionCache, NativeConnector};
@@ -36,20 +28,20 @@ use crate::error::GatewayResult;
 use async_trait::async_trait;
 use fluss::client::FlussAdmin;
 use fluss::error::Error as FlussClientError;
+use fluss::metadata::{
+    AlterTableChanges, PartitionInfo, PartitionSpec, TableDescriptor, TableInfo, TablePath,
+};
 use futures_util::future::join_all;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 pub struct NativeFlussBackend {
-    /// The cluster routing table. Built from configuration and never mutated, so it needs no lock and
-    /// no request can add, remove, or reorder a cluster.
     caches: BTreeMap<ClusterId, ConnectionCache<NativeConnector>>,
 }
 
 impl NativeFlussBackend {
-    /// Performs no I/O: the process starts while Fluss is down, and the first request of a cluster
-    /// dials it.
+    /// Builds the routing table without connecting.
     pub fn from_config(config: &GatewayConfig) -> Self {
         let caches = config
             .clusters
@@ -65,10 +57,7 @@ impl NativeFlussBackend {
         Self { caches }
     }
 
-    /// Closes every connection of every cluster within `timeout`. Idempotent.
-    ///
-    /// Concurrent because the budget is the whole shutdown's, not each cluster's: closing sequentially
-    /// would let one slow cluster consume the time the others need.
+    /// Closes all clusters concurrently within one timeout.
     pub(crate) async fn close(&self, timeout: Duration) -> GatewayResult<()> {
         let closes = join_all(self.caches.values().map(|cache| cache.close(timeout))).await;
         let mut first_failure = None;
@@ -81,26 +70,18 @@ impl NativeFlussBackend {
         first_failure.map_or(Ok(()), Err)
     }
 
-    /// Runs one idle scan for every configured cluster. Each cache logs its own best-effort close
-    /// failures, so a slow or unavailable cluster cannot suppress cleanup of the others.
+    /// Runs one idle scan for every configured cluster.
     pub(crate) async fn clean_expired_connections(&self) {
         join_all(self.caches.values().map(ConnectionCache::clean_expired)).await;
     }
 
-    /// The only place `cluster_not_found` originates.
     fn cache_for(&self, ctx: &RequestContext) -> GatewayResult<&ConnectionCache<NativeConnector>> {
         self.caches
             .get(ctx.cluster_id())
             .ok_or_else(|| unknown_cluster(ctx.cluster_id().as_str()))
     }
 
-    /// The single entry point of every admin call: route, run under the request budget, take the
-    /// cluster's service connection, then classify the failure.
-    ///
-    /// A failure never evicts the connection. `fluss-rs` reports a broken transport per server and
-    /// reconnects that server on the next use, so the logical client recovers on its own; discarding it
-    /// would only throw away its cluster metadata and cached sub-clients.
-    ///
+    /// Routes and bounds one native admin call, then classifies its failure.
     async fn admin_call<T, F, Fut>(
         &self,
         ctx: &RequestContext,
@@ -146,9 +127,102 @@ impl FlussBackend for NativeFlussBackend {
         ctx: &RequestContext,
         database: &str,
     ) -> GatewayResult<Vec<String>> {
-        let database = database.to_string();
         self.admin_call(ctx, "list the tables", |admin| async move {
-            admin.list_tables(&database).await
+            admin.list_tables(database).await
+        })
+        .await
+    }
+
+    async fn create_database(&self, ctx: &RequestContext, database: &str) -> GatewayResult<()> {
+        self.admin_call(ctx, "create the database", |admin| async move {
+            admin.create_database(database, None, false).await
+        })
+        .await
+    }
+
+    async fn drop_database(&self, ctx: &RequestContext, database: &str) -> GatewayResult<()> {
+        self.admin_call(ctx, "drop the database", |admin| async move {
+            admin.drop_database(database, false, false).await
+        })
+        .await
+    }
+
+    /// Reads through fluss-rs, which refreshes its metadata cache.
+    async fn describe_table(
+        &self,
+        ctx: &RequestContext,
+        table: &TablePath,
+    ) -> GatewayResult<TableInfo> {
+        self.admin_call(ctx, "describe the table", |admin| async move {
+            admin.get_table_info(table).await
+        })
+        .await
+    }
+
+    async fn create_table(
+        &self,
+        ctx: &RequestContext,
+        table: &TablePath,
+        descriptor: &TableDescriptor,
+    ) -> GatewayResult<TableInfo> {
+        self.admin_call(ctx, "create the table", |admin| async move {
+            admin.create_table(table, descriptor, false).await?;
+            admin.get_table_info(table).await
+        })
+        .await
+    }
+
+    async fn alter_table(
+        &self,
+        ctx: &RequestContext,
+        table: &TablePath,
+        changes: AlterTableChanges,
+    ) -> GatewayResult<TableInfo> {
+        self.admin_call(ctx, "alter the table", |admin| async move {
+            admin.alter_table(table, false, changes).await?;
+            admin.get_table_info(table).await
+        })
+        .await
+    }
+
+    async fn drop_table(&self, ctx: &RequestContext, table: &TablePath) -> GatewayResult<()> {
+        self.admin_call(ctx, "drop the table", |admin| async move {
+            admin.drop_table(table, false).await
+        })
+        .await
+    }
+
+    async fn list_partitions(
+        &self,
+        ctx: &RequestContext,
+        table: &TablePath,
+    ) -> GatewayResult<Vec<PartitionInfo>> {
+        self.admin_call(ctx, "list the partitions", |admin| async move {
+            admin.list_partition_infos(table).await
+        })
+        .await
+    }
+
+    async fn create_partition(
+        &self,
+        ctx: &RequestContext,
+        table: &TablePath,
+        spec: &PartitionSpec,
+    ) -> GatewayResult<()> {
+        self.admin_call(ctx, "create the partition", |admin| async move {
+            admin.create_partition(table, spec, false).await
+        })
+        .await
+    }
+
+    async fn drop_partition(
+        &self,
+        ctx: &RequestContext,
+        table: &TablePath,
+        spec: &PartitionSpec,
+    ) -> GatewayResult<()> {
+        self.admin_call(ctx, "drop the partition", |admin| async move {
+            admin.drop_partition(table, spec, false).await
         })
         .await
     }
@@ -174,8 +248,6 @@ mod tests {
         ClusterConfig::default()
     }
 
-    /// Every configured cluster is routable in lexical order, and a malformed or unconfigured ID is
-    /// the same 404 — resolved from configuration alone, without any connection attempt.
     #[tokio::test]
     async fn routing_answers_only_from_configuration() {
         let backend = backend(&[("zeta", service_cluster()), ("alpha", service_cluster())]);
@@ -200,12 +272,9 @@ mod tests {
         );
     }
 
-    /// The backend constructs without touching the network, so both ways a dial can fail surface on
-    /// the first request rather than at startup. Shutdown then has nothing to close.
     #[tokio::test]
     async fn a_dial_failure_reaches_the_caller_classified() {
         let unreachable = ClusterConfig {
-            // Port 1 has no listener in any test environment; the connect timeout bounds the attempt.
             bootstrap_servers: "127.0.0.1:1".to_string(),
             connect_timeout: ConfigDuration::from_millis(200),
             ..service_cluster()
@@ -235,12 +304,6 @@ mod tests {
         (error.kind(), error.code())
     }
 
-    /// A server that accepts the connection and never answers must still end at the deadline.
-    ///
-    /// Nothing below the gateway ends this wait: `fluss-rs` has no per-RPC timeout, and the connect
-    /// timeout is already satisfied by the accepted TCP connection. Only [`RequestContext::run`] does.
-    /// The abandoned RPC stays registered on the native connection — see the note on
-    /// `NativeConnector::dial`.
     #[tokio::test]
     async fn a_server_that_never_answers_ends_at_the_request_deadline() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -250,7 +313,6 @@ mod tests {
         tokio::spawn(async move {
             let mut accepted = Vec::new();
             while let Ok((stream, _)) = listener.accept().await {
-                // Held open and never answered.
                 accepted.push(stream);
             }
         });

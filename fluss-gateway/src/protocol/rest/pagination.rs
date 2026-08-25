@@ -48,6 +48,7 @@ const TOKEN_VERSION: u32 = 1;
 pub enum Collection {
     Databases,
     Tables,
+    Partitions,
 }
 
 impl Collection {
@@ -55,6 +56,7 @@ impl Collection {
         match self {
             Self::Databases => "databases",
             Self::Tables => "tables",
+            Self::Partitions => "partitions",
         }
     }
 }
@@ -133,6 +135,31 @@ impl Page {
             .last()
             .filter(|_| has_more)
             .map(|last| encode_token(&self.cluster, self.collection, self.scope.as_deref(), last));
+        (page, next)
+    }
+
+    /// Paginates entries by a derived name.
+    pub fn apply_by<T>(
+        &self,
+        mut entries: Vec<T>,
+        key: impl Fn(&T) -> String,
+    ) -> (Vec<T>, Option<String>) {
+        entries.sort_unstable_by_key(|entry| key(entry));
+        let start = match &self.after {
+            Some(after) => entries.partition_point(|entry| key(entry).as_str() <= after.as_str()),
+            None => 0,
+        };
+        let mut page: Vec<T> = entries.split_off(start);
+        let has_more = page.len() > self.max_results;
+        page.truncate(self.max_results);
+        let next = page.last().filter(|_| has_more).map(|last| {
+            encode_token(
+                &self.cluster,
+                self.collection,
+                self.scope.as_deref(),
+                &key(last),
+            )
+        });
         (page, next)
     }
 }

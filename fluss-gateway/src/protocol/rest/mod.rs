@@ -26,6 +26,8 @@
 //! [`RequestContext`] carries into the backend.
 
 pub mod clusters;
+pub mod datatype;
+pub mod ddl;
 pub mod health;
 pub mod metadata;
 pub mod openapi;
@@ -291,6 +293,7 @@ pub fn build_router(state: RestState, options: &RestOptions) -> Router {
         .split_for_parts();
     let (metadata_router, metadata_api) = OpenApiRouter::new()
         .merge(metadata::routes())
+        .merge(ddl::routes())
         .split_for_parts();
     let (open_router, open_api) = OpenApiRouter::new()
         .merge(health::routes())
