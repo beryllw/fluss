@@ -27,10 +27,10 @@ use fluss::error::{Error as FlussClientError, FlussError};
 /// message.
 ///
 /// The rules the gateway commits to: an error code Fluss defines for a resource keeps that meaning,
-/// an authentication or authorization refusal stays a caller-visible 403, a retriable transport
-/// failure is a transient outage, and anything the client cannot classify is reported as a backend
-/// failure rather than a gateway-internal one. Messages carry the operation, never the native error
-/// text, which can contain addresses and payload detail; that goes to the log.
+/// service authentication or authorization failures are backend deployment faults, a retriable
+/// transport failure is a transient outage, and anything the client cannot classify is reported as a
+/// backend failure rather than a gateway-internal one. Messages carry the operation, never the native
+/// error text, which can contain addresses and payload detail; that goes to the log.
 pub(crate) fn map_fluss_error(what: &str, error: FlussClientError) -> GatewayError {
     if let Some(api_error) = error.api_error()
         && let Some(mapped) = map_api_error(what, api_error)
@@ -89,17 +89,10 @@ fn map_api_error(what: &str, api_error: FlussError) -> Option<GatewayError> {
                 "Fluss rejected the name while trying to {what}"
             ))
         }
-        // The gateway authenticated with the configured service credentials, so a refusal is a
-        // deployment fault an operator has to fix, not something a caller can retry into success.
-        FlussError::AuthenticateException => {
-            log::error!("Fluss refused the gateway's service credentials while trying to {what}");
-            GatewayError::unauthorized(format!(
-                "Fluss refused to authenticate the gateway while trying to {what}"
-            ))
-        }
-        FlussError::AuthorizationException => {
-            log::warn!("Fluss denied the operation while trying to {what}");
-            GatewayError::unauthorized(format!("Fluss denied the operation while trying to {what}"))
+        // Service identity is the only supported mode, so either refusal is a deployment fault.
+        FlussError::AuthenticateException | FlussError::AuthorizationException => {
+            log::error!("Fluss rejected the gateway's backend access while trying to {what}");
+            GatewayError::backend(format!("Fluss rejected the gateway while trying to {what}"))
         }
         _ => return None,
     })
@@ -157,13 +150,13 @@ pub(crate) mod tests {
             ),
             (
                 api_failure(FlussError::AuthenticateException),
-                ErrorKind::Unauthorized,
-                "unauthorized",
+                ErrorKind::Backend,
+                "backend",
             ),
             (
                 api_failure(FlussError::AuthorizationException),
-                ErrorKind::Unauthorized,
-                "unauthorized",
+                ErrorKind::Backend,
+                "backend",
             ),
             (
                 FlussClientError::UnsupportedVersion {

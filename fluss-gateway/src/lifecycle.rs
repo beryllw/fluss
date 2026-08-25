@@ -608,6 +608,9 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::FlussBackend;
+    use crate::backend::context::RequestContext;
+    use crate::error::ErrorKind;
     use std::sync::atomic::AtomicUsize;
 
     struct DropGuard(Arc<AtomicUsize>);
@@ -725,20 +728,24 @@ mod tests {
         );
     }
 
-    /// Shutdown releases the backend connections after the request drain, so a stopped process leaves no
-    /// Fluss connection behind. That the pool actually drains its connections is the pool's own test;
-    /// this one covers the lifecycle reaching it within the process deadline.
+    /// Shutdown permanently closes the backend caches. The real-cluster E2E covers an installed native
+    /// connection; the cache test covers draining it.
     #[tokio::test]
-    async fn shutdown_closes_every_backend_connection() {
+    async fn shutdown_permanently_closes_backend_caches() {
         let mut config = GatewayConfig::default();
         config.server.rest.bind_address = "127.0.0.1:0".parse().expect("valid address");
         config.server.metrics.enabled = false;
         let backend = Arc::new(NativeFlussBackend::from_config(&config));
 
-        let gateway = start_internal(config, backend)
+        let gateway = start_internal(config, backend.clone())
             .await
             .expect("the gateway starts");
         gateway.shutdown().await.expect("clean shutdown");
+
+        let context = RequestContext::for_test("default", Duration::from_secs(1));
+        let error = backend.list_databases(&context).await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unavailable);
+        assert_eq!(error.message(), "the Fluss connection cache is closed");
     }
 
     /// Timed-out tasks are aborted and joined before cleanup returns.
