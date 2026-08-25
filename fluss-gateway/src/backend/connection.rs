@@ -310,6 +310,8 @@ impl<K: Connector> ConnectionCache<K> {
 
     async fn dial_for(&self, key: &Arc<str>) -> GatewayResult<Arc<K::Conn>> {
         let entry = self.admit(key)?;
+        // TODO: Share one failed dial with its current waiters without caching it for later requests;
+        // see #4101.
         let _dialing = entry.dialing.lock().await;
 
         // The caller that won the previous dial may have installed the connection while this request

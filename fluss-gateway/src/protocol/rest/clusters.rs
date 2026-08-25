@@ -18,10 +18,8 @@
 //! Cluster discovery: `GET /v1/clusters`.
 
 use crate::error::ErrorEnvelope;
-use crate::protocol::rest::{
-    RestState, ensure_no_query, error_response, json_response, request_id,
-};
-use axum::extract::{Request, State};
+use crate::protocol::rest::{RestState, json_response};
+use axum::extract::State;
 use axum::response::Response;
 use serde::Serialize;
 use utoipa::ToSchema;
@@ -60,10 +58,7 @@ pub fn routes() -> OpenApiRouter<RestState> {
         (status = 504, description = "Request deadline exceeded", body = ErrorEnvelope),
     )
 )]
-pub(crate) async fn list_clusters(State(state): State<RestState>, request: Request) -> Response {
-    if let Err(error) = ensure_no_query(request.uri()) {
-        return error_response(&error, &request_id(&request));
-    }
+pub(crate) async fn list_clusters(State(state): State<RestState>) -> Response {
     let clusters = state
         .backend
         .clusters()

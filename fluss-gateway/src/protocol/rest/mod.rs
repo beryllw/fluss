@@ -53,6 +53,7 @@ use std::net::SocketAddr;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use utoipa_axum::router::OpenApiRouter;
 
@@ -121,6 +122,7 @@ pub struct RequestCancellation(CancellationToken);
 pub struct RestOptions {
     pub request_timeout: Duration,
     pub max_body_bytes: u64,
+    pub metadata_max_concurrent_requests: u32,
 }
 
 impl From<&RestServerConfig> for RestOptions {
@@ -128,6 +130,7 @@ impl From<&RestServerConfig> for RestOptions {
         Self {
             request_timeout: config.request_timeout.get(),
             max_body_bytes: config.max_body_bytes.bytes(),
+            metadata_max_concurrent_requests: config.metadata_max_concurrent_requests,
         }
     }
 }
@@ -213,16 +216,6 @@ pub(crate) fn validate_json_content_type(headers: &HeaderMap) -> Result<(), Gate
     }
 }
 
-/// Rejects any query string on endpoints that define no query parameters.
-pub fn ensure_no_query(uri: &Uri) -> Result<(), GatewayError> {
-    if uri.query().is_some() {
-        return Err(GatewayError::invalid_argument(
-            "this operation does not accept query parameters",
-        ));
-    }
-    Ok(())
-}
-
 /// The request ID the outermost middleware assigned, for a handler rendering its own envelope.
 pub(crate) fn request_id(request: &Request) -> RequestId {
     request
@@ -292,31 +285,70 @@ pub fn build(
 /// and later all data/control routes) carries the request-body size and deadline budget, with the
 /// acceptance guard outermost so draining answers 503 without consuming bodies.
 pub fn build_router(state: RestState, options: &RestOptions) -> Router {
-    let (guarded_router, guarded_api) = OpenApiRouter::new()
+    let (queryless_guarded, mut guarded_api) = OpenApiRouter::new()
         .merge(openapi::routes())
         .merge(clusters::routes())
+        .split_for_parts();
+    let (metadata_router, metadata_api) = OpenApiRouter::new()
         .merge(metadata::routes())
         .split_for_parts();
     let (open_router, open_api) = OpenApiRouter::new()
         .merge(health::routes())
         .split_for_parts();
 
-    let mut api = guarded_api;
-    api.merge(open_api);
-    let _ = state.openapi.set(openapi::finalize(api));
+    guarded_api.merge(metadata_api);
+    guarded_api.merge(open_api);
+    let _ = state.openapi.set(openapi::finalize(guarded_api));
 
     let backend = state.backend.clone();
+    let metadata_router =
+        apply_metadata_concurrency_limit(metadata_router, options.metadata_max_concurrent_requests);
+    let guarded_router = queryless_guarded
+        .route_layer(middleware::from_fn(reject_query_parameters))
+        .merge(metadata_router);
     // `apply_data_limits` also stamps the request deadline, so the guarded side needs no separate
     // `assign_request_deadline` layer.
     let guarded = apply_data_limits(guarded_router.with_state(state.clone()), options);
     let guarded = apply_acceptance_guard(guarded, state.readiness.clone());
     let open = open_router
+        .route_layer(middleware::from_fn(reject_query_parameters))
         .fallback(unknown_route)
         .with_state(state)
         .layer(middleware::from_fn(assign_request_deadline(
             options.request_timeout,
         )));
     apply_common_middleware(open.merge(guarded), Some(backend))
+}
+
+/// Rejects query strings only on the route groups whose OpenAPI operations declare none.
+async fn reject_query_parameters(request: Request, next: Next) -> Response {
+    if request.uri().query().is_some() {
+        return error_response(
+            &GatewayError::invalid_argument("this operation does not accept query parameters"),
+            &request_id(&request),
+        );
+    }
+    next.run(request).await
+}
+
+/// Bounds metadata work without queueing requests behind an overloaded backend.
+fn apply_metadata_concurrency_limit<S>(router: Router<S>, max_requests: u32) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    let permits = Arc::new(Semaphore::new(max_requests as usize));
+    router.route_layer(middleware::from_fn(move |request: Request, next: Next| {
+        let permits = permits.clone();
+        async move {
+            let Ok(_permit) = permits.try_acquire_owned() else {
+                return error_response(
+                    &GatewayError::resource_exhausted("too many concurrent metadata requests"),
+                    &request_id(&request),
+                );
+            };
+            next.run(request).await
+        }
+    }))
 }
 
 /// Rejects new application work after graceful draining starts while keeping `GET /health` available.
@@ -634,6 +666,7 @@ pub mod test_support {
         RestOptions {
             request_timeout: Duration::from_secs(5),
             max_body_bytes: 1024,
+            metadata_max_concurrent_requests: 16,
         }
     }
 
@@ -660,6 +693,7 @@ mod tests {
     use axum::routing::{get, post};
     use http_body_util::BodyExt;
     use serde::Deserialize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::ServiceExt;
 
     #[derive(Debug, Deserialize, PartialEq)]
@@ -710,26 +744,29 @@ mod tests {
     #[tokio::test]
     async fn unknown_route_yields_404_envelope() {
         let app = build_router(test_support::test_state(), &test_support::test_options());
-        let response = app
-            .oneshot(Request::builder().uri("/nope").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
+        for path in ["/nope", "/nope?unknown=value"] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
 
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let header_id = response
-            .headers()
-            .get("x-request-id")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string)
-            .expect("x-request-id header");
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+            let header_id = response
+                .headers()
+                .get("x-request-id")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+                .expect("x-request-id header");
 
-        let json = body_json(response).await;
-        assert_eq!(json["error"]["code"], "not_found");
-        assert_eq!(json["error"]["request_id"], header_id.as_str());
-        assert!(
-            json["error"]["message"].as_str().unwrap().contains("/nope"),
-            "message names the missing route: {json}"
-        );
+            let json = body_json(response).await;
+            assert_eq!(json["error"]["code"], "not_found", "{path}");
+            assert_eq!(json["error"]["request_id"], header_id.as_str(), "{path}");
+            assert!(
+                json["error"]["message"].as_str().unwrap().contains("/nope"),
+                "message names the missing route: {json}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -766,6 +803,7 @@ mod tests {
         let options = RestOptions {
             request_timeout: Duration::from_millis(50),
             max_body_bytes: 1024,
+            metadata_max_concurrent_requests: 16,
         };
         let app = apply_middleware(Router::new().route("/slow", get(slow)), &options);
 
@@ -818,6 +856,7 @@ mod tests {
         let options = RestOptions {
             request_timeout: REST_RESPONSE_GRACE + Duration::from_millis(400),
             max_body_bytes: 1024,
+            metadata_max_concurrent_requests: 16,
         };
         let app = apply_middleware(
             Router::new().route("/deadline", get(finishes_at_deadline)),
@@ -862,7 +901,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_requests_are_never_rejected_with_429() {
+    async fn generic_middleware_does_not_impose_a_global_concurrency_limit() {
         /// Holds a request open long enough for several to overlap.
         async fn slow() -> &'static str {
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -880,6 +919,60 @@ mod tests {
         for response in responses {
             assert_eq!(response.unwrap().status(), StatusCode::OK);
         }
+    }
+
+    #[tokio::test]
+    async fn metadata_concurrency_rejects_without_queueing_and_releases_its_permit() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler = {
+            let entered = entered.clone();
+            let release = release.clone();
+            let calls = calls.clone();
+            move || {
+                let entered = entered.clone();
+                let release = release.clone();
+                let calls = calls.clone();
+                async move {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        entered.notify_one();
+                        release.notified().await;
+                    }
+                    "ok"
+                }
+            }
+        };
+        let app = apply_common_middleware(
+            apply_metadata_concurrency_limit(Router::new().route("/metadata", get(handler)), 1),
+            None,
+        );
+        let request = || {
+            Request::builder()
+                .uri("/metadata")
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let first = tokio::spawn(app.clone().oneshot(request()));
+        entered.notified().await;
+
+        let rejected = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(rejected.headers()[header::RETRY_AFTER], "1");
+        assert_eq!(
+            body_json(rejected).await["error"]["code"],
+            "resource_exhausted"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        release.notify_one();
+        assert_eq!(first.await.unwrap().unwrap().status(), StatusCode::OK);
+        assert_eq!(
+            app.oneshot(request()).await.unwrap().status(),
+            StatusCode::OK
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

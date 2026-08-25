@@ -19,8 +19,9 @@
 //!
 //! Both handlers do the same four things and nothing else: check that the cluster is one this gateway
 //! serves (404), validate the page parameters (400), call the backend, and cut the page out of the
-//! answer. Every other status — 403, 503, 504 — comes from the [`crate::backend::FlussBackend`]
-//! error the call returned, so this module knows nothing about connections, identity modes, or capacity.
+//! answer. Every other status — 429, 500, 503, 504 — is emitted by shared admission or middleware,
+//! or propagated from [`crate::backend::FlussBackend`], so this module knows nothing about
+//! connections, identity modes, or capacity.
 
 use crate::backend::context::RequestContext;
 use crate::backend::types::ClusterId;
@@ -80,8 +81,9 @@ pub fn routes() -> OpenApiRouter<RestState> {
     responses(
         (status = 200, description = "Databases in lexical order", body = DatabasesResponse),
         (status = 400, description = "Invalid page parameter or page token", body = ErrorEnvelope),
-        (status = 403, description = "Fluss refused the operation", body = ErrorEnvelope),
         (status = 404, description = "Unknown cluster", body = ErrorEnvelope),
+        (status = 429, description = "Metadata concurrency limit exceeded", body = ErrorEnvelope),
+        (status = 500, description = "Fluss backend failure", body = ErrorEnvelope),
         (status = 503, description = "Fluss is unavailable, or the gateway is starting or shutting down", body = ErrorEnvelope),
         (status = 504, description = "Request deadline exceeded", body = ErrorEnvelope),
     )
@@ -123,8 +125,9 @@ pub(crate) async fn list_databases(
     responses(
         (status = 200, description = "Tables in lexical order", body = TablesResponse),
         (status = 400, description = "Invalid page parameter or page token", body = ErrorEnvelope),
-        (status = 403, description = "Fluss refused the operation", body = ErrorEnvelope),
         (status = 404, description = "Unknown cluster or database", body = ErrorEnvelope),
+        (status = 429, description = "Metadata concurrency limit exceeded", body = ErrorEnvelope),
+        (status = 500, description = "Fluss backend failure", body = ErrorEnvelope),
         (status = 503, description = "Fluss is unavailable, or the gateway is starting or shutting down", body = ErrorEnvelope),
         (status = 504, description = "Request deadline exceeded", body = ErrorEnvelope),
     )
@@ -317,9 +320,9 @@ mod tests {
                 "unavailable",
             ),
             (
-                GatewayError::unauthorized("Fluss denied the operation"),
-                StatusCode::FORBIDDEN,
-                "unauthorized",
+                GatewayError::backend("Fluss denied the gateway"),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "backend",
             ),
         ] {
             let backend = catalog();

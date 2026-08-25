@@ -80,6 +80,7 @@ pub(crate) fn finalize(api: utoipa::openapi::OpenApi) -> Value {
     tag = "metadata",
     responses(
         (status = 200, description = "OpenAPI 3.1 document"),
+        (status = 400, description = "This operation accepts no query parameters", body = ErrorEnvelope),
         (status = 405, description = "Wrong method for this route", body = ErrorEnvelope),
         (status = 413, description = "Request body above the configured limit", body = ErrorEnvelope),
         (status = 503, description = "Gateway starting or shutting down", body = ErrorEnvelope),
@@ -191,6 +192,28 @@ mod tests {
             "the envelope code refers to the generated vocabulary: {}",
             document["components"]["schemas"]["ErrorBody"]
         );
+    }
+
+    /// The document route follows the same strict query policy as every other endpoint.
+    #[tokio::test]
+    async fn document_route_rejects_query_parameters() {
+        let state = test_support::test_state();
+        state.readiness.set_serving();
+        let app = crate::protocol::rest::build_router(state, &test_support::test_options());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/openapi.json?format=yaml")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["code"], "invalid_argument");
     }
 
     /// The published `ErrorCode` vocabulary is generated from the taxonomy, so adding an [`ErrorKind`]

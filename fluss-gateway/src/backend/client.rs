@@ -21,8 +21,9 @@
 //! management: routing a request to its cluster and sharing its service-mode connection. None of that
 //! is visible above this module.
 //!
-//! Only this module and [`crate::backend::connection`] link against the Fluss client, so a native type
-//! never appears in a signature the protocol layer can see.
+//! This module and [`crate::backend::connection`] own native client handles, connection lifecycle, and
+//! transport error translation. Protocol adapters may still reuse stable `fluss-rs` domain types, such
+//! as metadata descriptors, when they fit the API instead of defining duplicate models.
 
 use crate::backend::FlussBackend;
 use crate::backend::connection::{ConnectionCache, NativeConnector};

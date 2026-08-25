@@ -140,6 +140,12 @@ paths:
               schema:
                 $ref: '#/components/schemas/HealthResponse'
           description: Gateway liveness and uptime
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: This operation accepts no query parameters
         '405':
           content:
             application/json:
@@ -164,6 +170,12 @@ paths:
               schema:
                 $ref: '#/components/schemas/ReadyResponse'
           description: The gateway accepts application traffic
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: This operation accepts no query parameters
         '405':
           content:
             application/json:
@@ -265,18 +277,24 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
           description: Invalid page parameter or page token
-        '403':
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorEnvelope'
-          description: Fluss refused the operation
         '404':
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
           description: Unknown cluster
+        '429':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Metadata concurrency limit exceeded
+        '500':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Fluss backend failure
         '503':
           content:
             application/json:
@@ -335,18 +353,24 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
           description: Invalid page parameter or page token
-        '403':
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorEnvelope'
-          description: Fluss refused the operation
         '404':
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
           description: Unknown cluster or database
+        '429':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Metadata concurrency limit exceeded
+        '500':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Fluss backend failure
         '503':
           content:
             application/json:
@@ -368,6 +392,12 @@ paths:
       responses:
         '200':
           description: OpenAPI 3.1 document
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: This operation accepts no query parameters
         '405':
           content:
             application/json:

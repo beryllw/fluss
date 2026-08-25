@@ -236,7 +236,8 @@ impl RunningGateway {
     /// that budget, so shutdown cannot hang on an unresponsive cluster.
     async fn close_backend(&self, deadline: tokio::time::Instant) -> Result<(), String> {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        match tokio::time::timeout(remaining, self.backend.close(remaining)).await {
+        let close_timeout = shutdown_work_budget(remaining);
+        match tokio::time::timeout(remaining, self.backend.close(close_timeout)).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(error)) => Err(format!("failed to close a Fluss backend: {error}")),
             Err(_) => {
@@ -379,12 +380,16 @@ fn cleanup_reserve(total: Duration) -> Duration {
     std::cmp::min(total / 10, MAX_CLEANUP_HEADROOM)
 }
 
-/// Splits the configured shutdown budget into the connection drain and the cleanup tail.
+/// Leaves a cleanup tail inside an outer shutdown budget.
 ///
-/// The drain has to end before the process deadline: otherwise `drain_tasks` aborts `serve()`
-/// mid-drain and the connection abort loses its join.
-fn connection_drain_budget(total: Duration) -> Duration {
+/// Inner drains must finish before their outer deadline so forced closes and task joins can complete.
+fn shutdown_work_budget(total: Duration) -> Duration {
     total.saturating_sub(cleanup_reserve(total))
+}
+
+/// Keeps the listener's graceful drain inside the process task deadline.
+fn connection_drain_budget(total: Duration) -> Duration {
+    shutdown_work_budget(shutdown_work_budget(total))
 }
 
 /// Binds one configured HTTP listener and adds a contextual startup error.
@@ -723,7 +728,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("gateway.rest.write.request-timeout must be greater than zero"),
+                .contains("gateway.rest.request-timeout must be greater than zero"),
             "got: {error}"
         );
     }
@@ -820,23 +825,44 @@ mod tests {
         assert!(tasks.is_empty());
     }
 
-    /// Every configured budget keeps a drain window and a cleanup tail, and the tail is capped.
+    /// Every nested shutdown layer finishes before the deadline that supervises it.
     #[test]
-    fn the_connection_drain_leaves_a_proportional_cleanup_tail() {
-        for (total, drain) in [
-            (Duration::from_secs(30), Duration::from_secs(28)),
-            (Duration::from_secs(20), Duration::from_secs(18)),
-            (Duration::from_secs(10), Duration::from_secs(9)),
-            (Duration::from_millis(100), Duration::from_millis(90)),
+    fn shutdown_budgets_leave_each_outer_layer_headroom() {
+        for (total, task_drain, connection_drain) in [
+            (
+                Duration::from_secs(30),
+                Duration::from_secs(28),
+                Duration::from_secs(26),
+            ),
+            (
+                Duration::from_secs(20),
+                Duration::from_secs(18),
+                Duration::from_millis(16_200),
+            ),
+            (
+                Duration::from_secs(10),
+                Duration::from_secs(9),
+                Duration::from_millis(8_100),
+            ),
+            (
+                Duration::from_millis(100),
+                Duration::from_millis(90),
+                Duration::from_millis(81),
+            ),
         ] {
-            assert_eq!(connection_drain_budget(total), drain, "total={total:?}");
+            assert_eq!(shutdown_work_budget(total), task_drain, "total={total:?}");
+            assert_eq!(
+                connection_drain_budget(total),
+                connection_drain,
+                "total={total:?}"
+            );
         }
     }
 
-    /// A handler that outlives the connection drain budget is aborted and joined before `serve`
-    /// returns, so no request work can continue once the process reports itself stopped.
+    /// A handler that outlives the connection drain is aborted and joined before the process task
+    /// deadline, so forced cleanup remains a successful shutdown rather than an outer timeout.
     #[tokio::test]
-    async fn a_handler_outlasting_the_drain_budget_is_dropped_before_serve_returns() {
+    async fn a_handler_outlasting_the_connection_drain_finishes_before_the_task_deadline() {
         /// Reports that the handler future was dropped rather than left running.
         struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
         impl Drop for DropFlag {
@@ -868,14 +894,20 @@ mod tests {
             .await
             .expect("bound");
         let address = listener.local_addr().expect("address");
+        let shutdown_timeout = Duration::from_secs(1);
         let shutdown = CancellationToken::new();
-        let serving = tokio::spawn(serve(
-            listener,
-            router,
-            Duration::from_secs(5),
-            Duration::from_millis(200),
-            shutdown.clone(),
-        ));
+        let mut tasks = JoinSet::new();
+        spawn_named(
+            &mut tasks,
+            "test listener",
+            serve(
+                listener,
+                router,
+                Duration::from_secs(5),
+                connection_drain_budget(shutdown_timeout),
+                shutdown.clone(),
+            ),
+        );
 
         // Send a request without reading the response, then wait until the handler is running.
         let request = tokio::spawn(async move {
@@ -898,16 +930,15 @@ mod tests {
             "the handler is still running before shutdown starts"
         );
 
+        let task_deadline = tokio::time::Instant::now() + shutdown_work_budget(shutdown_timeout);
         shutdown.cancel();
-        let result = tokio::time::timeout(Duration::from_secs(10), serving)
-            .await
-            .expect("serve returns within the test timeout")
-            .expect("serve does not panic");
+        let cleanup_error = drain_tasks(&mut tasks, task_deadline).await;
 
-        assert!(result.is_ok(), "{result:?}");
+        assert!(cleanup_error.is_none(), "{cleanup_error:?}");
+        assert!(tasks.is_empty());
         assert!(
             dropped.load(Ordering::SeqCst),
-            "the handler must be dropped before serve returns, not left running detached"
+            "the handler must be dropped before the task deadline, not left running detached"
         );
         request.abort();
     }

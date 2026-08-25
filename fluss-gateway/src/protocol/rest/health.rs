@@ -22,7 +22,7 @@
 //! `GET /ready` is the readiness counterpart: 200 only while the gateway accepts traffic.
 
 use crate::error::ErrorEnvelope;
-use crate::protocol::rest::{RequestId, RestState, error_response, json_response};
+use crate::protocol::rest::{RestState, error_response, json_response, request_id};
 use axum::extract::{Request, State};
 use axum::response::Response;
 use serde::Serialize;
@@ -53,6 +53,7 @@ pub struct HealthResponse {
     tag = "health",
     responses(
         (status = 200, description = "Gateway liveness and uptime", body = HealthResponse),
+        (status = 400, description = "This operation accepts no query parameters", body = ErrorEnvelope),
         (status = 405, description = "Wrong method for this route", body = ErrorEnvelope),
     )
 )]
@@ -84,6 +85,7 @@ pub struct ReadyResponse {
     tag = "health",
     responses(
         (status = 200, description = "The gateway accepts application traffic", body = ReadyResponse),
+        (status = 400, description = "This operation accepts no query parameters", body = ErrorEnvelope),
         (status = 405, description = "Wrong method for this route", body = ErrorEnvelope),
         (status = 503, description = "The gateway is starting or shutting down", body = ErrorEnvelope),
     )
@@ -92,14 +94,7 @@ pub(crate) async fn ready(State(state): State<RestState>, request: Request) -> R
     match state.readiness.ensure_accepting() {
         Ok(()) => json_response(&ReadyResponse { status: "ready" })
             .expect("the ready response is serializable"),
-        Err(error) => {
-            let request_id = request
-                .extensions()
-                .get::<RequestId>()
-                .cloned()
-                .unwrap_or_default();
-            error_response(&error, &request_id)
-        }
+        Err(error) => error_response(&error, &request_id(&request)),
     }
 }
 
@@ -171,6 +166,19 @@ mod tests {
         let response = get(app, "/health").await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(body_json(response).await["status"], "ok");
+    }
+
+    /// Endpoints without declared query parameters reject them consistently.
+    #[tokio::test]
+    async fn health_endpoints_reject_query_parameters() {
+        for path in ["/health?probe=deep", "/ready?probe=deep"] {
+            let response = get(app(), path).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+            assert_eq!(
+                body_json(response).await["error"]["code"],
+                "invalid_argument"
+            );
+        }
     }
 
     /// `/ready` is 200 only while the gateway accepts traffic, so load balancers stop sending

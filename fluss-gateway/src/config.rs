@@ -215,8 +215,10 @@ impl<'de> Deserialize<'de> for ByteSize {
 const INSTANCE_ID_KEY: &str = "gateway.instance-id";
 const REST_LISTEN_KEY: &str = "gateway.rest.listen";
 const REST_HEADER_READ_TIMEOUT_KEY: &str = "gateway.rest.header-read-timeout";
-const REST_REQUEST_TIMEOUT_KEY: &str = "gateway.rest.write.request-timeout";
+const REST_REQUEST_TIMEOUT_KEY: &str = "gateway.rest.request-timeout";
 const REST_MAX_REQUEST_BYTES_KEY: &str = "gateway.rest.write.max-request-bytes";
+const REST_METADATA_MAX_CONCURRENT_REQUESTS_KEY: &str =
+    "gateway.rest.metadata.max-concurrent-requests";
 const METRICS_ENABLED_KEY: &str = "gateway.metrics.enabled";
 const METRICS_EXPORTERS_KEY: &str = "gateway.metrics.exporters";
 const METRICS_LISTEN_KEY: &str = "gateway.metrics.exporter.prometheus.listen";
@@ -247,6 +249,7 @@ const REST_PREFIX_LOOKUP_MAX_CONCURRENT_REQUESTS_KEY: &str =
 const DEFAULT_REST_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
 const DEFAULT_REST_HEADER_READ_TIMEOUT: ConfigDuration = ConfigDuration::from_secs(10);
 const DEFAULT_REST_REQUEST_TIMEOUT: ConfigDuration = ConfigDuration::from_secs(30);
+const DEFAULT_REST_METADATA_MAX_CONCURRENT_REQUESTS: u32 = 16;
 
 /// Time reserved for encoding and sending an HTTP response after the handler deadline.
 pub(crate) const REST_RESPONSE_GRACE: Duration = Duration::from_secs(1);
@@ -448,6 +451,11 @@ const CONFIG_ENTRIES: &[GatewayConfigEntry] = &[
     ),
     typed_entry!(
         GatewayConfigEntry,
+        REST_METADATA_MAX_CONCURRENT_REQUESTS_KEY,
+        server.rest.metadata_max_concurrent_requests
+    ),
+    typed_entry!(
+        GatewayConfigEntry,
         REST_WRITE_MAX_ROWS_KEY,
         request_limits.write_max_rows
     ),
@@ -582,6 +590,8 @@ pub struct RestServerConfig {
     pub request_timeout: ConfigDuration,
     /// Maximum accepted request body size. Exceeding it yields 413.
     pub max_body_bytes: ByteSize,
+    /// Maximum metadata requests concurrently accessing Fluss. Exceeding it yields 429.
+    pub metadata_max_concurrent_requests: u32,
 }
 
 impl Default for RestServerConfig {
@@ -591,6 +601,7 @@ impl Default for RestServerConfig {
             header_read_timeout: DEFAULT_REST_HEADER_READ_TIMEOUT,
             request_timeout: DEFAULT_REST_REQUEST_TIMEOUT,
             max_body_bytes: DEFAULT_REST_MAX_REQUEST_BYTES,
+            metadata_max_concurrent_requests: DEFAULT_REST_METADATA_MAX_CONCURRENT_REQUESTS,
         }
     }
 }
@@ -610,6 +621,11 @@ impl RestServerConfig {
         if self.max_body_bytes.bytes() == 0 {
             problems.push(format!(
                 "{REST_MAX_REQUEST_BYTES_KEY} must be greater than zero"
+            ));
+        }
+        if self.metadata_max_concurrent_requests == 0 {
+            problems.push(format!(
+                "{REST_METADATA_MAX_CONCURRENT_REQUESTS_KEY} must be greater than zero"
             ));
         }
     }
@@ -1697,6 +1713,7 @@ mod tests {
             "127.0.0.1:8080".parse().unwrap()
         );
         assert_eq!(config.server.rest.max_body_bytes.bytes(), 32 * 1024 * 1024);
+        assert_eq!(config.server.rest.metadata_max_concurrent_requests, 16);
         assert_eq!(
             config.server.rest.request_timeout.get(),
             Duration::from_secs(30)
@@ -1744,7 +1761,8 @@ mod tests {
     gateway.instance-id: gateway-1
     gateway.rest.listen: 0.0.0.0:8080
     gateway.rest.write.max-request-bytes: 32MiB
-    gateway.rest.write.request-timeout: 30s
+    gateway.rest.request-timeout: 30s
+    gateway.rest.metadata.max-concurrent-requests: 16
     gateway.metrics.enabled: true
     gateway.metrics.exporters: prometheus
     gateway.metrics.exporter.prometheus.listen: 0.0.0.0:9095
@@ -1759,6 +1777,7 @@ mod tests {
             "0.0.0.0:8080".parse().unwrap()
         );
         assert_eq!(config.server.rest.max_body_bytes.bytes(), 32 * 1024 * 1024);
+        assert_eq!(config.server.rest.metadata_max_concurrent_requests, 16);
         assert_eq!(
             config.server.rest.request_timeout.get(),
             Duration::from_secs(30)
@@ -1948,7 +1967,7 @@ mod tests {
                 "127.0.0.1:18080".to_string(),
             ),
             (
-                "FLUSS_GATEWAY__REST__WRITE__REQUEST_TIMEOUT".to_string(),
+                "FLUSS_GATEWAY__REST__REQUEST_TIMEOUT".to_string(),
                 "5s".to_string(),
             ),
             (
@@ -2096,14 +2115,28 @@ mod tests {
 
         let errors = problems(config.validate().unwrap_err());
         assert!(
-            errors.iter().any(|error| {
-                error == "gateway.rest.write.request-timeout must be greater than zero"
-            }),
+            errors
+                .iter()
+                .any(|error| { error == "gateway.rest.request-timeout must be greater than zero" }),
             "got: {errors:?}"
         );
         assert!(
             errors.iter().any(|error| {
                 error == "gateway.shutdown.drain-timeout must not exceed 31536000 seconds"
+            }),
+            "got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn metadata_concurrency_limit_must_be_positive() {
+        let mut config = GatewayConfig::default();
+        config.server.rest.metadata_max_concurrent_requests = 0;
+
+        let errors = problems(config.validate().unwrap_err());
+        assert!(
+            errors.iter().any(|error| {
+                error == "gateway.rest.metadata.max-concurrent-requests must be greater than zero"
             }),
             "got: {errors:?}"
         );
@@ -2814,6 +2847,7 @@ mod tests {
             let (file_value, env_value) = match entry.key {
                 METRICS_ENABLED_KEY | REST_WRITE_RATE_LIMIT_ENABLED_KEY => ("true", "false"),
                 REST_WRITE_MAX_ROWS_KEY
+                | REST_METADATA_MAX_CONCURRENT_REQUESTS_KEY
                 | REST_WRITE_MAX_CONCURRENT_REQUESTS_KEY
                 | REST_WRITE_RATE_LIMIT_REQUESTS_PER_SECOND_KEY
                 | REST_LOOKUP_MAX_KEYS_KEY
