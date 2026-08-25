@@ -15,24 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The per-cluster connection pool a [`crate::backend::client::NativeFlussBackend`] owns.
+//! The connection cache for one configured Fluss cluster.
 //!
-//! One pool per configured cluster, one entry for its configured service account: lazy creation on the
-//! cold path, dial coalescing, and idle reclamation.
+//! Connections are indexed by effective Fluss user and multiplexed by `fluss-rs`. Service identity
+//! mode is the one-entry case: `ConnectionCache::key` always returns the configured service user.
+//! Concurrent cold requests for the same user serialize behind one dial. A cancelled request cancels
+//! its dial, releases the dial lock, and lets the next waiter retry; dial failures are not cached.
 //!
-//! **This is not a checkout pool.** A `fluss-rs` connection multiplexes: one connection serves any
-//! number of concurrent requests over a background reader, so there is no lease, no return, no maximum
-//! lifetime, and no liveness query. Database-connection-pool intuition does not apply.
-//!
-//! Two things this pool deliberately does not do. It does not retry a dial: `fluss-rs` already walks
-//! every bootstrap address and retries a single one with the same backoff a gateway retry would use.
-//! And it does not evict a connection when a request fails on it: a broken transport is reported per
-//! server and `RpcClient::get_connection` reconnects that one server, so discarding the logical client
-//! would only throw away its cluster metadata and cached sub-clients.
+//! Idle cleanup is based on the last acquisition time rather than a lease count. Configuration keeps
+//! the idle timeout above the longest backend operation, so no request can still be using a connection
+//! once it becomes eligible. Shutdown similarly relies on the process lifecycle draining request and
+//! cleaner tasks before calling `ConnectionCache::close`.
 
+use crate::backend::context::RequestContext;
 use crate::backend::errors::map_fluss_error;
 use crate::backend::types::ClusterId;
-use crate::config::{ClusterConfig, IdentityMode};
+use crate::config::{ClusterConfig, ConnectionSecurityProtocol, IdentityMode};
 use crate::error::{GatewayError, GatewayResult};
 use crate::observability;
 use fluss::client::FlussConnection;
@@ -40,69 +38,70 @@ use fluss::config::Config as NativeClientConfig;
 use fluss::error::Error as FlussClientError;
 use futures_util::future::join_all;
 use std::collections::HashMap;
-use std::fmt;
-use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::time::Duration;
+use tokio::time::Instant;
 
-/// Budget for draining one connection that idle reclamation took out of the pool.
-///
-/// It is idle by definition, so the drain normally completes at once; this only stops a stuck sender
-/// task from turning reclamation into a wait.
-const RECLAIM_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How often the process-owned cleaner scans every cluster cache.
+pub(crate) const CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
 
-/// The effective Fluss identity of one pooled connection.
+/// Per-connection budget for an idle close. Idle cleanup is best effort and must not stall later scans.
+const CLEANER_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Private cache key for a service connection without Fluss authentication.
 ///
-/// This is intentionally separate from [`crate::backend::context::Principal`], which describes the
-/// caller authenticated by the Gateway. Service mode keys on the Fluss authentication ID from cluster
-/// configuration. User mode will key on the authorization ID after `fluss-rs` can carry it; that mode
-/// remains rejected by configuration today.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum ConnectionKey {
-    Service {
-        /// The Gateway's Fluss service-account username, or `None` for a cluster without SASL.
-        authentication_id: Option<Arc<str>>,
-    },
-    // Kept in the key vocabulary now so the eventual user-mode implementation cannot reintroduce a
-    // Principal-shaped pool key. Configuration rejects that mode until fluss-rs supports authzid.
-    #[allow(dead_code)]
-    User {
-        /// The effective user sent to Fluss as the SASL authorization ID.
-        authorization_id: Arc<str>,
-    },
+/// A configured SASL service account and every future request-derived principal are non-blank, so this
+/// sentinel cannot collide with an authenticated effective user.
+const PLAINTEXT_SERVICE_USER: &str = "";
+
+/// The two Fluss-side users of one authenticated native connection.
+///
+/// `gateway_user` authenticates the connection. `fluss_user` is the effective user Fluss authorizes.
+/// They are the same configured service account today. Future user identity mode keeps the Gateway
+/// account in the first field and maps the request [`crate::backend::context::Principal`] into the
+/// second immediately before selecting a connection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FlussConnectionIdentity {
+    gateway_user: Arc<str>,
+    fluss_user: Arc<str>,
 }
 
-impl ConnectionKey {
-    fn service(config: &ClusterConfig) -> Self {
-        Self::Service {
-            authentication_id: config.service_account().map(Arc::from),
+impl FlussConnectionIdentity {
+    fn service(config: &ClusterConfig) -> Option<Self> {
+        if config.security_protocol == ConnectionSecurityProtocol::Plaintext {
+            return None;
         }
+        let service_user: Arc<str> = Arc::from(
+            config
+                .service_account()
+                .expect("validated SASL configuration has a service account"),
+        );
+        Some(Self {
+            gateway_user: service_user.clone(),
+            fluss_user: service_user,
+        })
+    }
+
+    fn gateway_user(&self) -> &str {
+        &self.gateway_user
+    }
+
+    fn fluss_user(&self) -> &str {
+        &self.fluss_user
     }
 }
 
-impl fmt::Display for ConnectionKey {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Service {
-                authentication_id: Some(authentication_id),
-            } => write!(formatter, "service:{authentication_id}"),
-            Self::Service {
-                authentication_id: None,
-            } => formatter.write_str("service:<anonymous>"),
-            Self::User { authorization_id } => write!(formatter, "user:{authorization_id}"),
-        }
-    }
-}
-
-/// Opens and releases the connections of one cluster.
+/// Opens and releases connections for one cluster.
 ///
-/// The pool owns the algorithm — admission, dial coalescing, reclamation — and this trait owns what a
-/// connection *is*, which is what lets the algorithm be tested without a cluster.
+/// The cache owns sharing and cleanup; this trait owns what a connection is, which lets those
+/// algorithms be tested without a cluster.
 pub(crate) trait Connector: Send + Sync + 'static {
     type Conn: Send + Sync + 'static;
 
     fn dial(
         &self,
-        key: &ConnectionKey,
+        identity: Option<&FlussConnectionIdentity>,
     ) -> impl Future<Output = Result<Self::Conn, FlussClientError>> + Send;
 
     /// Releases a connection, draining pending writes within `timeout`.
@@ -113,7 +112,7 @@ pub(crate) trait Connector: Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), FlussClientError>> + Send;
 }
 
-/// Dials the native Fluss client with the cluster's service credentials.
+/// Dials the native Fluss client with the cluster's configured security protocol.
 pub(crate) struct NativeConnector {
     config: NativeClientConfig,
 }
@@ -129,20 +128,22 @@ impl NativeConnector {
 impl Connector for NativeConnector {
     type Conn = FlussConnection;
 
-    /// The connection also has no per-RPC timeout, because `fluss-rs` only exposes
-    /// [`FlussConnection::new`]: `ServerConnection` deliberately stops cleaning up a request once it
-    /// went out, so a request that runs out of budget abandons its future while the RPC stays
-    /// registered, and a server that accepts connections but never answers leaks one entry per gateway
-    /// timeout. Idle reclamation is what frees them until `fluss-rs` can bound the RPC itself — dropping
-    /// the connection drops its whole in-flight map (the write path's counterpart of that gap is
-    /// apache/fluss#3861).
-    async fn dial(&self, key: &ConnectionKey) -> Result<FlussConnection, FlussClientError> {
-        match key {
-            ConnectionKey::Service { .. } => FlussConnection::new(self.config.clone()).await,
-            ConnectionKey::User { .. } => Err(FlussClientError::UnsupportedOperation {
-                message: "user identity mode requires SASL authorization ID support".to_string(),
-            }),
+    async fn dial(
+        &self,
+        identity: Option<&FlussConnectionIdentity>,
+    ) -> Result<FlussConnection, FlussClientError> {
+        if let Some(identity) = identity {
+            if identity.gateway_user() != identity.fluss_user() {
+                return Err(FlussClientError::UnsupportedOperation {
+                    message: "user identity mode requires SASL authorization ID support"
+                        .to_string(),
+                });
+            }
+            debug_assert_eq!(self.config.security_sasl_username, identity.gateway_user());
+        } else {
+            debug_assert!(!self.config.is_sasl_enabled());
         }
+        FlussConnection::new(self.config.clone()).await
     }
 
     async fn close(
@@ -154,160 +155,105 @@ impl Connector for NativeConnector {
     }
 }
 
-/// One connection key's slot, with the cheapest synchronisation each field allows.
-struct Entry<C> {
-    /// Set once by whoever wins the dial gate, having found it empty, and never replaced — so
-    /// steady-state reads are lock free, and a connection leaves the pool only with its entry.
-    current: OnceLock<Arc<C>>,
-    /// The dial critical section, per entry, so different identities dial in parallel. It carries
-    /// **only the last dial failure** — a dial outcome is the same for every waiter on this entry, so
-    /// it can be shared; a read or write failure belongs to one request and never lands here.
-    dial_gate: tokio::sync::Mutex<Option<(Instant, GatewayError)>>,
-    last_used: Mutex<Instant>,
+/// One effective user's cache entry.
+#[derive(Debug)]
+struct CachedConnection<C> {
+    /// Installed once for this entry and never replaced. Eviction removes the entire entry.
+    connection: OnceLock<Arc<C>>,
+    /// Serializes cold dials for this user without blocking dials for other users.
+    dialing: tokio::sync::Mutex<()>,
+    /// Milliseconds relative to [`ConnectionCache::origin`], updated whenever a request acquires the
+    /// entry. `fetch_max` prevents an older concurrent reader from moving the timestamp backwards.
+    last_access_ms: AtomicU64,
 }
 
-impl<C> Entry<C> {
-    fn new() -> Self {
+impl<C> CachedConnection<C> {
+    fn new(now_ms: u64) -> Self {
         Self {
-            current: OnceLock::new(),
-            dial_gate: tokio::sync::Mutex::new(None),
-            last_used: Mutex::new(Instant::now()),
+            connection: OnceLock::new(),
+            dialing: tokio::sync::Mutex::new(()),
+            last_access_ms: AtomicU64::new(now_ms),
         }
     }
 
-    fn connection(&self) -> Option<Arc<C>> {
-        self.current.get().cloned()
-    }
-
-    fn has_connection(&self) -> bool {
-        self.current.get().is_some()
-    }
-
-    fn install(&self, connection: Arc<C>) {
-        let _ = self.current.set(connection);
-    }
-
-    fn touch(&self) {
-        *self
-            .last_used
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Instant::now();
-    }
-
-    fn idle_for(&self) -> Duration {
-        self.last_used
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .elapsed()
+    fn touch(&self, now_ms: u64) {
+        self.last_access_ms.fetch_max(now_ms, Ordering::Relaxed);
     }
 }
 
-type Entries<C> = HashMap<ConnectionKey, Arc<Entry<C>>>;
+struct CacheState<C> {
+    closed: bool,
+    entries: HashMap<Arc<str>, Arc<CachedConnection<C>>>,
+}
 
-/// The connections of one cluster, keyed by identity.
-pub(crate) struct ClusterPool<K: Connector> {
+/// The connections of one configured Fluss cluster, indexed by effective Fluss user.
+pub(crate) struct ConnectionCache<K: Connector> {
     cluster: ClusterId,
-    /// Service mode has exactly one key, derived from the Fluss account rather than the request caller.
-    key: ConnectionKey,
-    /// A connection left idle this long has almost certainly been dropped by a NAT or load balancer
-    /// already, and rebuilding on the next request is cheaper than discovering that through a failed
-    /// one.
-    idle_timeout: Duration,
+    /// Service-mode cache key: the service account under SASL, or a private sentinel for plaintext.
+    gateway_user: Arc<str>,
+    identity: Option<FlussConnectionIdentity>,
     connector: K,
-    entries: RwLock<Entries<K::Conn>>,
+    idle_timeout: Duration,
+    origin: Instant,
+    state: RwLock<CacheState<K::Conn>>,
 }
 
-impl<K: Connector> ClusterPool<K> {
+impl<K: Connector> ConnectionCache<K> {
     pub(crate) fn new(cluster: ClusterId, config: &ClusterConfig, connector: K) -> Self {
         assert_eq!(
             config.identity_mode,
             IdentityMode::Service,
             "validated configuration must reject user identity mode"
         );
+        let identity = FlussConnectionIdentity::service(config);
+        let gateway_user = identity
+            .as_ref()
+            .map(|identity| identity.fluss_user.clone())
+            .unwrap_or_else(|| Arc::from(PLAINTEXT_SERVICE_USER));
         Self {
             cluster,
-            key: ConnectionKey::service(config),
-            idle_timeout: config.connection_idle_timeout(),
+            gateway_user,
+            identity,
             connector,
-            entries: RwLock::new(HashMap::new()),
+            idle_timeout: config.connection_idle_timeout.get(),
+            origin: Instant::now(),
+            state: RwLock::new(CacheState {
+                closed: false,
+                entries: HashMap::new(),
+            }),
         }
     }
 
-    /// The service connection, dialing it on the cold path.
+    /// Returns the shared connection for the request's effective Fluss user.
     ///
-    /// Concurrent first requests on one entry share a single dial and a single answer: the winner
-    /// installs the connection, and everyone whose wait overlapped a failed dial gets that failure
-    /// instead of piling further attempts onto an unreachable cluster.
-    pub(crate) async fn connection(&self) -> GatewayResult<Arc<K::Conn>> {
-        let key = &self.key;
-        // Taken before queueing, so "the dial that ran while I waited" is decidable.
-        let arrived = Instant::now();
-        let (admitted, expired) = {
-            let mut expired = Vec::new();
-            let admitted = self.admit(key, &mut expired);
-            (admitted, expired)
+    /// The dial belongs to the calling request. Cancelling the request drops the dial future and its
+    /// mutex guard; the next waiter then retries. A native dial failure is likewise not cached.
+    pub(crate) async fn connection(&self, ctx: &RequestContext) -> GatewayResult<Arc<K::Conn>> {
+        let key = self.key(ctx);
+        if let Some(connection) = self.hit(&key)? {
+            return Ok(connection);
+        }
+        self.dial_for(&key).await
+    }
+
+    /// Removes and closes connections whose last acquisition is beyond the configured idle timeout.
+    pub(crate) async fn clean_expired(&self) {
+        let connections = {
+            let mut state = self.write_state();
+            if state.closed {
+                return;
+            }
+            self.take_expired(&mut state)
         };
-        // Drained even when admission was refused: the connections are already out of the pool, so
-        // nothing else would ever close them.
-        self.close_expired(expired).await;
-        let entry = admitted?;
-        if let Some(live) = entry.connection() {
-            return Ok(live);
-        }
-
-        let mut gate = entry.dial_gate.lock().await;
-        if let Some(live) = entry.connection() {
-            return Ok(live);
-        }
-        if let Some((failed_at, error)) = gate.as_ref()
-            && *failed_at >= arrived
-        {
-            return Err(error.clone());
-        }
-
-        match self.connector.dial(key).await {
-            Ok(connection) => {
-                let connection = Arc::new(connection);
-                entry.install(connection.clone());
-                *gate = None;
-                observability::connection_created(self.cluster.as_str());
-                observability::connections_active(self.cluster.as_str(), self.active());
-                log::info!("connected to Fluss cluster `{}` as `{key}`", self.cluster);
-                Ok(connection)
-            }
-            Err(native) => {
-                let error = map_fluss_error("connect to Fluss", native);
-                *gate = Some((Instant::now(), error.clone()));
-                Err(error)
-            }
-        }
-    }
-
-    /// Releases entries nobody is using any more, draining each connection on the way out.
-    ///
-    /// A cluster that stops receiving requests never reaches [`Self::admit`]'s slow path again, so this
-    /// is the only thing that lets its connection go.
-    pub(crate) async fn reclaim_idle(&self) {
-        let expired = self.retain_live(&mut self.write_entries());
-        self.close_expired(expired).await;
-    }
-
-    /// Drains and releases the connections reclamation took out of the pool.
-    ///
-    /// Dropping them would not be enough: `WriterClient` has no `Drop`, so a dropped connection leaves
-    /// its sender task detached with nothing able to reach it — batches short of their linger are never
-    /// flushed, and the rows in them never get a verdict.
-    ///
-    /// Concurrent, because [`Self::admit`] drains on the request path: closing one after another would
-    /// charge a single request the timeout of every expired connection.
-    async fn close_expired(&self, expired: Vec<Arc<K::Conn>>) {
-        if expired.is_empty() {
+        if connections.is_empty() {
             return;
         }
+
         let results = join_all(
-            expired
-                .into_iter()
-                .map(|connection| self.connector.close(connection, RECLAIM_CLOSE_TIMEOUT)),
+            connections
+                .iter()
+                .cloned()
+                .map(|connection| self.connector.close(connection, CLEANER_CLOSE_TIMEOUT)),
         )
         .await;
         for result in results {
@@ -319,23 +265,27 @@ impl<K: Connector> ClusterPool<K> {
             }
             observability::connection_closed(self.cluster.as_str(), "idle");
         }
-        observability::connections_active(self.cluster.as_str(), self.active());
+        observability::connections_active(self.cluster.as_str(), self.live_count());
     }
 
-    /// Closes every connection within `timeout` and empties the pool. Idempotent.
-    pub(crate) async fn close_all(&self, timeout: Duration) -> GatewayResult<()> {
-        let connections: Vec<Arc<K::Conn>> = {
-            let mut entries = self.write_entries();
-            let taken = entries
-                .values()
-                .filter_map(|entry| entry.connection())
-                .collect();
-            entries.clear();
-            taken
+    /// Closes and removes every cached connection. Idempotent.
+    ///
+    /// The process lifecycle must drain every request and stop the cleaner before calling this method.
+    /// Consequently no dial or operation can race with the map drain; `closed` only prevents accidental
+    /// requests after that lifecycle boundary from opening a connection the process would not own.
+    pub(crate) async fn close(&self, timeout: Duration) -> GatewayResult<()> {
+        let connections = {
+            let mut state = self.write_state();
+            if state.closed {
+                return Ok(());
+            }
+            state.closed = true;
+            state
+                .entries
+                .drain()
+                .filter_map(|(_, entry)| entry.connection.get().cloned())
+                .collect::<Vec<_>>()
         };
-        if connections.is_empty() {
-            return Ok(());
-        }
 
         let closes = connections.len();
         let results = join_all(
@@ -344,89 +294,152 @@ impl<K: Connector> ClusterPool<K> {
                 .map(|connection| self.connector.close(connection, timeout)),
         )
         .await;
-        for _ in 0..closes {
+        let mut first_failure = None;
+        for result in results {
+            if let Err(error) = result {
+                first_failure = first_failure
+                    .or_else(|| Some(map_fluss_error("close the Fluss connection", error)));
+            }
             observability::connection_closed(self.cluster.as_str(), "shutdown");
         }
-        observability::connections_active(self.cluster.as_str(), 0);
-        results
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()
-            .map(|_| ())
-            .map_err(|error| map_fluss_error("close the Fluss connection", error))
+        if closes > 0 {
+            observability::connections_active(self.cluster.as_str(), 0);
+        }
+        first_failure.map_or(Ok(()), Err)
     }
 
-    /// Finds or admits the service entry, collecting into `expired` the connections its reclamation
-    /// pass took out of the pool for the caller to drain.
-    fn admit(
-        &self,
-        key: &ConnectionKey,
-        expired: &mut Vec<Arc<K::Conn>>,
-    ) -> GatewayResult<Arc<Entry<K::Conn>>> {
-        if let Some(entry) = self.read_entries().get(key) {
-            entry.touch();
-            return Ok(entry.clone());
+    async fn dial_for(&self, key: &Arc<str>) -> GatewayResult<Arc<K::Conn>> {
+        let entry = self.admit(key)?;
+        let _dialing = entry.dialing.lock().await;
+
+        // The caller that won the previous dial may have installed the connection while this request
+        // waited for the user-local mutex.
+        if let Some(connection) = entry.connection.get() {
+            entry.touch(self.elapsed_ms());
+            return Ok(connection.clone());
         }
 
-        let mut entries = self.write_entries();
-        if let Some(entry) = entries.get(key) {
-            entry.touch();
+        let connection = self
+            .connector
+            .dial(self.identity.as_ref())
+            .await
+            .map_err(|native| map_fluss_error("connect to Fluss", native))?;
+        Ok(self.install(&entry, connection))
+    }
+
+    fn install(&self, entry: &Arc<CachedConnection<K::Conn>>, connection: K::Conn) -> Arc<K::Conn> {
+        let connection = Arc::new(connection);
+        let installed = entry.connection.set(connection.clone());
+        assert!(
+            installed.is_ok(),
+            "a user-local dial mutex must allow only one connection installation"
+        );
+        entry.touch(self.elapsed_ms());
+        observability::connection_created(self.cluster.as_str());
+        observability::connections_active(self.cluster.as_str(), self.live_count());
+        if let Some(identity) = &self.identity {
+            log::info!(
+                "connected to Fluss cluster `{}` as Fluss user `{}` through Gateway user `{}`",
+                self.cluster,
+                identity.fluss_user(),
+                identity.gateway_user()
+            );
+        } else {
+            log::info!(
+                "connected to Fluss cluster `{}` without Fluss authentication",
+                self.cluster
+            );
+        }
+        connection
+    }
+
+    fn hit(&self, key: &str) -> GatewayResult<Option<Arc<K::Conn>>> {
+        let state = self.read_state();
+        if state.closed {
+            return Err(GatewayError::unavailable(
+                "the Fluss connection cache is closed",
+            ));
+        }
+        let Some(entry) = state.entries.get(key) else {
+            return Ok(None);
+        };
+        let Some(connection) = entry.connection.get() else {
+            return Ok(None);
+        };
+        entry.touch(self.elapsed_ms());
+        Ok(Some(connection.clone()))
+    }
+
+    fn admit(&self, key: &Arc<str>) -> GatewayResult<Arc<CachedConnection<K::Conn>>> {
+        {
+            let state = self.read_state();
+            if state.closed {
+                return Err(GatewayError::unavailable(
+                    "the Fluss connection cache is closed",
+                ));
+            }
+            if let Some(entry) = state.entries.get(key) {
+                // Refresh under the state lock so the cleaner cannot remove an entry being redialed.
+                entry.touch(self.elapsed_ms());
+                return Ok(entry.clone());
+            }
+        }
+
+        let mut state = self.write_state();
+        if state.closed {
+            return Err(GatewayError::unavailable(
+                "the Fluss connection cache is closed",
+            ));
+        }
+        if let Some(entry) = state.entries.get(key) {
+            entry.touch(self.elapsed_ms());
             return Ok(entry.clone());
         }
-        expired.extend(self.retain_live(&mut entries));
-        // Service mode has one immutable key, so no second entry can be admitted. User-mode capacity
-        // is added here only when that mode becomes constructible.
-        debug_assert!(entries.is_empty());
-        let entry = Arc::new(Entry::new());
-        entries.insert(key.clone(), entry.clone());
+        let entry = Arc::new(CachedConnection::new(self.elapsed_ms()));
+        state.entries.insert(key.clone(), entry.clone());
         Ok(entry)
     }
 
-    /// Drops the entries no caller holds any more and returns the connections among them, which the
-    /// caller has to drain.
-    ///
-    /// Two reference counts have to be one, and they mean different things. `strong_count(entry) == 1`
-    /// says nobody is inside [`Self::connection`], so removing the entry cannot orphan a connection
-    /// someone is about to install. `strong_count(connection) == 1` says no request is *using* it: a
-    /// request holds the connection, not the entry, for the whole operation, and `last_used` is stamped
-    /// before that operation starts — so the entry looks unreferenced and idle while the work is still
-    /// running. Both are evaluated under the write lock, and neither `Arc` escapes this module, so the
-    /// test is exact rather than heuristic.
-    fn retain_live(&self, entries: &mut Entries<K::Conn>) -> Vec<Arc<K::Conn>> {
+    /// The only identity-mode branch point. Service mode always has exactly one key; future user mode
+    /// maps the request principal into an effective Fluss user here.
+    fn key(&self, _ctx: &RequestContext) -> Arc<str> {
+        self.gateway_user.clone()
+    }
+
+    fn take_expired(&self, state: &mut CacheState<K::Conn>) -> Vec<Arc<K::Conn>> {
+        let now_ms = self.elapsed_ms();
+        let threshold_ms = u64::try_from(self.idle_timeout.as_millis()).unwrap_or(u64::MAX);
         let mut expired = Vec::new();
-        entries.retain(|key, entry| {
-            if Arc::strong_count(entry) > 1 {
+        state.entries.retain(|_, entry| {
+            if now_ms.saturating_sub(entry.last_access_ms.load(Ordering::Relaxed)) < threshold_ms {
                 return true;
             }
-            // An entry without a connection is what a failed or cancelled dial leaves behind.
-            let Some(connection) = entry.current.get() else {
-                return false;
-            };
-            if Arc::strong_count(connection) > 1 || entry.idle_for() < self.idle_timeout {
-                return true;
+            if let Some(connection) = entry.connection.get() {
+                expired.push(connection.clone());
             }
-            log::info!(
-                "reclaimed the idle Fluss connection of cluster `{}` for `{key}`",
-                self.cluster
-            );
-            expired.push(connection.clone());
             false
         });
         expired
     }
 
-    fn active(&self) -> usize {
-        self.read_entries()
+    fn live_count(&self) -> usize {
+        self.read_state()
+            .entries
             .values()
-            .filter(|entry| entry.has_connection())
+            .filter(|entry| entry.connection.get().is_some())
             .count()
     }
 
-    fn read_entries(&self) -> RwLockReadGuard<'_, Entries<K::Conn>> {
-        self.entries.read().unwrap_or_else(PoisonError::into_inner)
+    fn elapsed_ms(&self) -> u64 {
+        u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
-    fn write_entries(&self) -> RwLockWriteGuard<'_, Entries<K::Conn>> {
-        self.entries.write().unwrap_or_else(PoisonError::into_inner)
+    fn read_state(&self) -> RwLockReadGuard<'_, CacheState<K::Conn>> {
+        self.state.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn write_state(&self) -> RwLockWriteGuard<'_, CacheState<K::Conn>> {
+        self.state.write().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -437,9 +450,10 @@ mod tests {
     use crate::config::ConfigDuration;
     use crate::error::ErrorKind;
     use fluss::error::FlussError;
+    use futures_util::future::join_all;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// A stand-in connection: the pool never looks inside one, so identity by address is enough.
     #[derive(Debug)]
     struct FakeConnection;
 
@@ -450,12 +464,13 @@ mod tests {
         Hang,
     }
 
-    /// A connector that records what it was asked to do and answers from a scripted outcome.
     struct Dialer {
-        dials: Mutex<Vec<ConnectionKey>>,
+        dials: Mutex<Vec<Option<FlussConnectionIdentity>>>,
         closes: AtomicUsize,
         outcome: Mutex<Outcome>,
         latency: Duration,
+        active_dials: AtomicUsize,
+        max_active_dials: AtomicUsize,
     }
 
     impl Dialer {
@@ -465,6 +480,8 @@ mod tests {
                 closes: AtomicUsize::new(0),
                 outcome: Mutex::new(outcome),
                 latency,
+                active_dials: AtomicUsize::new(0),
+                max_active_dials: AtomicUsize::new(0),
             })
         }
 
@@ -476,17 +493,24 @@ mod tests {
             *self.outcome.lock().unwrap() = outcome;
         }
 
-        fn dialed(&self) -> Vec<String> {
-            self.dials
-                .lock()
-                .unwrap()
-                .iter()
-                .map(ToString::to_string)
-                .collect()
+        fn dialed(&self) -> Vec<Option<FlussConnectionIdentity>> {
+            self.dials.lock().unwrap().clone()
         }
 
         fn closes(&self) -> usize {
             self.closes.load(Ordering::SeqCst)
+        }
+
+        fn max_active_dials(&self) -> usize {
+            self.max_active_dials.load(Ordering::SeqCst)
+        }
+    }
+
+    struct ActiveDial(Arc<Dialer>);
+
+    impl Drop for ActiveDial {
+        fn drop(&mut self) {
+            self.0.active_dials.fetch_sub(1, Ordering::SeqCst);
         }
     }
 
@@ -495,12 +519,15 @@ mod tests {
 
         fn dial(
             &self,
-            key: &ConnectionKey,
+            identity: Option<&FlussConnectionIdentity>,
         ) -> impl Future<Output = Result<FakeConnection, FlussClientError>> + Send {
             let dialer = self.clone();
-            let key = key.clone();
+            let identity = identity.cloned();
             async move {
-                dialer.dials.lock().unwrap().push(key);
+                dialer.dials.lock().unwrap().push(identity);
+                let active = dialer.active_dials.fetch_add(1, Ordering::SeqCst) + 1;
+                dialer.max_active_dials.fetch_max(active, Ordering::SeqCst);
+                let _active = ActiveDial(dialer.clone());
                 let outcome = dialer.outcome.lock().unwrap().clone();
                 if !dialer.latency.is_zero() {
                     tokio::time::sleep(dialer.latency).await;
@@ -523,171 +550,213 @@ mod tests {
         }
     }
 
-    fn pool(dialer: &Arc<Dialer>, config: ClusterConfig) -> ClusterPool<Arc<Dialer>> {
-        ClusterPool::new(
+    fn cache(dialer: &Arc<Dialer>, config: ClusterConfig) -> ConnectionCache<Arc<Dialer>> {
+        ConnectionCache::new(
             ClusterId::try_from("default").unwrap(),
             &config,
             dialer.clone(),
         )
     }
 
-    fn service_pool(dialer: &Arc<Dialer>) -> ClusterPool<Arc<Dialer>> {
-        pool(dialer, ClusterConfig::default())
+    fn service_cache(dialer: &Arc<Dialer>) -> ConnectionCache<Arc<Dialer>> {
+        cache(dialer, service_config())
     }
 
-    /// A service pool whose entries expire immediately, so reclamation is observable without sleeping.
-    fn expiring_pool(dialer: &Arc<Dialer>) -> ClusterPool<Arc<Dialer>> {
-        pool(
-            dialer,
-            ClusterConfig {
-                connection_idle_timeout: Some(ConfigDuration::from_millis(0)),
-                ..ClusterConfig::default()
-            },
-        )
+    fn service_config() -> ClusterConfig {
+        ClusterConfig {
+            security_protocol: ConnectionSecurityProtocol::Sasl,
+            service_account: Some("gateway_svc".to_string()),
+            service_secret: Some(crate::config::Secret::new("secret")),
+            ..ClusterConfig::default()
+        }
     }
 
-    /// A burst of first requests dials once, and every caller gets that same connection.
+    fn context() -> RequestContext {
+        RequestContext::for_test("default", Duration::from_secs(5))
+    }
+
     #[tokio::test]
     async fn concurrent_first_requests_share_a_single_dial() {
         let dialer = Dialer::new(Outcome::Connect, Duration::from_millis(50));
-        let pool = Arc::new(service_pool(&dialer));
+        let cache = Arc::new(service_cache(&dialer));
 
         let connections = join_all((0..32).map(|_| {
-            let pool = pool.clone();
-            async move { pool.connection().await.unwrap() }
+            let cache = cache.clone();
+            async move { cache.connection(&context()).await.unwrap() }
         }))
         .await;
 
         assert_eq!(dialer.dialed().len(), 1);
+        assert_eq!(dialer.max_active_dials(), 1);
         assert!(
             connections
                 .windows(2)
                 .all(|pair| Arc::ptr_eq(&pair[0], &pair[1])),
-            "every caller must share the pooled connection"
+            "every caller must share the connection"
         );
-        assert_eq!(pool.active(), 1);
+        assert_eq!(cache.live_count(), 1);
     }
 
-    /// A dial failure is answered to everyone who waited for it, and leaves no entry behind to
-    /// occupy capacity; once the cluster answers again the next request reconnects.
     #[tokio::test]
-    async fn a_failed_dial_is_shared_and_leaves_no_entry() {
+    async fn concurrent_failures_are_serialized_but_not_cached() {
         let dialer = Dialer::new(
             Outcome::Fail(FlussError::NetworkException),
-            Duration::from_millis(50),
+            Duration::from_millis(10),
         );
-        let pool = Arc::new(service_pool(&dialer));
+        let cache = Arc::new(service_cache(&dialer));
 
         let failures = join_all((0..8).map(|_| {
-            let pool = pool.clone();
-            async move { pool.connection().await.unwrap_err() }
+            let cache = cache.clone();
+            async move { cache.connection(&context()).await.unwrap_err() }
         }))
         .await;
 
-        assert_eq!(dialer.dialed().len(), 1, "the waiters shared one dial");
-        for failure in &failures {
-            assert_eq!(failure.kind(), ErrorKind::Unavailable);
-        }
-        assert_eq!(pool.active(), 0);
-
-        dialer.set(Outcome::Connect);
-        assert!(pool.connection().await.is_ok());
+        assert!(
+            failures
+                .iter()
+                .all(|failure| failure.kind() == ErrorKind::Unavailable)
+        );
+        assert_eq!(dialer.dialed().len(), 8);
+        assert_eq!(dialer.max_active_dials(), 1);
+        assert_eq!(cache.live_count(), 0);
     }
 
-    /// The pool key names the configured Fluss account, not a Gateway request principal. The User
-    /// shape is reserved for the future SASL authorization ID and cannot be produced by this pool.
-    #[test]
-    fn the_connection_key_is_separate_from_the_request_principal() {
-        let dialer = Dialer::connecting();
-        let pool = pool(
+    #[tokio::test]
+    async fn a_cancelled_caller_releases_the_dial_for_the_next_request() {
+        let dialer = Dialer::new(Outcome::Hang, Duration::ZERO);
+        let cache = service_cache(&dialer);
+
+        let cancelled =
+            tokio::time::timeout(Duration::from_millis(20), cache.connection(&context())).await;
+        assert!(cancelled.is_err());
+
+        dialer.set(Outcome::Connect);
+        assert!(cache.connection(&context()).await.is_ok());
+        assert_eq!(dialer.dialed().len(), 2);
+        assert_eq!(dialer.max_active_dials(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_expired_failed_entry_is_not_removed_while_redialing() {
+        let dialer = Dialer::new(Outcome::Fail(FlussError::NetworkException), Duration::ZERO);
+        let cache = Arc::new(cache(
             &dialer,
             ClusterConfig {
-                service_account: Some("gateway_svc".to_string()),
-                service_secret: Some(crate::config::Secret::new("secret")),
-                ..ClusterConfig::default()
+                connection_idle_timeout: ConfigDuration::from_secs(2),
+                ..service_config()
+            },
+        ));
+
+        assert!(cache.connection(&context()).await.is_err());
+        tokio::time::advance(Duration::from_secs(2)).await;
+
+        dialer.set(Outcome::Hang);
+        let retry_cache = cache.clone();
+        let retry = tokio::spawn(async move { retry_cache.connection(&context()).await });
+        while dialer.dialed().len() < 2 {
+            tokio::task::yield_now().await;
+        }
+
+        cache.clean_expired().await;
+        assert_eq!(cache.read_state().entries.len(), 1);
+
+        let follower_cache = cache.clone();
+        let follower = tokio::spawn(async move { follower_cache.connection(&context()).await });
+        tokio::task::yield_now().await;
+        assert_eq!(dialer.dialed().len(), 2);
+        assert_eq!(dialer.max_active_dials(), 1);
+
+        retry.abort();
+        follower.abort();
+        assert!(retry.await.unwrap_err().is_cancelled());
+        assert!(follower.await.unwrap_err().is_cancelled());
+        dialer.set(Outcome::Connect);
+        assert!(cache.connection(&context()).await.is_ok());
+        assert_eq!(dialer.max_active_dials(), 1);
+        assert_eq!(cache.live_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn service_mode_uses_the_gateway_user_as_its_single_key() {
+        let dialer = Dialer::connecting();
+        let cache = service_cache(&dialer);
+        let first = context();
+        let second = RequestContext::for_test("default", Duration::from_secs(1));
+
+        assert_eq!(&*cache.key(&first), "gateway_svc");
+        assert_eq!(cache.key(&first), cache.key(&second));
+        drop(cache.connection(&first).await.unwrap());
+        assert_eq!(
+            dialer.dialed(),
+            [Some(FlussConnectionIdentity {
+                gateway_user: Arc::from("gateway_svc"),
+                fluss_user: Arc::from("gateway_svc"),
+            })]
+        );
+    }
+
+    #[tokio::test]
+    async fn plaintext_service_mode_uses_the_unauthenticated_key() {
+        let dialer = Dialer::connecting();
+        let cache = cache(&dialer, ClusterConfig::default());
+
+        assert_eq!(&*cache.key(&context()), PLAINTEXT_SERVICE_USER);
+        drop(cache.connection(&context()).await.unwrap());
+        assert_eq!(dialer.dialed(), [None]);
+    }
+
+    #[test]
+    fn access_time_never_moves_backwards() {
+        let entry = CachedConnection::<FakeConnection>::new(10);
+
+        entry.touch(20);
+        entry.touch(15);
+
+        assert_eq!(entry.last_access_ms.load(Ordering::Relaxed), 20);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_cleanup_releases_and_recreates_the_service_connection() {
+        let dialer = Dialer::connecting();
+        let cache = cache(
+            &dialer,
+            ClusterConfig {
+                connection_idle_timeout: ConfigDuration::from_secs(2),
+                ..service_config()
             },
         );
-        assert_eq!(
-            pool.key,
-            ConnectionKey::Service {
-                authentication_id: Some(Arc::from("gateway_svc"))
-            }
-        );
-        assert_ne!(
-            pool.key,
-            ConnectionKey::User {
-                authorization_id: Arc::from("gateway_svc")
-            }
-        );
-    }
+        drop(cache.connection(&context()).await.unwrap());
 
-    /// The maintenance tick reclaims an idle connection with no request to trigger admission, in
-    /// service mode too, and the next request rebuilds it.
-    ///
-    /// Reclaiming in service mode departs from FIP-49, which scopes `connection.idle-timeout` to user
-    /// mode; the reason is on [`ClusterPool::idle_timeout`].
-    #[tokio::test]
-    async fn the_maintenance_tick_reclaims_the_shared_connection() {
-        let dialer = Dialer::connecting();
-        let pool = expiring_pool(&dialer);
-
-        // Dropped, so the entry holds the only reference: what an operation that has returned leaves.
-        drop(pool.connection().await.unwrap());
-        pool.reclaim_idle().await;
-        assert_eq!(pool.active(), 0);
-        assert_eq!(dialer.closes(), 1);
-
-        pool.connection().await.unwrap();
-        assert_eq!(dialer.dialed().len(), 2, "the next request dialed again");
-    }
-
-    /// A connection a request is still using is never reclaimed, however idle its entry looks.
-    ///
-    /// The entry is unreferenced for the whole operation — the request holds the connection, not the
-    /// entry — and `last_used` was stamped before the operation began, so the idle timeout can pass
-    /// while the work runs. Closing it there would abort a write mid-flight.
-    #[tokio::test]
-    async fn a_connection_in_use_is_never_reclaimed() {
-        let dialer = Dialer::connecting();
-        let pool = expiring_pool(&dialer);
-
-        let in_use = pool.connection().await.unwrap();
-        pool.reclaim_idle().await;
-        assert_eq!(pool.active(), 1, "the operation is still holding it");
+        tokio::time::advance(Duration::from_millis(1999)).await;
+        cache.clean_expired().await;
         assert_eq!(dialer.closes(), 0);
+        assert_eq!(cache.live_count(), 1);
 
-        drop(in_use);
-        pool.reclaim_idle().await;
-        assert_eq!(pool.active(), 0);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        cache.clean_expired().await;
         assert_eq!(dialer.closes(), 1);
-    }
+        assert_eq!(cache.live_count(), 0);
 
-    /// A cancelled dial does not poison the service entry: the next request retries it.
-    #[tokio::test]
-    async fn a_cancelled_dial_can_be_retried() {
-        let dialer = Dialer::new(Outcome::Hang, Duration::ZERO);
-        let pool = service_pool(&dialer);
-
-        let cancelled = tokio::time::timeout(Duration::from_millis(20), pool.connection()).await;
-        assert!(cancelled.is_err(), "the dial must still be pending");
-
-        dialer.set(Outcome::Connect);
-        pool.connection().await.unwrap();
+        drop(cache.connection(&context()).await.unwrap());
         assert_eq!(dialer.dialed().len(), 2);
     }
 
-    /// Shutdown drains every connection, empties the pool, and repeats cleanly.
     #[tokio::test]
-    async fn close_drains_every_connection_and_repeats() {
+    async fn close_drains_connections_and_permanently_closes_the_cache() {
         let dialer = Dialer::connecting();
-        let pool = service_pool(&dialer);
-        pool.connection().await.unwrap();
+        let cache = service_cache(&dialer);
+        drop(cache.connection(&context()).await.unwrap());
 
-        pool.close_all(Duration::from_secs(1)).await.unwrap();
+        cache.close(Duration::from_secs(1)).await.unwrap();
         assert_eq!(dialer.closes(), 1);
-        assert_eq!(pool.active(), 0);
+        assert_eq!(cache.live_count(), 0);
 
-        pool.close_all(Duration::from_secs(1)).await.unwrap();
+        cache.close(Duration::from_secs(1)).await.unwrap();
         assert_eq!(dialer.closes(), 1);
+
+        let error = cache.connection(&context()).await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unavailable);
+        assert_eq!(error.message(), "the Fluss connection cache is closed");
+        assert_eq!(dialer.dialed().len(), 1);
     }
 }

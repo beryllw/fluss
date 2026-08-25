@@ -17,15 +17,15 @@
 
 //! The production [`FlussBackend`] over `fluss-rs`.
 //!
-//! It owns one `ClusterPool` per configured cluster, which is the whole of the gateway's connection
-//! management: routing a request to its cluster and sharing the connection of its configured service
-//! account. None of that is visible above this module.
+//! It owns one `ConnectionCache` per configured cluster, which is the whole of the gateway's connection
+//! management: routing a request to its cluster and sharing its service-mode connection. None of that
+//! is visible above this module.
 //!
 //! Only this module and [`crate::backend::connection`] link against the Fluss client, so a native type
 //! never appears in a signature the protocol layer can see.
 
 use crate::backend::FlussBackend;
-use crate::backend::connection::{ClusterPool, NativeConnector};
+use crate::backend::connection::{ConnectionCache, NativeConnector};
 use crate::backend::context::RequestContext;
 use crate::backend::errors::map_fluss_error;
 use crate::backend::types::ClusterId;
@@ -43,34 +43,35 @@ use std::time::Duration;
 pub struct NativeFlussBackend {
     /// The cluster routing table. Built from configuration and never mutated, so it needs no lock and
     /// no request can add, remove, or reorder a cluster.
-    pools: BTreeMap<ClusterId, ClusterPool<NativeConnector>>,
+    caches: BTreeMap<ClusterId, ConnectionCache<NativeConnector>>,
 }
 
 impl NativeFlussBackend {
     /// Performs no I/O: the process starts while Fluss is down, and the first request of a cluster
     /// dials it.
     pub fn from_config(config: &GatewayConfig) -> Self {
-        let pools = config
+        let caches = config
             .clusters
             .iter()
             .map(|(id, cluster)| {
                 let id = ClusterId::try_from(id.as_str())
                     .expect("configuration validation accepted every cluster ID");
-                let pool = ClusterPool::new(id.clone(), cluster, NativeConnector::new(cluster));
-                (id, pool)
+                let cache =
+                    ConnectionCache::new(id.clone(), cluster, NativeConnector::new(cluster));
+                (id, cache)
             })
             .collect();
-        Self { pools }
+        Self { caches }
     }
 
     /// Closes every connection of every cluster within `timeout`. Idempotent.
     ///
     /// Concurrent because the budget is the whole shutdown's, not each cluster's: closing sequentially
     /// would let one slow cluster consume the time the others need.
-    pub async fn close(&self, timeout: Duration) -> GatewayResult<()> {
-        let closes = join_all(self.pools.values().map(|pool| pool.close_all(timeout))).await;
+    pub(crate) async fn close(&self, timeout: Duration) -> GatewayResult<()> {
+        let closes = join_all(self.caches.values().map(|cache| cache.close(timeout))).await;
         let mut first_failure = None;
-        for (id, result) in self.pools.keys().zip(closes) {
+        for (id, result) in self.caches.keys().zip(closes) {
             if let Err(error) = result {
                 log::warn!("failed to close the connections of cluster `{id}`: {error}");
                 first_failure = first_failure.or(Some(error));
@@ -79,17 +80,15 @@ impl NativeFlussBackend {
         first_failure.map_or(Ok(()), Err)
     }
 
-    /// Releases the connections no request has used for the idle timeout.
-    ///
-    /// Driven by the process maintenance tick: a cluster that stops receiving requests would otherwise
-    /// hold its connection until shutdown.
-    pub async fn reclaim_idle(&self) {
-        join_all(self.pools.values().map(ClusterPool::reclaim_idle)).await;
+    /// Runs one idle scan for every configured cluster. Each cache logs its own best-effort close
+    /// failures, so a slow or unavailable cluster cannot suppress cleanup of the others.
+    pub(crate) async fn clean_expired_connections(&self) {
+        join_all(self.caches.values().map(ConnectionCache::clean_expired)).await;
     }
 
     /// The only place `cluster_not_found` originates.
-    fn pool_for(&self, ctx: &RequestContext) -> GatewayResult<&ClusterPool<NativeConnector>> {
-        self.pools
+    fn cache_for(&self, ctx: &RequestContext) -> GatewayResult<&ConnectionCache<NativeConnector>> {
+        self.caches
             .get(ctx.cluster_id())
             .ok_or_else(|| unknown_cluster(ctx.cluster_id().as_str()))
     }
@@ -101,8 +100,6 @@ impl NativeFlussBackend {
     /// reconnects that server on the next use, so the logical client recovers on its own; discarding it
     /// would only throw away its cluster metadata and cached sub-clients.
     ///
-    /// `connection` stays bound for the whole call on purpose: holding it is what keeps idle
-    /// reclamation off a connection still in use, and the admin client alone would not.
     async fn admin_call<T, F, Fut>(
         &self,
         ctx: &RequestContext,
@@ -113,9 +110,9 @@ impl NativeFlussBackend {
         F: FnOnce(Arc<FlussAdmin>) -> Fut,
         Fut: Future<Output = Result<T, FlussClientError>>,
     {
-        let pool = self.pool_for(ctx)?;
+        let cache = self.cache_for(ctx)?;
         ctx.run(async {
-            let connection = pool.connection().await?;
+            let connection = cache.connection(ctx).await?;
             let result = match connection.get_admin() {
                 Ok(admin) => operation(admin).await,
                 Err(error) => Err(error),
@@ -129,11 +126,11 @@ impl NativeFlussBackend {
 #[async_trait]
 impl FlussBackend for NativeFlussBackend {
     fn clusters(&self) -> Vec<ClusterId> {
-        self.pools.keys().cloned().collect()
+        self.caches.keys().cloned().collect()
     }
 
     fn has_cluster(&self, id: &str) -> bool {
-        ClusterId::try_from(id).is_ok_and(|id| self.pools.contains_key(&id))
+        ClusterId::try_from(id).is_ok_and(|id| self.caches.contains_key(&id))
     }
 
     async fn list_databases(&self, ctx: &RequestContext) -> GatewayResult<Vec<String>> {
@@ -172,14 +169,15 @@ mod tests {
         })
     }
 
+    fn service_cluster() -> ClusterConfig {
+        ClusterConfig::default()
+    }
+
     /// Every configured cluster is routable in lexical order, and a malformed or unconfigured ID is
     /// the same 404 — resolved from configuration alone, without any connection attempt.
     #[tokio::test]
     async fn routing_answers_only_from_configuration() {
-        let backend = backend(&[
-            ("zeta", ClusterConfig::default()),
-            ("alpha", ClusterConfig::default()),
-        ]);
+        let backend = backend(&[("zeta", service_cluster()), ("alpha", service_cluster())]);
 
         assert_eq!(
             backend
@@ -209,11 +207,11 @@ mod tests {
             // Port 1 has no listener in any test environment; the connect timeout bounds the attempt.
             bootstrap_servers: "127.0.0.1:1".to_string(),
             connect_timeout: ConfigDuration::from_millis(200),
-            ..ClusterConfig::default()
+            ..service_cluster()
         };
         let illegal = ClusterConfig {
             bootstrap_servers: "not-a-host-port".to_string(),
-            ..ClusterConfig::default()
+            ..service_cluster()
         };
         let backend = backend(&[("down", unreachable), ("bad_address", illegal)]);
 
@@ -260,7 +258,7 @@ mod tests {
             "default",
             ClusterConfig {
                 bootstrap_servers: address.to_string(),
-                ..ClusterConfig::default()
+                ..service_cluster()
             },
         )]);
         let ctx = RequestContext::for_test("default", Duration::from_millis(300));

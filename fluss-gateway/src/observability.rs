@@ -126,7 +126,7 @@ pub const METRIC_DEFINITIONS: &[MetricDefinition] = &[
         "fluss_gateway_connections_closed_total",
         MetricKind::Counter,
         None,
-        "Fluss connections released for a configured cluster, by why they were released.",
+        "Fluss connections released for a configured cluster. `reason` is `idle` or `shutdown`.",
         &["cluster", "reason"],
     ),
     // FIP-49 process and Tokio runtime families, sampled periodically by the runtime sampler.

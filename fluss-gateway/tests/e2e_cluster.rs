@@ -34,6 +34,8 @@ use support::{Api, ChildGuard, await_http_ok, binary, free_port};
 
 const DATABASE: &str = "gateway_e2e";
 const TABLE: &str = "events";
+const SERVICE_ACCOUNT: &str = "admin";
+const SERVICE_SECRET: &str = "admin-secret";
 
 /// A detached Docker cluster managed through the same helper used by the other language bindings.
 ///
@@ -41,7 +43,8 @@ const TABLE: &str = "events";
 struct FlussCluster {
     helper: PathBuf,
     name: String,
-    bootstrap_servers: String,
+    plaintext_bootstrap_servers: String,
+    sasl_bootstrap_servers: String,
     stopped: bool,
 }
 
@@ -60,12 +63,14 @@ impl FlussCluster {
         let mut cluster = Self {
             helper,
             name,
-            bootstrap_servers: String::new(),
+            plaintext_bootstrap_servers: String::new(),
+            sasl_bootstrap_servers: String::new(),
             stopped: false,
         };
         let output = Command::new(&cluster.helper)
             .args(["start", "--name"])
             .arg(&cluster.name)
+            .arg("--sasl")
             .args(["--port", &port.to_string()])
             .output()
             .expect("start the Fluss test cluster helper");
@@ -81,9 +86,13 @@ impl FlussCluster {
             .find_map(|line| line.strip_prefix("CLUSTER_JSON: "))
             .expect("cluster helper returns CLUSTER_JSON");
         let info: serde_json::Value = serde_json::from_str(json).expect("valid cluster JSON");
-        cluster.bootstrap_servers = info["bootstrap_servers"]
+        cluster.plaintext_bootstrap_servers = info["bootstrap_servers"]
             .as_str()
             .expect("cluster JSON contains bootstrap_servers")
+            .to_string();
+        cluster.sasl_bootstrap_servers = info["sasl_bootstrap_servers"]
+            .as_str()
+            .expect("SASL cluster JSON contains sasl_bootstrap_servers")
             .to_string();
         cluster
     }
@@ -113,21 +122,33 @@ fn stop_cluster(helper: &Path, name: &str) -> std::io::Result<std::process::Outp
     Command::new(helper).args(["stop", "--name", name]).output()
 }
 
-/// Finds adjacent host ports for the coordinator and the single tablet server.
+/// Finds the SASL and plaintext host-port pairs for the coordinator and single tablet server.
 fn free_cluster_port_pair() -> u16 {
     for _ in 0..100 {
-        let first = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a candidate port");
-        let port = first.local_addr().expect("candidate address").port();
-        let Some(next) = port.checked_add(1) else {
+        let candidate = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a candidate port");
+        let port = candidate.local_addr().expect("candidate address").port();
+        drop(candidate);
+        let Some(sasl_tablet) = port.checked_add(1) else {
             continue;
         };
-        if let Ok(second) = std::net::TcpListener::bind(("127.0.0.1", next)) {
-            drop(second);
-            drop(first);
+        let Some(plaintext_coordinator) = port.checked_add(100) else {
+            continue;
+        };
+        let Some(plaintext_tablet) = port.checked_add(101) else {
+            continue;
+        };
+        let mut reservations = Vec::new();
+        for candidate in [port, sasl_tablet, plaintext_coordinator, plaintext_tablet] {
+            match std::net::TcpListener::bind(("127.0.0.1", candidate)) {
+                Ok(listener) => reservations.push(listener),
+                Err(_) => break,
+            }
+        }
+        if reservations.len() == 4 {
             return port;
         }
     }
-    panic!("failed to find adjacent ports for a Fluss test cluster");
+    panic!("failed to find the four ports for a SASL Fluss test cluster");
 }
 
 /// Writes the production Gateway configuration that points its default cluster at the test cluster.
@@ -135,6 +156,7 @@ fn write_gateway_config(
     directory: &tempfile::TempDir,
     port: u16,
     bootstrap_servers: &str,
+    security_protocol: &str,
 ) -> std::path::PathBuf {
     let path = directory.path().join("gateway.yaml");
     let mut file = std::fs::File::create(&path).expect("create gateway config");
@@ -145,44 +167,35 @@ fn write_gateway_config(
         "gateway.cluster.default.bootstrap.servers: {bootstrap_servers}"
     )
     .expect("write Fluss bootstrap servers");
+    writeln!(
+        file,
+        "gateway.cluster.default.connection.security.protocol: {security_protocol}"
+    )
+    .expect("write Fluss security protocol");
+    if security_protocol == "sasl" {
+        writeln!(
+            file,
+            "gateway.cluster.default.connection.service.account: {SERVICE_ACCOUNT}"
+        )
+        .expect("write Gateway service account");
+        writeln!(
+            file,
+            "gateway.cluster.default.connection.service.secret: {SERVICE_SECRET}"
+        )
+        .expect("write Gateway service secret");
+    }
     path
 }
 
-#[tokio::test]
-async fn metadata_apis_read_the_catalog_of_a_real_fluss_cluster() {
-    let cluster = tokio::task::spawn_blocking(|| FlussCluster::start(free_cluster_port_pair()))
-        .await
-        .expect("cluster startup task");
-
-    let connection = FlussConnection::new(Config {
-        bootstrap_servers: cluster.bootstrap_servers.clone(),
-        ..Default::default()
-    })
-    .await
-    .expect("connect the catalog setup client");
-    let admin = connection.get_admin().expect("get Fluss admin client");
-    admin
-        .create_database(DATABASE, None, false)
-        .await
-        .expect("create the E2E database");
-    let descriptor = TableDescriptor::builder()
-        .schema(
-            Schema::builder()
-                .column("id", DataTypes::int())
-                .column("payload", DataTypes::string())
-                .build()
-                .expect("build the E2E schema"),
-        )
-        .build()
-        .expect("build the E2E table descriptor");
-    admin
-        .create_table(&TablePath::new(DATABASE, TABLE), &descriptor, false)
-        .await
-        .expect("create the E2E table");
-
+async fn assert_metadata_apis(bootstrap_servers: &str, security_protocol: &str) {
     let gateway_port = free_port();
     let directory = tempfile::tempdir().expect("temporary Gateway config directory");
-    let config = write_gateway_config(&directory, gateway_port, &cluster.bootstrap_servers);
+    let config = write_gateway_config(
+        &directory,
+        gateway_port,
+        bootstrap_servers,
+        security_protocol,
+    );
     let child = binary()
         .arg("--config")
         .arg(config)
@@ -219,6 +232,47 @@ async fn metadata_apis_read_the_catalog_of_a_real_fluss_cluster() {
     gateway.send_sigterm();
     let status = gateway.wait_for_exit(Duration::from_secs(35)).await;
     assert_eq!(status.code(), Some(0), "Gateway drains cleanly");
+}
+
+#[tokio::test]
+async fn metadata_apis_support_plaintext_and_sasl_fluss_clusters() {
+    let cluster = tokio::task::spawn_blocking(|| FlussCluster::start(free_cluster_port_pair()))
+        .await
+        .expect("cluster startup task");
+
+    let connection = FlussConnection::new(Config {
+        bootstrap_servers: cluster.sasl_bootstrap_servers.clone(),
+        security_protocol: "sasl".to_string(),
+        security_sasl_mechanism: "PLAIN".to_string(),
+        security_sasl_username: SERVICE_ACCOUNT.to_string(),
+        security_sasl_password: SERVICE_SECRET.to_string(),
+        ..Default::default()
+    })
+    .await
+    .expect("connect the catalog setup client");
+    let admin = connection.get_admin().expect("get Fluss admin client");
+    admin
+        .create_database(DATABASE, None, false)
+        .await
+        .expect("create the E2E database");
+    let descriptor = TableDescriptor::builder()
+        .schema(
+            Schema::builder()
+                .column("id", DataTypes::int())
+                .column("payload", DataTypes::string())
+                .build()
+                .expect("build the E2E schema"),
+        )
+        .build()
+        .expect("build the E2E table descriptor");
+    admin
+        .create_table(&TablePath::new(DATABASE, TABLE), &descriptor, false)
+        .await
+        .expect("create the E2E table");
+
+    assert_metadata_apis(&cluster.plaintext_bootstrap_servers, "plaintext").await;
+    assert_metadata_apis(&cluster.sasl_bootstrap_servers, "sasl").await;
+
     connection
         .close(Duration::from_secs(10))
         .await

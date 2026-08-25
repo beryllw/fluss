@@ -36,10 +36,15 @@ HTTP listener with its request-id, body-size and deadline middleware,
 `GET /health`, `GET /ready`, `GET /v1/openapi.json`, `GET /v1/clusters`,
 `GET /v1/clusters/{cluster}/databases`,
 `GET /v1/clusters/{cluster}/databases/{database}/tables`, the Prometheus
-listener, and the backend runtime that owns one connection pool per configured
-cluster: a connection is opened lazily on the first request that needs it, shared
-by every request to that cluster under its configured service account, and
-drained and released once it has been idle for `connection.idle-timeout`. A
+listener, and the backend runtime that owns one shared service connection per
+configured cluster. A connection is opened lazily on the first request that
+needs it, shared by every request to that cluster, released after the configured
+`connection.idle-timeout`, and drained during shutdown. Concurrent cold requests
+serialize behind one connection attempt. Cancelling that request cancels its
+attempt and lets the next waiter retry; bootstrap timeout and retry behavior remain
+owned by `fluss-rust`.
+Connections use Fluss's default plaintext protocol unless
+`connection.security.protocol: sasl` selects the configured service account. A
 broken transport is left to the native client, which reconnects the affected
 server on its own.
 `connection.identity-mode: user` is refused at startup until Fluss supports
@@ -69,11 +74,21 @@ just licenses     # cargo deny check licenses
 ```
 
 The E2E test requires Docker. It builds and invokes the `fluss-test-cluster`
-helper from the `fluss-rust` workspace, creates catalog objects with `fluss-rs`,
-starts the compiled Gateway binary, and verifies the cluster, database, and
-table REST APIs over a real TCP listener. Set `FLUSS_IMAGE` and `FLUSS_VERSION`
-to select the Fluss image; CI builds and uses `fluss:dev` from the same source
+helper from the `fluss-rust` workspace, creates catalog objects in a real Fluss
+cluster, then verifies the cluster, database, and table REST APIs through both
+its plaintext and SASL endpoints. Set `FLUSS_IMAGE` and `FLUSS_VERSION` to
+select the Fluss image; CI builds and uses `fluss:dev` from the same source
 revision.
+
+Plaintext is the default and must not carry service credentials. To use
+SASL/PLAIN, configure all three options explicitly:
+
+```yaml
+gateway.cluster.default.connection.security.protocol: sasl
+gateway.cluster.default.connection.service.account: gateway_svc
+gateway.cluster.default.connection.service.secret: change-me
+gateway.cluster.default.connection.idle-timeout: 10m
+```
 
 The MSRV can be verified locally with `cargo +1.88.0 check --all-targets`.
 

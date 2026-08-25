@@ -30,16 +30,16 @@ use tokio_util::sync::CancellationToken;
 /// The caller identity produced by the Gateway authenticator.
 ///
 /// A principal describes only the client-to-Gateway request. It is deliberately not hashable and
-/// carries no service-account sentinel: the connection layer derives its own key from cluster
-/// configuration and, in future user mode, from the effective authorization ID.
+/// carries no Fluss connection identity: the native backend maps it immediately before choosing a
+/// connection when user identity mode is implemented.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Principal {
     name: Arc<str>,
-    attributes: Arc<BTreeMap<String, String>>,
+    attributes: Arc<BTreeMap<String, Vec<String>>>,
 }
 
 impl Principal {
-    pub fn new(name: impl Into<Arc<str>>, attributes: BTreeMap<String, String>) -> Self {
+    pub fn new(name: impl Into<Arc<str>>, attributes: BTreeMap<String, Vec<String>>) -> Self {
         Self {
             name: name.into(),
             attributes: Arc::new(attributes),
@@ -50,22 +50,12 @@ impl Principal {
         &self.name
     }
 
-    pub fn attributes(&self) -> &BTreeMap<String, String> {
+    pub fn attributes(&self) -> &BTreeMap<String, Vec<String>> {
         &self.attributes
     }
 }
 
-/// Whether a request has passed through an authenticator.
-///
-/// Anonymous is a state rather than the reserved principal name `anonymous`, so a future real user
-/// with that name cannot collide with an unauthenticated caller.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CallerIdentity {
-    Anonymous,
-    Authenticated(Principal),
-}
-
-/// One request's deadline, cancellation signal, caller identity, and cluster.
+/// One request's deadline, cancellation signal, principal, and cluster.
 #[derive(Clone, Debug)]
 pub struct RequestContext {
     request_id: Arc<str>,
@@ -74,7 +64,9 @@ pub struct RequestContext {
     deadline: Instant,
     /// Cancelled when the caller goes away or the process drains.
     cancellation: CancellationToken,
-    caller: CallerIdentity,
+    /// `None` means the request has not been authenticated. It is not represented by a reserved
+    /// principal name, so a real caller named `anonymous` remains unambiguous.
+    principal: Option<Principal>,
 }
 
 impl RequestContext {
@@ -83,14 +75,14 @@ impl RequestContext {
         cluster_id: ClusterId,
         deadline: Instant,
         cancellation: CancellationToken,
-        caller: CallerIdentity,
+        principal: Option<Principal>,
     ) -> Self {
         Self {
             request_id: request_id.into(),
             cluster_id,
             deadline,
             cancellation,
-            caller,
+            principal,
         }
     }
 
@@ -133,16 +125,9 @@ impl RequestContext {
         &self.cancellation
     }
 
-    pub fn caller(&self) -> &CallerIdentity {
-        &self.caller
-    }
-
     /// The authenticated caller, once authentication is implemented.
     pub fn principal(&self) -> Option<&Principal> {
-        match &self.caller {
-            CallerIdentity::Anonymous => None,
-            CallerIdentity::Authenticated(principal) => Some(principal),
-        }
+        self.principal.as_ref()
     }
 
     pub fn cluster_id(&self) -> &ClusterId {
@@ -161,7 +146,7 @@ impl RequestContext {
             ClusterId::try_from(cluster).expect("valid test cluster ID"),
             Instant::now() + budget,
             CancellationToken::new(),
-            CallerIdentity::Anonymous,
+            None,
         )
     }
 }
@@ -180,16 +165,26 @@ mod tests {
     use crate::error::ErrorKind;
 
     #[test]
-    fn an_authenticated_principal_is_distinct_from_the_anonymous_state() {
+    fn an_authenticated_principal_is_distinct_from_an_unauthenticated_request() {
         let principal = Principal::new(
             "anonymous",
-            BTreeMap::from([("tenant".to_string(), "sales".to_string())]),
+            BTreeMap::from([("tenant".to_string(), vec!["sales".to_string()])]),
         );
-        let caller = CallerIdentity::Authenticated(principal.clone());
+        let ctx = RequestContext::new(
+            "request",
+            ClusterId::try_from("default").unwrap(),
+            Instant::now() + Duration::from_secs(1),
+            CancellationToken::new(),
+            Some(principal),
+        );
 
-        assert_ne!(caller, CallerIdentity::Anonymous);
-        assert_eq!(principal.name(), "anonymous");
-        assert_eq!(principal.attributes()["tenant"], "sales");
+        assert_eq!(ctx.principal().unwrap().name(), "anonymous");
+        assert_eq!(ctx.principal().unwrap().attributes()["tenant"], ["sales"]);
+        assert!(
+            RequestContext::for_test("default", Duration::from_secs(1))
+                .principal()
+                .is_none()
+        );
     }
 
     /// The three outcomes `run` has to keep apart, and the fact that the operation is abandoned in two

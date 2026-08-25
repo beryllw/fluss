@@ -277,12 +277,6 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
           description: Unknown cluster
-        '429':
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorEnvelope'
-          description: The cluster's connection limit is reached
         '503':
           content:
             application/json:
@@ -353,12 +347,6 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
           description: Unknown cluster or database
-        '429':
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorEnvelope'
-          description: The cluster's connection limit is reached
         '503':
           content:
             application/json:

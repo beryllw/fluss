@@ -26,6 +26,7 @@
 //! no work that another instance would have to pick up.
 
 use crate::backend::client::NativeFlussBackend;
+use crate::backend::connection::CLEANUP_INTERVAL;
 use crate::config::GatewayConfig;
 use crate::error::{GatewayError, panic_message};
 use crate::observability;
@@ -167,8 +168,8 @@ impl Readiness {
 pub struct RunningGateway {
     local_addr: std::net::SocketAddr,
     metrics_addr: Option<std::net::SocketAddr>,
-    /// Held as the concrete type: shutdown and idle reclamation are not part of the backend contract a
-    /// protocol adapter sees.
+    /// Held as the concrete type because shutdown is not part of the backend contract a protocol
+    /// adapter sees.
     backend: Arc<NativeFlussBackend>,
     readiness: Arc<Readiness>,
     drain_timeout: Duration,
@@ -302,6 +303,17 @@ async fn start_internal(
     let connection_drain = connection_drain_budget(config.shutdown.drain_timeout.get());
     let shutdown = CancellationToken::new();
     let mut tasks = JoinSet::new();
+    let cleaner_backend = backend.clone();
+    let cleaner_shutdown = shutdown.clone();
+    spawn_named(&mut tasks, "connection cleaner", async move {
+        let mut interval = tokio::time::interval(CLEANUP_INTERVAL);
+        loop {
+            tokio::select! {
+                () = cleaner_shutdown.cancelled() => return Ok(()),
+                _ = interval.tick() => cleaner_backend.clean_expired_connections().await,
+            }
+        }
+    });
     spawn_named(
         &mut tasks,
         "REST listener",
@@ -339,21 +351,6 @@ async fn start_internal(
         });
     }
 
-    // Releases connections no request has used for the configured idle timeout. A cluster that stops
-    // receiving requests never reaches the pool's admission path again, so without this its connection
-    // would live until shutdown — long after any NAT or load balancer has dropped it.
-    let reclaim_backend = backend.clone();
-    let reclaim_shutdown = shutdown.clone();
-    spawn_named(&mut tasks, "connection reclaimer", async move {
-        let mut interval = tokio::time::interval(CONNECTION_RECLAIM_INTERVAL);
-        loop {
-            tokio::select! {
-                () = reclaim_shutdown.cancelled() => return Ok(()),
-                _ = interval.tick() => reclaim_backend.reclaim_idle().await,
-            }
-        }
-    });
-
     readiness.set_serving();
     log::info!("fluss-gateway REST listener serving at {local_addr}");
     if let Some(address) = metrics_addr {
@@ -369,12 +366,6 @@ async fn start_internal(
         tasks,
     })
 }
-
-/// How often idle pooled connections are reclaimed.
-///
-/// Reclaiming is cheap and never urgent — a connection released a minute late costs nothing — so the
-/// interval keeps the steady-state cost invisible rather than being prompt.
-const CONNECTION_RECLAIM_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Upper bound on the tail [`cleanup_reserve`] keeps for post-drain cleanup.
 const MAX_CLEANUP_HEADROOM: Duration = Duration::from_secs(2);

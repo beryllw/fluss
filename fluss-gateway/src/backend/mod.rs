@@ -22,8 +22,8 @@
 //! below this trait. That boundary is what lets the REST layer be tested without a cluster and lets a
 //! second protocol be added without reimplementing any of it.
 //!
-//! A backend **owns its connections**. Shutdown and idle reclamation are methods on the concrete type
-//! rather than on this trait, so a protocol adapter cannot reach them.
+//! A backend **owns its connections**. Shutdown is a method on the concrete type rather than on this
+//! trait, so a protocol adapter cannot reach it.
 //!
 //! Every capability method is a complete request-response operation: the contract deliberately exposes
 //! **no** way to open a stream, scanner, cursor, or any other handle that would outlive the call,

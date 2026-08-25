@@ -247,6 +247,19 @@ const REST_PREFIX_LOOKUP_MAX_CONCURRENT_REQUESTS_KEY: &str =
 const DEFAULT_REST_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
 const DEFAULT_REST_HEADER_READ_TIMEOUT: ConfigDuration = ConfigDuration::from_secs(10);
 const DEFAULT_REST_REQUEST_TIMEOUT: ConfigDuration = ConfigDuration::from_secs(30);
+
+/// Time reserved for encoding and sending an HTTP response after the handler deadline.
+pub(crate) const REST_RESPONSE_GRACE: Duration = Duration::from_secs(1);
+
+/// Applies the response grace exactly as the REST deadline middleware does.
+pub(crate) fn rest_handler_timeout(request_timeout: Duration) -> Duration {
+    if request_timeout > REST_RESPONSE_GRACE {
+        request_timeout - REST_RESPONSE_GRACE
+    } else {
+        request_timeout
+    }
+}
+
 const DEFAULT_REST_MAX_REQUEST_BYTES: ByteSize = ByteSize::new(32 * 1024 * 1024);
 const DEFAULT_METRICS_ENABLED: bool = true;
 const DEFAULT_METRICS_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9095);
@@ -254,20 +267,16 @@ const DEFAULT_SHUTDOWN_DRAIN_TIMEOUT: ConfigDuration = ConfigDuration::from_secs
 
 const DEFAULT_CLUSTER_ID: &str = "default";
 const DEFAULT_BOOTSTRAP_SERVERS: &str = "127.0.0.1:9123";
+const DEFAULT_CONNECTION_IDLE_TIMEOUT: ConfigDuration = ConfigDuration::from_secs(10 * 60);
 const DEFAULT_TRUSTED_HEADER_NAME: &str = "x-forwarded-user";
 
 const CLUSTER_BOOTSTRAP_SERVERS_KEY: &str = "bootstrap.servers";
 const CLUSTER_CONNECT_TIMEOUT_KEY: &str = "connect-timeout";
+const CLUSTER_CONNECTION_IDLE_TIMEOUT_KEY: &str = "connection.idle-timeout";
+const CLUSTER_SECURITY_PROTOCOL_KEY: &str = "connection.security.protocol";
 const CLUSTER_SERVICE_ACCOUNT_KEY: &str = "connection.service.account";
 const CLUSTER_SERVICE_SECRET_KEY: &str = "connection.service.secret";
 const CLUSTER_IDENTITY_MODE_KEY: &str = "connection.identity-mode";
-const CLUSTER_CONNECTION_MAX_KEY: &str = "connection.max";
-const CLUSTER_CONNECTION_IDLE_TIMEOUT_KEY: &str = "connection.idle-timeout";
-
-/// Cap on pooled per-user connections when none is configured (FIP-49 sample configuration).
-const DEFAULT_CONNECTION_MAX: u32 = 512;
-/// Idle reclamation deadline for pooled per-user connections when none is configured.
-const DEFAULT_CONNECTION_IDLE_TIMEOUT: ConfigDuration = ConfigDuration::from_secs(600);
 
 type ApplyConfigValue<C> = fn(&mut C, &Value) -> Result<(), String>;
 
@@ -359,6 +368,16 @@ impl FromConfigValue for IdentityMode {
             "service" => Ok(Self::Service),
             "user" => Ok(Self::User),
             _ => Err("expected service or user".to_string()),
+        }
+    }
+}
+
+impl FromConfigValue for ConnectionSecurityProtocol {
+    fn from_config_value(value: &Value) -> Result<Self, String> {
+        match String::from_config_value(value)?.as_str() {
+            "plaintext" => Ok(Self::Plaintext),
+            "sasl" => Ok(Self::Sasl),
+            _ => Err("expected plaintext or sasl".to_string()),
         }
     }
 }
@@ -512,7 +531,9 @@ const CONFIG_ENTRIES: &[GatewayConfigEntry] = &[
     typed_entry!(GatewayConfigEntry, SECURITY_TRUSTED_HEADER_NAME_KEY, optional security.trusted_header_name),
 ];
 
-// `request-timeout` is omitted until fluss-rust exposes a general per-RPC timeout API.
+// TODO: Expose `request-timeout` after fluss-rust independently bounds a complete bootstrap
+// attempt (TCP connect, API version negotiation, SASL, and metadata), matching the Java client,
+// and provides a general per-RPC timeout. `connect-timeout` must remain TCP-connect-only.
 const CLUSTER_ENTRIES: &[ClusterConfigEntry] = &[
     typed_entry!(
         ClusterConfigEntry,
@@ -524,11 +545,19 @@ const CLUSTER_ENTRIES: &[ClusterConfigEntry] = &[
         CLUSTER_CONNECT_TIMEOUT_KEY,
         connect_timeout
     ),
+    typed_entry!(
+        ClusterConfigEntry,
+        CLUSTER_CONNECTION_IDLE_TIMEOUT_KEY,
+        connection_idle_timeout
+    ),
+    typed_entry!(
+        ClusterConfigEntry,
+        CLUSTER_SECURITY_PROTOCOL_KEY,
+        security_protocol
+    ),
     typed_entry!(ClusterConfigEntry, CLUSTER_SERVICE_ACCOUNT_KEY, optional service_account),
     typed_entry!(ClusterConfigEntry, CLUSTER_SERVICE_SECRET_KEY, optional service_secret),
     typed_entry!(ClusterConfigEntry, CLUSTER_IDENTITY_MODE_KEY, identity_mode),
-    typed_entry!(ClusterConfigEntry, CLUSTER_CONNECTION_MAX_KEY, optional connection_max),
-    typed_entry!(ClusterConfigEntry, CLUSTER_CONNECTION_IDLE_TIMEOUT_KEY, optional connection_idle_timeout),
 ];
 
 /// Gateway listeners and instance identity.
@@ -609,11 +638,22 @@ impl Default for MetricsServerConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum IdentityMode {
-    /// One shared connection authenticated as the configured service account.
+    /// One shared connection, authenticated as the service account when the protocol supports it.
     #[default]
     Service,
     /// Authenticate as the service account and carry the request's principal as the authorization ID.
     User,
+}
+
+/// Transport authentication used by the native Fluss client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ConnectionSecurityProtocol {
+    /// Connect without authenticating a Fluss user.
+    #[default]
+    Plaintext,
+    /// Authenticate the configured service account with SASL/PLAIN.
+    Sasl,
 }
 
 /// Connection settings for one Fluss cluster.
@@ -623,14 +663,13 @@ pub struct ClusterConfig {
     /// Comma-separated bootstrap addresses passed to the native Fluss client.
     pub bootstrap_servers: String,
     pub connect_timeout: ConfigDuration,
+    /// How long a connection can go without being acquired before the cleaner releases it.
+    pub connection_idle_timeout: ConfigDuration,
+    pub security_protocol: ConnectionSecurityProtocol,
     /// Account used to authenticate to Fluss.
     pub service_account: Option<String>,
     pub service_secret: Option<Secret>,
     pub identity_mode: IdentityMode,
-    /// Cap on pooled per-user connections. User identity mode only.
-    pub connection_max: Option<u32>,
-    /// Idle reclamation deadline for pooled connections, in both identity modes.
-    pub connection_idle_timeout: Option<ConfigDuration>,
 }
 
 impl Default for ClusterConfig {
@@ -638,11 +677,11 @@ impl Default for ClusterConfig {
         Self {
             bootstrap_servers: DEFAULT_BOOTSTRAP_SERVERS.to_string(),
             connect_timeout: ConfigDuration::from_secs(10),
+            connection_idle_timeout: DEFAULT_CONNECTION_IDLE_TIMEOUT,
+            security_protocol: ConnectionSecurityProtocol::Plaintext,
             service_account: None,
             service_secret: None,
             identity_mode: IdentityMode::Service,
-            connection_max: None,
-            connection_idle_timeout: None,
         }
     }
 }
@@ -656,22 +695,6 @@ impl ClusterConfig {
         self.service_secret.as_ref().map(Secret::expose)
     }
 
-    /// Upper bound on pooled per-user connections. User identity mode only.
-    pub fn connection_max(&self) -> usize {
-        usize::try_from(self.connection_max.unwrap_or(DEFAULT_CONNECTION_MAX)).unwrap_or(usize::MAX)
-    }
-
-    /// How long a pooled connection may sit unused before it is released.
-    ///
-    /// Applies in both identity modes, unlike `connection.max`: a connection idle this long has almost
-    /// certainly been dropped by a NAT or load balancer already, so rebuilding it on the next request
-    /// is cheaper than discovering that through a failed one.
-    pub fn connection_idle_timeout(&self) -> Duration {
-        self.connection_idle_timeout
-            .unwrap_or(DEFAULT_CONNECTION_IDLE_TIMEOUT)
-            .get()
-    }
-
     /// Builds native settings owned by the Gateway.
     pub fn native_client_config(&self) -> NativeClientConfig {
         let mut native = NativeClientConfig {
@@ -680,11 +703,20 @@ impl ClusterConfig {
                 .expect("bounded configuration durations fit u64 milliseconds"),
             ..NativeClientConfig::default()
         };
-        if let (Some(account), Some(secret)) = (&self.service_account, &self.service_secret) {
-            native.security_protocol = "sasl".to_string();
-            native.security_sasl_mechanism = "PLAIN".to_string();
-            native.security_sasl_username = account.clone();
-            native.security_sasl_password = secret.expose().to_string();
+        match self.security_protocol {
+            ConnectionSecurityProtocol::Plaintext => {
+                native.security_protocol = "PLAINTEXT".to_string();
+            }
+            ConnectionSecurityProtocol::Sasl => {
+                native.security_protocol = "sasl".to_string();
+                native.security_sasl_mechanism = "PLAIN".to_string();
+                if let Some(account) = &self.service_account {
+                    native.security_sasl_username = account.clone();
+                }
+                if let Some(secret) = &self.service_secret {
+                    native.security_sasl_password = secret.expose().to_string();
+                }
+            }
         }
         native
     }
@@ -887,6 +919,7 @@ impl GatewayConfig {
         if self.clusters.is_empty() {
             problems.push(format!("{CLUSTERS_KEY} must declare at least one cluster"));
         }
+        let handler_timeout = rest_handler_timeout(self.server.rest.request_timeout.get());
         for (id, cluster) in &self.clusters {
             if !valid_cluster_id(id) {
                 problems.push(format!(
@@ -899,29 +932,39 @@ impl GatewayConfig {
                     cluster_key(id, CLUSTER_BOOTSTRAP_SERVERS_KEY)
                 ));
             }
+            let connect_timeout = cluster.connect_timeout.get();
             validate_duration(
                 &cluster_key(id, CLUSTER_CONNECT_TIMEOUT_KEY),
-                cluster.connect_timeout.get(),
+                connect_timeout,
                 problems,
             );
-            if let Some(idle_timeout) = cluster.connection_idle_timeout {
-                validate_duration(
-                    &cluster_key(id, CLUSTER_CONNECTION_IDLE_TIMEOUT_KEY),
-                    idle_timeout.get(),
-                    problems,
-                );
-            }
-            if cluster.connection_max == Some(0) {
+            let idle_timeout = cluster.connection_idle_timeout.get();
+            validate_duration(
+                &cluster_key(id, CLUSTER_CONNECTION_IDLE_TIMEOUT_KEY),
+                idle_timeout,
+                problems,
+            );
+            if !idle_timeout.is_zero()
+                && idle_timeout <= MAX_CONFIG_DURATION
+                && !handler_timeout.is_zero()
+                && handler_timeout <= MAX_CONFIG_DURATION
+                && idle_timeout <= handler_timeout
+            {
                 problems.push(format!(
-                    "{} must be greater than zero",
-                    cluster_key(id, CLUSTER_CONNECTION_MAX_KEY)
+                    "{} must be greater than the REST handler timeout {handler_timeout:?}",
+                    cluster_key(id, CLUSTER_CONNECTION_IDLE_TIMEOUT_KEY)
                 ));
             }
-            self.validate_credentials(id, cluster, problems);
+            self.validate_connection_security(id, cluster, problems);
         }
     }
 
-    fn validate_credentials(&self, id: &str, cluster: &ClusterConfig, problems: &mut Vec<String>) {
+    fn validate_connection_security(
+        &self,
+        id: &str,
+        cluster: &ClusterConfig,
+        problems: &mut Vec<String>,
+    ) {
         let account = cluster.service_account();
         let secret = cluster.service_secret();
         for (key, value) in [
@@ -933,14 +976,34 @@ impl GatewayConfig {
             }
         }
 
-        // The native client only authenticates with a complete SASL PLAIN credential, so half of one
-        // would silently connect as an anonymous caller instead.
-        if account.is_some() != secret.is_some() {
-            problems.push(format!(
-                "{} and {} must be set together",
-                cluster_key(id, CLUSTER_SERVICE_ACCOUNT_KEY),
-                cluster_key(id, CLUSTER_SERVICE_SECRET_KEY)
-            ));
+        match cluster.security_protocol {
+            ConnectionSecurityProtocol::Plaintext => {
+                if account.is_some() || secret.is_some() {
+                    problems.push(format!(
+                        "{} and {} must be omitted when {} is plaintext",
+                        cluster_key(id, CLUSTER_SERVICE_ACCOUNT_KEY),
+                        cluster_key(id, CLUSTER_SERVICE_SECRET_KEY),
+                        cluster_key(id, CLUSTER_SECURITY_PROTOCOL_KEY)
+                    ));
+                }
+            }
+            ConnectionSecurityProtocol::Sasl => {
+                if account.is_none() && secret.is_none() {
+                    problems.push(format!(
+                        "{} and {} must be configured when {} is sasl",
+                        cluster_key(id, CLUSTER_SERVICE_ACCOUNT_KEY),
+                        cluster_key(id, CLUSTER_SERVICE_SECRET_KEY),
+                        cluster_key(id, CLUSTER_SECURITY_PROTOCOL_KEY)
+                    ));
+                } else if account.is_some() != secret.is_some() {
+                    problems.push(format!(
+                        "{} and {} must be set together when {} is sasl",
+                        cluster_key(id, CLUSTER_SERVICE_ACCOUNT_KEY),
+                        cluster_key(id, CLUSTER_SERVICE_SECRET_KEY),
+                        cluster_key(id, CLUSTER_SECURITY_PROTOCOL_KEY)
+                    ));
+                }
+            }
         }
 
         if cluster.identity_mode == IdentityMode::User {
@@ -949,9 +1012,8 @@ impl GatewayConfig {
             // degradation (FIP-49: configuring user mode fails at startup until Fluss ships act-as).
             problems.push(format!(
                 "{} user is not supported yet: fluss-rust cannot send a SASL authorization ID, and \
-                 client authentication is not implemented, so every request would act as {}",
-                cluster_key(id, CLUSTER_IDENTITY_MODE_KEY),
-                cluster_key(id, CLUSTER_SERVICE_ACCOUNT_KEY)
+                 client authentication is not implemented",
+                cluster_key(id, CLUSTER_IDENTITY_MODE_KEY)
             ));
         }
     }
@@ -1046,15 +1108,6 @@ impl GatewayConfig {
                  trusts the {} header. Expose it only behind a trusted proxy",
                 self.security.trusted_header_name()
             ));
-        }
-        for (id, cluster) in &self.clusters {
-            if cluster.identity_mode == IdentityMode::Service && cluster.connection_max.is_some() {
-                warnings.push(format!(
-                    "{} is ignored because {} is service, which shares a single connection",
-                    cluster_key(id, CLUSTER_CONNECTION_MAX_KEY),
-                    cluster_key(id, CLUSTER_IDENTITY_MODE_KEY)
-                ));
-            }
         }
         warnings
     }
@@ -1660,8 +1713,24 @@ mod tests {
             DEFAULT_BOOTSTRAP_SERVERS
         );
         assert_eq!(
+            cluster(&config, DEFAULT_CLUSTER_ID)
+                .connection_idle_timeout
+                .get(),
+            Duration::from_secs(10 * 60)
+        );
+        assert_eq!(
             cluster(&config, DEFAULT_CLUSTER_ID).identity_mode,
             IdentityMode::Service
+        );
+        assert_eq!(
+            cluster(&config, DEFAULT_CLUSTER_ID).security_protocol,
+            ConnectionSecurityProtocol::Plaintext
+        );
+        assert_eq!(
+            cluster(&config, DEFAULT_CLUSTER_ID)
+                .native_client_config()
+                .security_protocol,
+            "PLAINTEXT"
         );
         assert_eq!(config.security.authentication, AuthenticationMode::Trust);
         assert_eq!(config.request_limits, RequestLimitsConfig::default());
@@ -1715,6 +1784,7 @@ mod tests {
             "gateway.cluster.default.bootstrap.serverz: fluss:9123\n",
             "gateway.cluster.default.request-timeout: 30s\n",
             "gateway.cluster.default.connection.identity: user\n",
+            "gateway.cluster.default.connection.max: 512\n",
             "gateway.cluster.default.client.: 1\n",
             "gateway.cluster.default: fluss:9123\n",
         ] {
@@ -1759,15 +1829,16 @@ mod tests {
         assert!(!config.server.metrics.enabled);
 
         // Semantic errors in losing sources are masked, but the winning value is still parsed normally.
-        let file = write_temp_config("gateway.cluster.default.connection.max: not-a-number\n");
-        let env = BTreeMap::from([(
-            "FLUSS_GATEWAY__CLUSTER__DEFAULT__CONNECTION__MAX".to_string(),
-            "10".to_string(),
-        )]);
+        let file = write_temp_config("gateway.cluster.default.connect-timeout: not-a-duration\n");
+        let mut env = no_env();
+        env.insert(
+            "FLUSS_GATEWAY__CLUSTER__DEFAULT__CONNECT_TIMEOUT".to_string(),
+            "10s".to_string(),
+        );
         let config = load(Some(file.path()), &env, &CliOverrides::default()).unwrap();
         assert_eq!(
-            cluster(&config, DEFAULT_CLUSTER_ID).connection_max,
-            Some(10)
+            cluster(&config, DEFAULT_CLUSTER_ID).connect_timeout.get(),
+            Duration::from_secs(10)
         );
     }
 
@@ -1810,16 +1881,16 @@ mod tests {
         assert!(error.to_string().contains("scalar"), "{error}");
 
         let file =
-            write_temp_config("gateway.cluster.default.connection.max:\n  unexpected: mapping\n");
+            write_temp_config("gateway.cluster.default.connect-timeout:\n  unexpected: mapping\n");
         let env = BTreeMap::from([(
-            "FLUSS_GATEWAY__CLUSTER__DEFAULT__CONNECTION__MAX".to_string(),
-            "10".to_string(),
+            "FLUSS_GATEWAY__CLUSTER__DEFAULT__CONNECT_TIMEOUT".to_string(),
+            "10s".to_string(),
         )]);
         let error = load(Some(file.path()), &env, &CliOverrides::default()).unwrap_err();
         assert!(
             error
                 .to_string()
-                .contains("gateway.cluster.default.connection.max"),
+                .contains("gateway.cluster.default.connect-timeout"),
             "{error}"
         );
         assert!(error.to_string().contains("scalar"), "{error}");
@@ -1869,7 +1940,8 @@ mod tests {
 
     #[test]
     fn public_environment_options_are_loaded_by_type() {
-        let env = BTreeMap::from([
+        let mut env = no_env();
+        env.extend([
             ("FLUSS_GATEWAY__INSTANCE_ID".to_string(), "123".to_string()),
             (
                 "FLUSS_GATEWAY__REST__LISTEN".to_string(),
@@ -1878,6 +1950,10 @@ mod tests {
             (
                 "FLUSS_GATEWAY__REST__WRITE__REQUEST_TIMEOUT".to_string(),
                 "5s".to_string(),
+            ),
+            (
+                "FLUSS_GATEWAY__CLUSTER__DEFAULT__CONNECT_TIMEOUT".to_string(),
+                "3s".to_string(),
             ),
             (
                 "FLUSS_GATEWAY__REST__WRITE__MAX_REQUEST_BYTES".to_string(),
@@ -1910,6 +1986,10 @@ mod tests {
         assert_eq!(
             config.server.rest.request_timeout.get(),
             Duration::from_secs(5)
+        );
+        assert_eq!(
+            cluster(&config, DEFAULT_CLUSTER_ID).connect_timeout.get(),
+            Duration::from_secs(3)
         );
         assert_eq!(config.server.rest.max_body_bytes.bytes(), 2 * 1024 * 1024);
         assert!(!config.server.metrics.enabled);
@@ -2036,8 +2116,6 @@ mod tests {
         let mut config = GatewayConfig::default();
         let cluster = config.clusters.get_mut("default").expect("default cluster");
         cluster.identity_mode = IdentityMode::User;
-        cluster.service_account = Some("gateway_svc".to_string());
-        cluster.service_secret = Some(Secret("secret".to_string()));
 
         let errors = problems(config.validate().unwrap_err());
         let refusal = errors
@@ -2050,23 +2128,66 @@ mod tests {
         assert!(GatewayConfig::default().validate().is_ok());
     }
 
-    /// The pooled per-user bounds fall back to the FIP-49 sample values.
     #[test]
-    fn the_connection_bounds_have_defaults() {
-        let cluster = ClusterConfig::default();
-        assert_eq!(cluster.connection_max(), 512);
-        assert_eq!(cluster.connection_idle_timeout(), Duration::from_secs(600));
-
-        let configured = ClusterConfig {
-            connection_max: Some(4),
-            connection_idle_timeout: Some(ConfigDuration::from_secs(30)),
-            ..ClusterConfig::default()
-        };
-        assert_eq!(configured.connection_max(), 4);
-        assert_eq!(
-            configured.connection_idle_timeout(),
-            Duration::from_secs(30)
+    fn connection_security_protocol_validates_credentials() {
+        assert!(GatewayConfig::default().validate().is_ok());
+        assert!(
+            load_file(
+                "gateway.cluster.default.connection.security.protocol: sasl\n\
+                 gateway.cluster.default.connection.service.account: gateway_svc\n\
+                 gateway.cluster.default.connection.service.secret: secret\n"
+            )
+            .is_ok()
         );
+
+        for contents in [
+            "gateway.cluster.default.connection.security.protocol: sasl\n",
+            "gateway.cluster.default.connection.security.protocol: sasl\n\
+             gateway.cluster.default.connection.service.account: gateway_svc\n",
+            "gateway.cluster.default.connection.security.protocol: plaintext\n\
+             gateway.cluster.default.connection.service.account: gateway_svc\n\
+             gateway.cluster.default.connection.service.secret: secret\n",
+        ] {
+            let error = load_file(contents).unwrap_err().to_string();
+            assert!(error.contains("connection.security.protocol"), "{error}");
+        }
+    }
+
+    #[test]
+    fn backend_connect_timeout_is_independent_of_a_request_deadline() {
+        let mut config = GatewayConfig::default();
+        config.server.rest.request_timeout = ConfigDuration::from_secs(1);
+        config
+            .clusters
+            .get_mut(DEFAULT_CLUSTER_ID)
+            .unwrap()
+            .connect_timeout = ConfigDuration::from_secs(10);
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn connection_idle_timeout_must_outlive_the_handler_budget() {
+        let mut config = GatewayConfig::default();
+        config.server.rest.request_timeout = ConfigDuration::from_secs(5);
+        config
+            .clusters
+            .get_mut(DEFAULT_CLUSTER_ID)
+            .unwrap()
+            .connection_idle_timeout = ConfigDuration::from_secs(4);
+
+        let errors = problems(config.validate().unwrap_err());
+        assert!(errors.iter().any(|error| {
+            error.contains("gateway.cluster.default.connection.idle-timeout")
+                && error.contains("REST handler timeout 4s")
+        }));
+
+        config
+            .clusters
+            .get_mut(DEFAULT_CLUSTER_ID)
+            .unwrap()
+            .connection_idle_timeout = ConfigDuration::from_millis(4001);
+        assert!(config.validate().is_ok());
     }
 
     #[test]
@@ -2287,10 +2408,10 @@ mod tests {
             "gateway.clusters: default, analytics\n\
              gateway.cluster.default.bootstrap.servers: fluss-1:9123,fluss-2:9123\n\
              gateway.cluster.default.connection.identity-mode: service\n\
+             gateway.cluster.default.connection.security.protocol: sasl\n\
              gateway.cluster.default.connection.service.account: gateway_svc\n\
              gateway.cluster.default.connection.service.secret: gw-pass\n\
-             gateway.cluster.default.connection.max: 512\n\
-             gateway.cluster.default.connection.idle-timeout: 10m\n\
+             gateway.cluster.default.connection.idle-timeout: 12m\n\
              gateway.cluster.analytics.bootstrap.servers: analytics:9123,analytics-2:9123\n\
              gateway.cluster.analytics.connect-timeout: 5s\n\
              gateway.security.authentication: password\n\
@@ -2307,8 +2428,13 @@ mod tests {
         let default = cluster(&config, "default");
         assert_eq!(default.bootstrap_servers, "fluss-1:9123,fluss-2:9123");
         assert_eq!(default.identity_mode, IdentityMode::Service);
+        assert_eq!(default.security_protocol, ConnectionSecurityProtocol::Sasl);
         assert_eq!(default.service_account(), Some("gateway_svc"));
         assert_eq!(default.service_secret(), Some("gw-pass"));
+        assert_eq!(
+            default.connection_idle_timeout.get(),
+            Duration::from_secs(12 * 60)
+        );
         let native = default.native_client_config();
         assert_eq!(native.bootstrap_servers, "fluss-1:9123,fluss-2:9123");
         assert_eq!(native.connect_timeout_ms, 10_000);
@@ -2316,11 +2442,6 @@ mod tests {
         assert_eq!(native.security_sasl_mechanism, "PLAIN");
         assert_eq!(native.security_sasl_username, "gateway_svc");
         assert_eq!(native.security_sasl_password, "gw-pass");
-        assert_eq!(default.connection_max, Some(512));
-        assert_eq!(
-            default.connection_idle_timeout.map(ConfigDuration::get),
-            Some(Duration::from_secs(600))
-        );
         assert_eq!(
             cluster(&config, "analytics").bootstrap_servers,
             "analytics:9123,analytics-2:9123"
@@ -2333,6 +2454,7 @@ mod tests {
         let analytics_native = cluster(&config, "analytics").native_client_config();
         assert_eq!(analytics_native.connect_timeout_ms, 5_000);
         assert_eq!(analytics_native.security_protocol, "PLAINTEXT");
+        assert!(analytics_native.security_sasl_username.is_empty());
         assert_eq!(config.request_limits.write_max_rows, 500);
         assert!(config.request_limits.write_rate_limit_enabled);
         assert_eq!(
@@ -2363,10 +2485,11 @@ mod tests {
             "a:9123, b:9123, [::1]:9123"
         );
 
-        let env = BTreeMap::from([(
+        let mut env = no_env();
+        env.insert(
             "FLUSS_GATEWAY__CLUSTER__DEFAULT__BOOTSTRAP__SERVERS".to_string(),
             "env-a:9123, env-b:9123".to_string(),
-        )]);
+        );
         let from_env = load(None, &env, &CliOverrides::default()).unwrap();
         assert_eq!(
             cluster(&from_env, "default").bootstrap_servers,
@@ -2577,7 +2700,6 @@ mod tests {
             // An account without its secret, and the reverse.
             "gateway.cluster.default.connection.service.account: gateway_svc\n",
             "gateway.cluster.default.connection.service.secret: gw-pass\n",
-            "gateway.cluster.default.connection.max: 0\n",
             "gateway.cluster.default.bootstrap.servers: \" \"\n",
             "gateway.rest.write.rate-limit.requests-per-second: 0\n",
             // The mode's credential table is missing.
@@ -2590,9 +2712,7 @@ mod tests {
             // User identity mode, however it is spelled out, cannot be served yet.
             "gateway.security.authentication: password\n\
              gateway.security.users: alice:secret\n\
-             gateway.cluster.default.connection.identity-mode: user\n\
-             gateway.cluster.default.connection.service.account: gateway_svc\n\
-             gateway.cluster.default.connection.service.secret: gw-pass\n",
+             gateway.cluster.default.connection.identity-mode: user\n",
         ] {
             assert!(load_file(contents).is_err(), "accepted: {contents}");
         }
@@ -2610,7 +2730,8 @@ mod tests {
     #[test]
     fn diagnostics_redact_every_credential_and_keep_the_identities() {
         let config = load_file(
-            "gateway.cluster.default.connection.service.account: canonical-user\n\
+            "gateway.cluster.default.connection.security.protocol: sasl\n\
+             gateway.cluster.default.connection.service.account: canonical-user\n\
              gateway.cluster.default.connection.service.secret: canonical-secret\n\
              gateway.security.authentication: password\n\
              gateway.security.users: alice:user-secret\n\
@@ -2680,8 +2801,8 @@ mod tests {
         for entry in CONFIG_ENTRIES {
             if entry.key == METRICS_EXPORTERS_KEY {
                 let file = write_temp_config(&format!("{}: otlp\n", entry.key));
-                let env =
-                    BTreeMap::from([(environment_variable(entry.key), "prometheus".to_string())]);
+                let mut env = no_env();
+                env.insert(environment_variable(entry.key), "prometheus".to_string());
                 let from_env = load(Some(file.path()), &env, &CliOverrides::default())
                     .unwrap_or_else(|error| panic!("{}: {error}", entry.key));
                 let only_env = load(None, &env, &CliOverrides::default())
@@ -2705,9 +2826,8 @@ mod tests {
                 | REST_LOOKUP_MAX_KEY_BYTES_KEY => ("1MiB", "2MiB"),
                 REST_LISTEN_KEY => ("127.0.0.1:11111", "127.0.0.1:22222"),
                 METRICS_LISTEN_KEY => ("127.0.0.1:11112", "127.0.0.1:22223"),
-                REST_HEADER_READ_TIMEOUT_KEY
-                | REST_REQUEST_TIMEOUT_KEY
-                | SHUTDOWN_DRAIN_TIMEOUT_KEY => ("11s", "22s"),
+                REST_REQUEST_TIMEOUT_KEY => ("12s", "22s"),
+                REST_HEADER_READ_TIMEOUT_KEY | SHUTDOWN_DRAIN_TIMEOUT_KEY => ("11s", "22s"),
                 // Both modes must be valid on their own: the file value is loaded without the
                 // environment override, and password and token modes need a credential table.
                 SECURITY_AUTHENTICATION_KEY => ("trusted-header", "trust"),
@@ -2717,7 +2837,8 @@ mod tests {
             let file = write_temp_config(&format!("{}: \"{file_value}\"\n", entry.key));
             let from_file = load(Some(file.path()), &no_env(), &CliOverrides::default())
                 .unwrap_or_else(|error| panic!("{}: {error}", entry.key));
-            let env = BTreeMap::from([(environment_variable(entry.key), env_value.to_string())]);
+            let mut env = no_env();
+            env.insert(environment_variable(entry.key), env_value.to_string());
             let from_env = load(Some(file.path()), &env, &CliOverrides::default())
                 .unwrap_or_else(|error| panic!("{}: {error}", entry.key));
 

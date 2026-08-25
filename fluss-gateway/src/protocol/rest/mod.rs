@@ -32,9 +32,11 @@ pub mod openapi;
 pub mod pagination;
 
 use crate::backend::FlussBackend;
-use crate::backend::context::{CallerIdentity, RequestContext};
+use crate::backend::context::RequestContext;
 use crate::backend::types::ClusterId;
-use crate::config::RestServerConfig;
+#[cfg(test)]
+use crate::config::REST_RESPONSE_GRACE;
+use crate::config::{RestServerConfig, rest_handler_timeout};
 use crate::error::{ErrorEnvelope, ErrorKind, GatewayError, panic_message};
 use crate::lifecycle::Readiness;
 use crate::observability;
@@ -58,11 +60,6 @@ use utoipa_axum::router::OpenApiRouter;
 ///
 /// Only reachable if a duration slips past configuration validation; one hour keeps such a request bounded.
 const MAX_REQUEST_DEADLINE: Duration = Duration::from_secs(3600);
-
-/// Reserved between a request's deadline and the middleware timeout that backstops it, so a
-/// response completing at the deadline still gets out instead of racing the timeout. The timeout
-/// keeps the configured value; the deadline ends this much earlier.
-const RESPONSE_GRACE: Duration = Duration::from_secs(1);
 
 /// Shared state for REST handlers.
 ///
@@ -256,7 +253,7 @@ pub(crate) fn request_context(cluster_id: ClusterId, request: &Request) -> Reque
         cluster_id,
         deadline.instant(),
         cancellation,
-        CallerIdentity::Anonymous,
+        None,
     )
 }
 
@@ -352,17 +349,14 @@ pub fn apply_middleware(router: Router, options: &RestOptions) -> Router {
     apply_common_middleware(apply_data_limits(router, options), None)
 }
 
-/// The deadline of a request starting now, ending [`RESPONSE_GRACE`] before the middleware timeout.
+/// The deadline of a request starting now, ending [`REST_RESPONSE_GRACE`] before the middleware
+/// timeout.
 ///
 /// The checked additions are defence in depth — configuration caps every duration well below the
 /// instant-arithmetic limit — and, like Envoy's `grpc_timeout_offset`, the grace applies only when
 /// the timeout is longer than it.
 fn deadline_from_now(request_timeout: Duration) -> RequestDeadline {
-    let handler_budget = if request_timeout > RESPONSE_GRACE {
-        request_timeout - RESPONSE_GRACE
-    } else {
-        request_timeout
-    };
+    let handler_budget = rest_handler_timeout(request_timeout);
     let now = Instant::now();
     RequestDeadline(
         now.checked_add(handler_budget)
@@ -791,9 +785,9 @@ mod tests {
         for (timeout, budget) in [
             (
                 Duration::from_secs(30),
-                Duration::from_secs(30) - RESPONSE_GRACE,
+                Duration::from_secs(30) - REST_RESPONSE_GRACE,
             ),
-            (RESPONSE_GRACE, RESPONSE_GRACE),
+            (REST_RESPONSE_GRACE, REST_RESPONSE_GRACE),
             (Duration::from_millis(200), Duration::from_millis(200)),
         ] {
             let before = Instant::now();
@@ -822,7 +816,7 @@ mod tests {
             "ok"
         }
         let options = RestOptions {
-            request_timeout: RESPONSE_GRACE + Duration::from_millis(400),
+            request_timeout: REST_RESPONSE_GRACE + Duration::from_millis(400),
             max_body_bytes: 1024,
         };
         let app = apply_middleware(
