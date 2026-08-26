@@ -209,6 +209,10 @@ mod tests {
             schemas["CreateDatabaseBody"]["required"],
             serde_json::json!(["database"])
         );
+        assert_eq!(
+            schemas["CreateTableBody"]["required"],
+            serde_json::json!(["table_name", "columns"])
+        );
         assert!(
             document["paths"]["/v1/clusters/{cluster}/databases/{database}"]
                 .get("get")
@@ -219,11 +223,39 @@ mod tests {
             schemas["TableResponse"]["required"],
             serde_json::json!(["database", "table", "columns"])
         );
+        for (path, method, status) in [
+            (
+                "/v1/clusters/{cluster}/databases/{database}/tables",
+                "post",
+                "201",
+            ),
+            (
+                "/v1/clusters/{cluster}/databases/{database}/tables/{table}",
+                "patch",
+                "204",
+            ),
+        ] {
+            let response = &document["paths"][path][method]["responses"][status];
+            assert!(response.is_object(), "{method} {path}: {status}");
+            assert!(response.get("content").is_none(), "{method} {path}");
+        }
+        let table =
+            &document["paths"]["/v1/clusters/{cluster}/databases/{database}/tables/{table}"];
+        assert!(table["patch"]["responses"].get("200").is_none());
+        assert_eq!(
+            schemas["PartitionEntry"]["required"],
+            serde_json::json!(["name", "partition"])
+        );
+        assert_eq!(
+            schemas["PartitionsResponse"]["properties"]["partitions"]["items"]["$ref"],
+            "#/components/schemas/PartitionEntry"
+        );
         for field in [
             "primary_key",
             "partitioned_by",
             "distribution",
             "configs",
+            "custom_properties",
             "comment",
         ] {
             assert!(
@@ -232,6 +264,16 @@ mod tests {
                     .contains("\"null\""),
                 "an absent table field is omitted, not nullable: {field}"
             );
+        }
+        for schema in ["CreateTableBody", "TableResponse"] {
+            for field in ["configs", "custom_properties"] {
+                let property = &schemas[schema]["properties"][field];
+                assert_eq!(property["type"], "object", "{schema}.{field}");
+                assert_eq!(
+                    property["additionalProperties"]["type"], "string",
+                    "{schema}.{field}"
+                );
+            }
         }
         for (name, has_nullable) in [("ColumnDataType", false), ("WireDataType", true)] {
             for variant in schemas[name]["oneOf"].as_array().expect("type variants") {

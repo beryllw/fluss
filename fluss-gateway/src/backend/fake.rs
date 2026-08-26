@@ -270,12 +270,12 @@ impl FlussBackend for FakeFlussBackend {
         ctx: &RequestContext,
         table: &TablePath,
         descriptor: &TableDescriptor,
-    ) -> GatewayResult<TableInfo> {
+    ) -> GatewayResult<()> {
         self.call(
             ctx,
             Operation::CreateTable,
             Some(FakeCall::CreateTable(table.clone(), descriptor.clone())),
-            |state| Ok(table_of(state, table)?.info.clone()),
+            |_| Ok(()),
         )
     }
 
@@ -284,12 +284,12 @@ impl FlussBackend for FakeFlussBackend {
         ctx: &RequestContext,
         table: &TablePath,
         changes: AlterTableChanges,
-    ) -> GatewayResult<TableInfo> {
+    ) -> GatewayResult<()> {
         self.call(
             ctx,
             Operation::AlterTable,
             Some(FakeCall::AlterTable(table.clone(), changes)),
-            |state| Ok(table_of(state, table)?.info.clone()),
+            |_| Ok(()),
         )
     }
 

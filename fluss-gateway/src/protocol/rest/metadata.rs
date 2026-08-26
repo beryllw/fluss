@@ -99,9 +99,14 @@ pub struct TableResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub comment: Option<String>,
+    /// Fluss table properties.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub configs: Option<HashMap<String, String>>,
+    /// Custom table metadata.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub custom_properties: Option<HashMap<String, String>>,
 }
 
 impl From<&TableInfo> for TableResponse {
@@ -131,6 +136,8 @@ impl From<&TableInfo> for TableResponse {
             }),
             comment: info.comment.clone(),
             configs: (!info.properties.is_empty()).then(|| info.properties.clone()),
+            custom_properties: (!info.custom_properties.is_empty())
+                .then(|| info.custom_properties.clone()),
         }
     }
 }
@@ -143,10 +150,33 @@ pub struct PartitionResponse {
     pub partition: HashMap<String, String>,
 }
 
+/// One partition in a listing.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PartitionEntry {
+    /// Native partition name; percent-encode it as a path segment when deleting.
+    pub name: String,
+    pub partition: HashMap<String, String>,
+}
+
+impl From<&PartitionInfo> for PartitionEntry {
+    fn from(info: &PartitionInfo) -> Self {
+        let spec = info.get_resolved_partition_spec();
+        Self {
+            name: info.get_partition_name(),
+            partition: spec
+                .get_partition_keys()
+                .iter()
+                .cloned()
+                .zip(spec.get_partition_values().iter().cloned())
+                .collect(),
+        }
+    }
+}
+
 /// Response of `GET /v1/clusters/{cluster}/databases/{database}/tables/{table}/partitions`.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct PartitionsResponse {
-    pub partitions: Vec<HashMap<String, String>>,
+    pub partitions: Vec<PartitionEntry>,
     /// Present only while more entries follow.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
@@ -352,21 +382,12 @@ pub(crate) async fn list_partitions(
                 partition.get_partition_name().into()
             });
         json_response(&PartitionsResponse {
-            partitions: partitions.iter().map(partition_values).collect(),
+            partitions: partitions.iter().map(PartitionEntry::from).collect(),
             next_page_token,
         })
     }
     .await;
     result.unwrap_or_else(|error| error_response(&error, &request_id))
-}
-
-fn partition_values(info: &PartitionInfo) -> HashMap<String, String> {
-    let spec = info.get_resolved_partition_spec();
-    spec.get_partition_keys()
-        .iter()
-        .cloned()
-        .zip(spec.get_partition_values().iter().cloned())
-        .collect()
 }
 
 /// Validates the cluster and page request before calling the backend.
@@ -541,13 +562,11 @@ mod tests {
     #[tokio::test]
     async fn a_table_is_described_in_the_shape_that_recreates_it() {
         let backend = Arc::new(FakeFlussBackend::new());
-        backend.define_table(described_table());
+        let mut table = described_table();
+        backend.define_table(table.clone());
+        let app = app(Arc::clone(&backend));
 
-        let (status, body) = get(
-            &app(backend),
-            "/v1/clusters/default/databases/sales/tables/orders",
-        )
-        .await;
+        let (status, body) = get(&app, "/v1/clusters/default/databases/sales/tables/orders").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
             body,
@@ -569,8 +588,17 @@ mod tests {
                 "distribution": {"bucket_count": 4, "bucket_keys": ["id"]},
                 "comment": "the orders table",
                 "configs": {"table.log.ttl": "7d"},
+                "custom_properties": {"app.owner": "sales", "table.log.ttl": "custom value"},
             })
         );
+
+        table.properties.clear();
+        backend.define_table(table);
+        let (status, custom_only) =
+            get(&app, "/v1/clusters/default/databases/sales/tables/orders").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(custom_only.get("configs").is_none(), "{custom_only}");
+        assert_eq!(custom_only["custom_properties"], body["custom_properties"]);
     }
 
     #[tokio::test]
@@ -585,6 +613,7 @@ mod tests {
         assert!(body.get("primary_key").is_none(), "{body}");
         assert!(body.get("partitioned_by").is_none(), "{body}");
         assert!(body.get("configs").is_none(), "{body}");
+        assert!(body.get("custom_properties").is_none(), "{body}");
     }
 
     #[tokio::test]
@@ -641,8 +670,8 @@ mod tests {
         assert_eq!(
             body["partitions"],
             serde_json::json!([
-                {"dt": "2026-08-24"},
-                {"dt": "2026-08-25"},
+                {"name": "2026-08-24", "partition": {"dt": "2026-08-24"}},
+                {"name": "2026-08-25", "partition": {"dt": "2026-08-25"}},
             ])
         );
 
@@ -658,7 +687,7 @@ mod tests {
         assert!(body.get("next_page_token").is_none(), "{body}");
         assert_eq!(
             body["partitions"],
-            serde_json::json!([{"dt": "2026-08-26"}])
+            serde_json::json!([{"name": "2026-08-26", "partition": {"dt": "2026-08-26"}}])
         );
 
         let (status, _) = get(
@@ -690,6 +719,10 @@ mod tests {
                 "table.log.ttl".to_string(),
                 "7d".to_string(),
             )]))
+            .custom_properties(HashMap::from([
+                ("app.owner".to_string(), "sales".to_string()),
+                ("table.log.ttl".to_string(), "custom value".to_string()),
+            ]))
             .build()
             .expect("the described descriptor is valid");
         TableInfo::of(

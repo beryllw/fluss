@@ -99,7 +99,7 @@ impl NativeFlussBackend {
                 Ok(admin) => operation(admin).await,
                 Err(error) => Err(error),
             };
-            result.map_err(|native| map_fluss_error(what, native))
+            result.map_err(|native| map_fluss_error(what, native, Some(ctx)))
         })
         .await
     }
@@ -164,10 +164,9 @@ impl FlussBackend for NativeFlussBackend {
         ctx: &RequestContext,
         table: &TablePath,
         descriptor: &TableDescriptor,
-    ) -> GatewayResult<TableInfo> {
+    ) -> GatewayResult<()> {
         self.admin_call(ctx, "create the table", |admin| async move {
-            admin.create_table(table, descriptor, false).await?;
-            admin.get_table_info(table).await
+            admin.create_table(table, descriptor, false).await
         })
         .await
     }
@@ -177,10 +176,9 @@ impl FlussBackend for NativeFlussBackend {
         ctx: &RequestContext,
         table: &TablePath,
         changes: AlterTableChanges,
-    ) -> GatewayResult<TableInfo> {
+    ) -> GatewayResult<()> {
         self.admin_call(ctx, "alter the table", |admin| async move {
-            admin.alter_table(table, false, changes).await?;
-            admin.get_table_info(table).await
+            admin.alter_table(table, false, changes).await
         })
         .await
     }

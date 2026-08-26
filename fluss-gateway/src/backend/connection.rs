@@ -298,7 +298,7 @@ impl<K: Connector> ConnectionCache<K> {
         for result in results {
             if let Err(error) = result {
                 first_failure = first_failure
-                    .or_else(|| Some(map_fluss_error("close the Fluss connection", error)));
+                    .or_else(|| Some(map_fluss_error("close the Fluss connection", error, None)));
             }
             observability::connection_closed(self.cluster.as_str(), "shutdown");
         }
@@ -325,7 +325,7 @@ impl<K: Connector> ConnectionCache<K> {
             .connector
             .dial(self.identity.as_ref())
             .await
-            .map_err(|native| map_fluss_error("connect to Fluss", native))?;
+            .map_err(|native| map_fluss_error("connect to Fluss", native, None))?;
         Ok(self.install(&entry, connection))
     }
 

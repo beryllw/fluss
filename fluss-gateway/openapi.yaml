@@ -35,7 +35,7 @@ components:
         name:
           type: string
         nullable:
-          description: Defaults to true; fluss-rs makes primary-key columns non-nullable.
+          description: Primary-key columns default to false and reject true; other columns default to true.
           type:
           - boolean
           - 'null'
@@ -323,6 +323,14 @@ components:
         configs:
           additionalProperties:
             type: string
+          description: Fluss table properties, validated by the server.
+          propertyNames:
+            type: string
+          type: object
+        custom_properties:
+          additionalProperties:
+            type: string
+          description: Custom table metadata; avoid the `table.` prefix used by Fluss configs.
           propertyNames:
             type: string
           type: object
@@ -475,6 +483,22 @@ components:
       - status
       - uptime_ms
       type: object
+    PartitionEntry:
+      description: One partition in a listing.
+      properties:
+        name:
+          description: Native partition name; percent-encode it as a path segment when deleting.
+          type: string
+        partition:
+          additionalProperties:
+            type: string
+          propertyNames:
+            type: string
+          type: object
+      required:
+      - name
+      - partition
+      type: object
     PartitionResponse:
       description: Response of a partition creation.
       properties:
@@ -501,11 +525,7 @@ components:
           type: string
         partitions:
           items:
-            additionalProperties:
-              type: string
-            propertyNames:
-              type: string
-            type: object
+            $ref: '#/components/schemas/PartitionEntry'
           type: array
       required:
       - partitions
@@ -519,7 +539,9 @@ components:
       - status
       type: object
     TableChangeBody:
-      description: One supported table change.
+      description: |-
+        One supported table change. Config keys under `table.` address Fluss table properties;
+        other keys address custom properties.
       oneOf:
       - description: 'An added column must be nullable: existing rows have no value for it.'
         properties:
@@ -554,7 +576,8 @@ components:
         - value
         - kind
         type: object
-      - properties:
+      - description: Removes the explicitly configured value.
+        properties:
           key:
             type: string
           kind:
@@ -577,6 +600,14 @@ components:
         configs:
           additionalProperties:
             type: string
+          description: Fluss table properties.
+          propertyNames:
+            type: string
+          type: object
+        custom_properties:
+          additionalProperties:
+            type: string
+          description: Custom table metadata.
           propertyNames:
             type: string
           type: object
@@ -1398,11 +1429,7 @@ paths:
                 $ref: '#/components/schemas/ValidateOnlyResponse'
           description: 'Dry run: fluss-rs accepted the definition and nothing was created'
         '201':
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/TableResponse'
-          description: The created table
+          description: The table was created; GET Location to read its metadata
           headers:
             Location:
               description: Created table URL
@@ -1654,12 +1681,8 @@ paths:
               $ref: '#/components/schemas/AlterTableBody'
         required: true
       responses:
-        '200':
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/TableResponse'
-          description: The altered table
+        '204':
+          description: The table was altered; GET the same URL to read its metadata
         '400':
           content:
             application/json:

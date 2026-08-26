@@ -266,6 +266,8 @@ async fn assert_catalog_journey(api: &Api) {
         "primary_key": ["id", "dt"],
         "partitioned_by": ["dt"],
         "distribution": {"bucket_count": 2, "bucket_keys": ["id"]},
+        "configs": {"table.log.ttl": "7d"},
+        "custom_properties": {"app.owner": "sales", "app.stage": "draft"},
         "comment": "the E2E journey table",
     });
     let mut dry_run = definition.clone();
@@ -279,18 +281,43 @@ async fn assert_catalog_journey(api: &Api) {
         "the dry run created nothing"
     );
 
-    let (location, created) = api.post_created(&tables, &definition).await;
+    for key in ["nope.key", "table.nope"] {
+        let mut invalid = definition.clone();
+        invalid["configs"][key] = serde_json::json!("1");
+        let (status, _, error) = api.post(&tables, &invalid).await;
+        assert_eq!(status, 400, "{key}: {error}");
+        assert_eq!(error["error"]["code"], "invalid_argument");
+    }
+
+    let (location, body) = api.post_created(&tables, &definition).await;
     assert_eq!(location, table);
+    assert_eq!(body, serde_json::Value::Null);
+    let created = api.get_ok(&table).await;
     assert_eq!(created["distribution"]["bucket_count"], 2);
+    assert_eq!(created["configs"]["table.log.ttl"], "7d");
+    assert_eq!(
+        created["custom_properties"],
+        definition["custom_properties"]
+    );
     // The declared type survives the round trip through Fluss's own schema serialization.
     assert_eq!(
         created["columns"][2]["data_type"],
         serde_json::json!({"type": "DECIMAL", "precision": 18, "scale": 2})
     );
+    let (status, _, error) = api
+        .patch(
+            &table,
+            &serde_json::json!({
+                "changes": [{"kind": "set_config", "key": "table.nope", "value": "1"}]
+            }),
+        )
+        .await;
+    assert_eq!(status, 400, "{error}");
+    assert_eq!(error["error"]["code"], "invalid_argument");
     assert_eq!(api.get_ok(&table).await, created);
 
     // Fluss currently requires schema and config changes in separate requests.
-    let (status, _, altered) = api
+    let (status, _, body) = api
         .patch(
             &table,
             &serde_json::json!({
@@ -300,10 +327,35 @@ async fn assert_catalog_journey(api: &Api) {
             }),
         )
         .await;
-    assert_eq!(status, 200, "the alteration is applied: {altered}");
+    assert_eq!(status, 204, "the alteration is applied: {body}");
+    assert_eq!(body, serde_json::Value::Null);
+    let altered = api.get_ok(&table).await;
     assert_eq!(altered["columns"][3]["name"], "note");
 
-    let (status, _, altered) = api
+    for (changes, expected) in [
+        (
+            serde_json::json!([
+                {"kind": "set_config", "key": "app.owner", "value": "finance"},
+                {"kind": "reset_config", "key": "app.stage"}
+            ]),
+            Some(serde_json::json!({"app.owner": "finance"})),
+        ),
+        (
+            serde_json::json!([{"kind": "reset_config", "key": "app.owner"}]),
+            None,
+        ),
+    ] {
+        let (status, _, body) = api
+            .patch(&table, &serde_json::json!({"changes": changes}))
+            .await;
+        assert_eq!(status, 204, "{body}");
+        assert_eq!(body, serde_json::Value::Null);
+        let altered = api.get_ok(&table).await;
+        assert_eq!(altered["configs"], created["configs"]);
+        assert_eq!(altered.get("custom_properties"), expected.as_ref());
+    }
+
+    let (status, _, body) = api
         .patch(
             &table,
             &serde_json::json!({
@@ -313,9 +365,10 @@ async fn assert_catalog_journey(api: &Api) {
             }),
         )
         .await;
-    assert_eq!(status, 200, "the alteration is applied: {altered}");
+    assert_eq!(status, 204, "the alteration is applied: {body}");
+    assert_eq!(body, serde_json::Value::Null);
+    let altered = api.get_ok(&table).await;
     assert_eq!(altered["configs"]["table.log.ttl"], "30d");
-    assert_eq!(api.get_ok(&table).await, altered);
 
     let (location, partition) = api
         .post_created(
@@ -328,9 +381,12 @@ async fn assert_catalog_journey(api: &Api) {
         partition["partition"],
         serde_json::json!({"dt": "2026-08-25"})
     );
+    let listed = api.get_ok(&partitions).await;
     assert_eq!(
-        api.get_ok(&partitions).await,
-        serde_json::json!({"partitions": [{"dt": "2026-08-25"}]})
+        listed,
+        serde_json::json!({
+            "partitions": [{"name": "2026-08-25", "partition": {"dt": "2026-08-25"}}]
+        })
     );
 
     // Drop without cascade requires leaf-to-root cleanup.
@@ -339,7 +395,8 @@ async fn assert_catalog_journey(api: &Api) {
         409,
         "the database is not empty"
     );
-    assert_eq!(api.delete(&format!("{partitions}/2026-08-25")).await, 204);
+    let name = listed["partitions"][0]["name"].as_str().unwrap();
+    assert_eq!(api.delete(&format!("{partitions}/{name}")).await, 204);
     assert_eq!(api.delete(&table).await, 204);
     assert_eq!(api.delete(&database).await, 204);
     assert!(

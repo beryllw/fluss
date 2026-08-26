@@ -66,7 +66,7 @@ pub trait FlussBackend: Send + Sync + 'static {
         ctx: &RequestContext,
         table: &TablePath,
         descriptor: &TableDescriptor,
-    ) -> GatewayResult<TableInfo>;
+    ) -> GatewayResult<()>;
 
     /// Applies the change group in one native request.
     async fn alter_table(
@@ -74,7 +74,7 @@ pub trait FlussBackend: Send + Sync + 'static {
         ctx: &RequestContext,
         table: &TablePath,
         changes: AlterTableChanges,
-    ) -> GatewayResult<TableInfo>;
+    ) -> GatewayResult<()>;
 
     async fn drop_table(&self, ctx: &RequestContext, table: &TablePath) -> GatewayResult<()>;
 

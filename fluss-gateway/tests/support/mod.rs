@@ -91,7 +91,7 @@ impl Api {
         )
     }
 
-    /// A body is absent for a 204, so it is reported as JSON null rather than as a parse failure.
+    /// Reports an empty body as JSON null in test results.
     async fn send(
         &self,
         request: reqwest::RequestBuilder,
@@ -112,8 +112,10 @@ impl Api {
         let body = if bytes.is_empty() {
             Value::Null
         } else {
-            serde_json::from_slice(&bytes)
-                .unwrap_or_else(|error| panic!("{path} answers JSON: {error}"))
+            Value::Object(
+                serde_json::from_slice(&bytes)
+                    .unwrap_or_else(|error| panic!("{path} answers a JSON object: {error}")),
+            )
         };
         (status, location, body)
     }
