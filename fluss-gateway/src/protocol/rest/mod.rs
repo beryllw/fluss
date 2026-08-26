@@ -33,13 +33,13 @@ pub mod metadata;
 pub mod openapi;
 pub mod pagination;
 
-use crate::backend::FlussBackend;
 use crate::backend::context::RequestContext;
 use crate::backend::types::ClusterId;
+use crate::backend::{FlussBackend, unknown_cluster};
 #[cfg(test)]
 use crate::config::REST_RESPONSE_GRACE;
 use crate::config::{RestServerConfig, rest_handler_timeout};
-use crate::error::{ErrorEnvelope, ErrorKind, GatewayError, panic_message};
+use crate::error::{ErrorEnvelope, ErrorKind, GatewayError, GatewayResult, panic_message};
 use crate::lifecycle::Readiness;
 use crate::observability;
 use axum::Router;
@@ -143,7 +143,7 @@ struct ShapedResponse;
 
 /// Renders the error envelope with the status its kind maps to, marks the response as already shaped, and adds
 /// `Retry-After` where the taxonomy calls for it.
-pub fn error_response(error: &GatewayError, request_id: &RequestId) -> Response {
+fn error_response(error: &GatewayError, request_id: &RequestId) -> Response {
     let status = StatusCode::from_u16(error.kind().http_status())
         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let mut response =
@@ -159,12 +159,12 @@ pub fn error_response(error: &GatewayError, request_id: &RequestId) -> Response 
 }
 
 /// Serializes `value` as a 200 JSON response. Fails only when serialization fails, which is reported as internal.
-pub fn json_response<T: Serialize>(value: &T) -> Result<Response, GatewayError> {
+fn json_response<T: Serialize>(value: &T) -> Result<Response, GatewayError> {
     json_response_with_status(StatusCode::OK, value)
 }
 
 /// Serializes `value` as a JSON response with the given status. Serialization failures are reported as internal.
-pub(crate) fn json_response_with_status<T: Serialize>(
+fn json_response_with_status<T: Serialize>(
     status: StatusCode,
     value: &T,
 ) -> Result<Response, GatewayError> {
@@ -180,7 +180,7 @@ pub(crate) fn json_response_with_status<T: Serialize>(
 }
 
 /// Reads a size-limited request body and deserializes it as JSON.
-pub async fn parse_json_body<T: DeserializeOwned>(mut request: Request) -> Result<T, GatewayError> {
+async fn parse_json_body<T: DeserializeOwned>(mut request: Request) -> Result<T, GatewayError> {
     let headers = std::mem::take(request.headers_mut());
     let body = Bytes::from_request(request, &()).await.map_err(|error| {
         if error.status() == StatusCode::PAYLOAD_TOO_LARGE {
@@ -224,7 +224,7 @@ fn validate_json_content_type(headers: &HeaderMap) -> Result<(), GatewayError> {
 }
 
 /// The request ID the outermost middleware assigned, for a handler rendering its own envelope.
-pub(crate) fn request_id(request: &Request) -> RequestId {
+fn request_id(request: &Request) -> RequestId {
     request
         .extensions()
         .get::<RequestId>()
@@ -232,11 +232,24 @@ pub(crate) fn request_id(request: &Request) -> RequestId {
         .unwrap_or_default()
 }
 
+/// Resolves a configured cluster and builds its backend request context.
+fn resolve_cluster(
+    state: &RestState,
+    request: &Request,
+    cluster: &str,
+) -> GatewayResult<(Arc<dyn FlussBackend>, RequestContext)> {
+    if !state.backend.has_cluster(cluster) {
+        return Err(unknown_cluster(cluster));
+    }
+    let cluster = ClusterId::try_from(cluster).expect("the backend serves this cluster ID");
+    Ok((state.backend.clone(), request_context(cluster, request)))
+}
+
 /// Builds the backend context of one cluster-scoped request from the middleware-assigned metadata.
 ///
 /// The caller is anonymous until the authenticator lands; the deadline and the cancellation signal are
 /// the ones the middleware also enforces, so a backend call cannot outlive its request.
-pub(crate) fn request_context(cluster_id: ClusterId, request: &Request) -> RequestContext {
+fn request_context(cluster_id: ClusterId, request: &Request) -> RequestContext {
     let deadline = request
         .extensions()
         .get::<RequestDeadline>()
@@ -255,13 +268,6 @@ pub(crate) fn request_context(cluster_id: ClusterId, request: &Request) -> Reque
         cancellation,
         None,
     )
-}
-
-/// Marks a response as final so the error-normalising middleware does not rewrite its body. Use it for handler
-/// responses that already carry their own envelope.
-pub fn shaped(mut response: Response) -> Response {
-    response.extensions_mut().insert(ShapedResponse);
-    response
 }
 
 /// Assembles the REST frontend from the REST configuration and the shared process services.
@@ -372,15 +378,9 @@ fn apply_acceptance_guard(router: Router, readiness: Arc<Readiness>) -> Router {
     }))
 }
 
-/// Applies the cross-cutting middleware stack to an already-routed app.
-///
-/// Exposed separately so tests can wrap purpose-built routers with the production middleware.
-/// The body-limit layer is a streaming-body backstop. Requests with a declared length are rejected earlier with an
-/// envelope.
-///
-/// Order (outermost first): request-id assignment and error normalisation, then access logging, then the
-/// body size and deadline limits.
-pub fn apply_middleware(router: Router, options: &RestOptions) -> Router {
+/// Wraps a test router with the production middleware.
+#[cfg(test)]
+fn apply_middleware(router: Router, options: &RestOptions) -> Router {
     apply_common_middleware(apply_data_limits(router, options), None)
 }
 

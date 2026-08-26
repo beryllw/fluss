@@ -19,15 +19,14 @@
 
 use crate::error::{ErrorEnvelope, GatewayError, GatewayResult};
 use crate::protocol::rest::datatype::ColumnDataType;
-use crate::protocol::rest::metadata::{
-    DatabaseResponse, PartitionResponse, TableResponse, resolve_cluster,
-};
+use crate::protocol::rest::metadata::{DatabaseResponse, PartitionResponse, TableResponse};
 use crate::protocol::rest::{
     RestState, error_response, json_response, json_response_with_status, parse_json_body,
-    request_id,
+    reject_query_parameters, request_id, resolve_cluster,
 };
 use axum::extract::{Path, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
+use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use fluss::metadata::{
     AddColumn, AlterConfig, AlterConfigOpType, AlterTableChanges, ColumnPositionType, DataType,
@@ -50,6 +49,7 @@ pub fn routes() -> OpenApiRouter<RestState> {
         .routes(routes!(drop_table))
         .routes(routes!(create_partition))
         .routes(routes!(drop_partition))
+        .route_layer(middleware::from_fn(reject_query_parameters))
 }
 
 /// Body of `POST /v1/clusters/{cluster}/databases`.
@@ -1279,11 +1279,12 @@ mod tests {
             ),
         ] {
             for (cluster, query, status, code) in [
+                ("other", "", StatusCode::NOT_FOUND, "cluster_not_found"),
                 (
                     "other",
                     "?dry_run=true",
-                    StatusCode::NOT_FOUND,
-                    "cluster_not_found",
+                    StatusCode::BAD_REQUEST,
+                    "invalid_argument",
                 ),
                 (
                     "default",

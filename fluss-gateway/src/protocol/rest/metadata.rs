@@ -17,16 +17,16 @@
 
 //! Catalog metadata endpoints.
 
+use crate::backend::FlussBackend;
 use crate::backend::context::RequestContext;
-use crate::backend::types::ClusterId;
-use crate::backend::{FlussBackend, unknown_cluster};
-use crate::error::{ErrorEnvelope, GatewayError, GatewayResult};
+use crate::error::{ErrorEnvelope, GatewayResult};
 use crate::protocol::rest::datatype::ColumnDataType;
 use crate::protocol::rest::pagination::{Collection, Page};
 use crate::protocol::rest::{
-    RestState, error_response, json_response, request_context, request_id,
+    RestState, error_response, json_response, reject_query_parameters, request_id, resolve_cluster,
 };
 use axum::extract::{Path, Request, State};
+use axum::middleware;
 use axum::response::Response;
 use fluss::metadata::{PartitionInfo, TableInfo, TablePath};
 use serde::Serialize;
@@ -156,9 +156,10 @@ pub struct PartitionsResponse {
 /// Metadata routes, merged into the main router by [`crate::protocol::rest::build_router`].
 pub fn routes() -> OpenApiRouter<RestState> {
     OpenApiRouter::new()
+        .routes(routes!(describe_table))
+        .route_layer(middleware::from_fn(reject_query_parameters))
         .routes(routes!(list_databases))
         .routes(routes!(list_tables))
-        .routes(routes!(describe_table))
         .routes(routes!(list_partitions))
 }
 
@@ -376,31 +377,9 @@ fn prepare_page(
     collection: Collection,
     scope: Option<&str>,
 ) -> GatewayResult<(Arc<dyn FlussBackend>, Page, RequestContext)> {
-    if !state.backend.has_cluster(cluster) {
-        return Err(unknown_cluster(cluster));
-    }
+    let (backend, ctx) = resolve_cluster(state, request, cluster)?;
     let page = Page::parse(request.uri(), cluster, collection, scope)?;
-    let cluster = ClusterId::try_from(cluster).expect("the backend serves this cluster ID");
-    let ctx = request_context(cluster, request);
-    Ok((state.backend.clone(), page, ctx))
-}
-
-/// Resolves a cluster and rejects query parameters on single-resource operations.
-pub(super) fn resolve_cluster(
-    state: &RestState,
-    request: &Request,
-    cluster: &str,
-) -> GatewayResult<(Arc<dyn FlussBackend>, RequestContext)> {
-    if !state.backend.has_cluster(cluster) {
-        return Err(unknown_cluster(cluster));
-    }
-    if request.uri().query().is_some() {
-        return Err(GatewayError::invalid_argument(
-            "this operation does not accept query parameters",
-        ));
-    }
-    let cluster = ClusterId::try_from(cluster).expect("the backend serves this cluster ID");
-    Ok((state.backend.clone(), request_context(cluster, request)))
+    Ok((backend, page, ctx))
 }
 
 #[cfg(test)]
@@ -457,7 +436,11 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, serde_json::json!({"databases": ["ops", "sales"]}));
 
-        let (status, body) = get(&app, "/v1/clusters/default/databases/sales/tables").await;
+        let (status, body) = get(
+            &app,
+            "/v1/clusters/default/databases/sales/tables?max_results=2",
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, serde_json::json!({"tables": ["customers", "orders"]}));
 
@@ -516,6 +499,8 @@ mod tests {
             "/v1/clusters/%FF/databases",
             "/v1/clusters/default/databases?page_token=nope!",
             "/v1/clusters/default/databases/missing/tables?max_results=99999",
+            "/v1/clusters/default/databases/sales/tables/orders?page_token=x",
+            "/v1/clusters/other/databases/sales/tables/orders?page_token=x",
         ] {
             let (status, body) = get(&app, path).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
@@ -525,11 +510,6 @@ mod tests {
         let (status, body) = get(&app, "/v1/clusters/default/databases/missing/tables").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["error"]["code"], "database_not_found");
-
-        let path = "/v1/clusters/default/databases/sales/tables/orders?page_token=x";
-        let (status, body) = get(&app, path).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(body["error"]["code"], "invalid_argument");
 
         for (operation, path) in [
             (Operation::ListDatabases, "/v1/clusters/default/databases"),
