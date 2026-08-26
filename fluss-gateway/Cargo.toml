@@ -66,7 +66,7 @@ hyper = { version = "1", default-features = false, features = ["http1", "server"
 # GracefulShutdown and the tower-to-hyper service adapter for the serve loop above. `http1` gates
 # the `GracefulConnection` impl `graceful.watch` needs, so it is requested rather than inherited.
 hyper-util = { version = "0.1", default-features = false, features = ["http1", "server-graceful", "service", "tokio"] }
-# Process CPU/RSS/fd sampling for the FIP-49 process_* metric families.
+# Process CPU/RSS/fd sampling for the process_* metric families.
 libc = "0.2"
 log = "0.4"
 metrics = "0.24"
@@ -77,7 +77,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 # Preserves the nested typed field path after file, env, and CLI values are merged.
 serde_path_to_error = "0.1"
-# The gateway.yaml configuration file is YAML with flat dotted keys (FIP-49).
+# The gateway.yaml configuration file is YAML with flat dotted keys.
 # serde_yaml_ng is the maintained, API-compatible fork of the archived serde_yaml crate.
 serde_yaml_ng = "0.10"
 # Runtime capabilities used by the server; test-only I/O/time controls are enabled below.

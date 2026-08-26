@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! FIP-49 catalog mutation endpoints.
+//! Catalog mutation endpoints.
 
 use crate::backend::FlussBackend;
 use crate::backend::context::RequestContext;
@@ -69,7 +69,7 @@ pub struct CreateDatabaseBody {
 pub struct ColumnBody {
     pub name: String,
     pub data_type: ColumnDataType,
-    /// Defaults to true. A primary-key column must not be declared nullable.
+    /// Defaults to true; fluss-rs makes primary-key columns non-nullable.
     pub nullable: Option<bool>,
     pub comment: Option<String>,
 }
@@ -89,7 +89,7 @@ pub struct DistributionBody {
 pub struct CreateTableBody {
     pub table_name: String,
     pub columns: Vec<ColumnBody>,
-    /// Present makes it a primary-key table, absent a log table (FIP-49).
+    /// Primary-key columns; omit for a log table.
     pub primary_key: Option<Vec<String>>,
     #[serde(default)]
     pub partitioned_by: Vec<String>,
@@ -135,7 +135,7 @@ pub enum TableChangeBody {
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AlterTableBody {
-    /// Schema and config changes must be submitted in separate requests.
+    /// The server currently rejects mixing schema and config changes.
     pub changes: Vec<TableChangeBody>,
 }
 
@@ -188,7 +188,7 @@ pub(crate) async fn create_database(
     result.unwrap_or_else(|error| error_response(&error, &request_id))
 }
 
-/// Drops one empty database.
+/// Drops a database only if it contains no tables.
 #[utoipa::path(
     delete,
     path = "/v1/clusters/{cluster}/databases/{database}",
@@ -410,8 +410,14 @@ pub(crate) async fn create_partition(
         let body: CreatePartitionBody = parse_json_body(&headers, &bytes)?;
         let table = TablePath::new(database, table);
         let current = backend.describe_table(&ctx, &table).await?;
-        let (spec, name) = partition(&body.partition, &current)?;
+        for value in body.partition.values() {
+            native_name("partition value", value, true)?;
+        }
+        let spec = PartitionSpec::new(body.partition.clone());
         backend.create_partition(&ctx, &table, &spec).await?;
+        // Resolve the Location only after Fluss accepts the unmodified spec.
+        let name = ResolvedPartitionSpec::from_partition_spec(current.partition_keys, &spec)
+            .get_partition_name();
         created_response(
             &PartitionResponse {
                 database: table.database().to_string(),
@@ -468,28 +474,10 @@ pub(crate) async fn drop_partition(
     result.unwrap_or_else(|error| error_response(&error, &request_id))
 }
 
-/// Builds a native descriptor, enforcing only REST-specific rules before the native builders run.
+/// Converts a REST definition using the native builders.
 fn table_descriptor(database: &str, body: CreateTableBody) -> GatewayResult<TableDescriptor> {
     native_name("database name", database, true)?;
     native_name("table name", &body.table_name, true)?;
-
-    if body.primary_key.as_ref().is_some_and(Vec::is_empty) {
-        return Err(GatewayError::invalid_argument(
-            "primary_key must contain at least one column when present",
-        ));
-    }
-    let primary_key = body.primary_key.unwrap_or_default();
-    for key in &primary_key {
-        if body
-            .columns
-            .iter()
-            .any(|column| column.name == *key && column.nullable.unwrap_or(true))
-        {
-            return Err(GatewayError::invalid_argument(format!(
-                "the primary-key column `{key}` must not be nullable"
-            )));
-        }
-    }
 
     let mut schema = Schema::builder();
     for column in body.columns {
@@ -502,7 +490,7 @@ fn table_descriptor(database: &str, body: CreateTableBody) -> GatewayResult<Tabl
             schema = schema.with_comment(comment);
         }
     }
-    if !primary_key.is_empty() {
+    if let Some(primary_key) = body.primary_key {
         schema = schema.primary_key(primary_key);
     }
     let schema = schema.build().map_err(|error| {
@@ -527,12 +515,6 @@ fn table_descriptor(database: &str, body: CreateTableBody) -> GatewayResult<Tabl
 
 /// Builds the native alter-table batch supported by the current Fluss API.
 fn table_changes(body: AlterTableBody) -> GatewayResult<AlterTableChanges> {
-    if body.changes.is_empty() {
-        return Err(GatewayError::invalid_argument(
-            "an alteration must contain at least one change",
-        ));
-    }
-
     let mut changes = AlterTableChanges::default();
     for change in body.changes {
         match change {
@@ -564,64 +546,11 @@ fn table_changes(body: AlterTableBody) -> GatewayResult<AlterTableChanges> {
             }
         }
     }
-    // Fluss currently requires schema and config changes in separate requests.
-    if !changes.add_columns.is_empty() && !changes.config_changes.is_empty() {
-        return Err(GatewayError::invalid_argument(
-            "schema and config changes cannot be mixed in one alteration",
-        ));
-    }
     Ok(changes)
-}
-
-/// Converts one exact REST partition map and returns its native name.
-fn partition(
-    entries: &HashMap<String, String>,
-    current: &TableInfo,
-) -> GatewayResult<(PartitionSpec, String)> {
-    if current.partition_keys.is_empty() {
-        return Err(GatewayError::invalid_argument(format!(
-            "the table `{}` is not partitioned",
-            current.table_path
-        )));
-    }
-    if entries.len() != current.partition_keys.len() {
-        return Err(GatewayError::invalid_argument(format!(
-            "the partition spec must contain exactly {} entries, one per partition key",
-            current.partition_keys.len()
-        )));
-    }
-
-    let values = current
-        .partition_keys
-        .iter()
-        .map(|key| {
-            entries
-                .get(key)
-                .ok_or_else(|| {
-                    GatewayError::invalid_argument(format!(
-                        "the partition spec is missing the partition key `{key}`"
-                    ))
-                })
-                .and_then(|value| {
-                    native_name("partition value", value, true)?;
-                    Ok(value.clone())
-                })
-        })
-        .collect::<GatewayResult<Vec<_>>>()?;
-    let resolved = ResolvedPartitionSpec::new(current.partition_keys.clone(), values)
-        .map_err(invalid_partition)?;
-    let name = resolved.get_partition_name();
-    Ok((resolved.to_partition_spec(), name))
 }
 
 /// Converts a native partition name from the REST path back into a spec.
 fn partition_of_name(name: &str, current: &TableInfo) -> GatewayResult<PartitionSpec> {
-    if current.partition_keys.is_empty() {
-        return Err(GatewayError::invalid_argument(format!(
-            "the table `{}` is not partitioned",
-            current.table_path
-        )));
-    }
     let values = name
         .split(PARTITION_SPEC_SEPARATOR)
         .map(|value| {
@@ -631,7 +560,7 @@ fn partition_of_name(name: &str, current: &TableInfo) -> GatewayResult<Partition
         .collect::<GatewayResult<Vec<_>>>()?;
     ResolvedPartitionSpec::new(current.partition_keys.clone(), values)
         .map(|resolved| resolved.to_partition_spec())
-        .map_err(invalid_partition)
+        .map_err(|error| GatewayError::invalid_argument(format!("invalid partition: {error}")))
 }
 
 fn native_name(kind: &str, value: &str, reject_internal_prefix: bool) -> GatewayResult<()> {
@@ -645,10 +574,6 @@ fn native_name(kind: &str, value: &str, reject_internal_prefix: bool) -> Gateway
         )));
     }
     Ok(())
-}
-
-fn invalid_partition(error: fluss::error::Error) -> GatewayError {
-    GatewayError::invalid_argument(format!("invalid partition: {error}"))
 }
 
 fn encoding_failure(error: impl std::fmt::Display) -> GatewayError {
@@ -732,14 +657,18 @@ fn encode_segment(segment: &str) -> String {
 #[cfg(test)]
 mod tests {
     use crate::backend::FlussBackend;
-    use crate::backend::fake::{FakeCall, FakeFlussBackend};
+    use crate::backend::fake::{FakeCall, FakeFlussBackend, Operation};
     use crate::error::{GatewayError, Resource};
     use crate::protocol::rest::test_support;
     use axum::body::Body;
     use axum::http::{Method, Request as HttpRequest, StatusCode, header};
-    use fluss::metadata::{AlterConfigOpType, TableInfo, TablePath};
+    use fluss::metadata::{
+        AlterConfigOpType, BigIntType, Column, DataType, DecimalType, Schema, StringType,
+        TableDescriptor, TableInfo, TablePath,
+    };
     use http_body_util::BodyExt;
     use serde_json::{Value, json};
+    use std::collections::HashMap;
     use std::sync::Arc;
     use tower::ServiceExt;
 
@@ -809,8 +738,8 @@ mod tests {
         json!({
             "table_name": "orders",
             "columns": [
-                {"name": "id", "data_type": {"type": "BIGINT"}, "nullable": false},
-                {"name": "dt", "data_type": {"type": "STRING"}, "nullable": false},
+                {"name": "id", "data_type": {"type": "BIGINT"}, "nullable": true},
+                {"name": "dt", "data_type": {"type": "STRING"}},
                 {"name": "amount", "data_type": {"type": "DECIMAL", "precision": 18, "scale": 2}, "comment": "the order total"},
             ],
             "primary_key": ["id", "dt"],
@@ -821,17 +750,16 @@ mod tests {
         })
     }
 
-    fn define_partitioned_table(backend: &FakeFlussBackend) {
-        let body = serde_json::from_value(partitioned_table()).expect("a table definition");
-        let descriptor = super::table_descriptor("sales", body).expect("a descriptor");
-        backend.define_table(TableInfo::of(
-            TablePath::new("sales", "orders"),
-            1,
-            1,
-            descriptor,
-            0,
-            0,
-        ));
+    fn partitioned_table_info(schema: Schema, configs: HashMap<String, String>) -> TableInfo {
+        let descriptor = TableDescriptor::builder()
+            .schema(schema)
+            .partitioned_by(vec!["dt"])
+            .distributed_by(Some(4), vec!["id".to_string()])
+            .properties(configs)
+            .comment("the backend table")
+            .build()
+            .expect("a fixture descriptor");
+        TableInfo::of(TablePath::new("sales", "orders"), 1, 1, descriptor, 0, 0)
     }
 
     #[tokio::test]
@@ -850,6 +778,23 @@ mod tests {
             Some("/v1/clusters/default/databases/sales")
         );
         assert_eq!(body, json!({"database": "sales"}));
+
+        let schema = Schema::builder()
+            .column("id", DataType::BigInt(BigIntType::with_nullable(false)))
+            .column("dt", DataType::String(StringType::with_nullable(false)))
+            .column(
+                "amount",
+                DataType::Decimal(DecimalType::with_nullable(true, 18, 2).unwrap()),
+            )
+            .with_comment("the order total")
+            .primary_key(["id", "dt"])
+            .build()
+            .expect("a fixture schema");
+        let mut configs = HashMap::from([
+            ("table.log.ttl".to_string(), "7d".to_string()),
+            ("table.datalake.enabled".to_string(), "true".to_string()),
+        ]);
+        backend.define_table(partitioned_table_info(schema.clone(), configs.clone()));
 
         let (status, location, body) = post(
             &app,
@@ -873,10 +818,27 @@ mod tests {
             })
         );
         assert_eq!(body["primary_key"], json!(["id", "dt"]));
+        assert_eq!(body["columns"][0]["nullable"], false);
+        assert_eq!(body["columns"][1]["nullable"], false);
+        assert_eq!(body["comment"], "the backend table");
+        assert_eq!(body["configs"], serde_json::to_value(&configs).unwrap());
 
-        define_partitioned_table(&backend);
+        let added_schema = Schema::builder()
+            .with_columns(schema.columns().to_vec())
+            .with_columns(vec![
+                Column::new("note", DataType::String(StringType::new()))
+                    .with_id(schema.highest_field_id() + 1)
+                    .with_comment("the backend note"),
+            ])
+            .primary_key(["id", "dt"])
+            .build()
+            .expect("an altered fixture schema");
+        backend.define_table(partitioned_table_info(
+            added_schema.clone(),
+            configs.clone(),
+        ));
 
-        let (status, _, _) = send(
+        let (status, _, body) = send(
             &app,
             Method::PATCH,
             "/v1/clusters/default/databases/sales/tables/orders",
@@ -888,8 +850,22 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["columns"].as_array().unwrap().len(), 4);
+        assert_eq!(
+            body["columns"][3],
+            json!({
+                "name": "note",
+                "data_type": {"type": "STRING"},
+                "nullable": true,
+                "comment": "the backend note",
+            })
+        );
 
-        let (status, _, _) = send(
+        configs.insert("table.log.ttl".to_string(), "30d".to_string());
+        configs.remove("table.datalake.enabled");
+        backend.define_table(partitioned_table_info(added_schema, configs.clone()));
+
+        let (status, _, body) = send(
             &app,
             Method::PATCH,
             "/v1/clusters/default/databases/sales/tables/orders",
@@ -902,6 +878,8 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["configs"], serde_json::to_value(&configs).unwrap());
+        assert_eq!(body["columns"].as_array().unwrap().len(), 4);
 
         let (status, location, body) = post(
             &app,
@@ -940,8 +918,18 @@ mod tests {
             panic!("expected create table, got {:?}", calls[1]);
         };
         assert_eq!(table, &TablePath::new("sales", "orders"));
+        assert_eq!(descriptor.schema(), &schema);
         assert_eq!(descriptor.partition_keys(), ["dt"]);
-        assert_eq!(descriptor.properties().get("table.log.ttl").unwrap(), "7d");
+        assert_eq!(
+            descriptor.table_distribution().unwrap().bucket_count(),
+            Some(4)
+        );
+        assert_eq!(descriptor.bucket_keys(), ["id"]);
+        assert_eq!(descriptor.comment(), Some("the orders table"));
+        assert_eq!(
+            descriptor.properties(),
+            &HashMap::from([("table.log.ttl".to_string(), "7d".to_string())])
+        );
 
         let FakeCall::AlterTable(_, add_column) = &calls[2] else {
             panic!("expected add column, got {:?}", calls[2]);
@@ -1011,34 +999,48 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
 
-        let mut invalid = partitioned_table();
-        invalid["validate_only"] = json!(true);
-        invalid["primary_key"] = json!(["absent"]);
-        let (status, _, _) =
-            post(&app, "/v1/clusters/default/databases/sales/tables", invalid).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        for (field, value) in [
+            ("primary_key", json!(["absent"])),
+            ("primary_key", json!([])),
+            (
+                "distribution",
+                json!({"bucket_count": 2, "bucket_keys": ["amount"]}),
+            ),
+            (
+                "columns",
+                json!([
+                    {"name": "id", "data_type": {"type": "BIGINT"}},
+                    {"name": "id", "data_type": {"type": "STRING"}}
+                ]),
+            ),
+        ] {
+            let mut invalid = partitioned_table();
+            invalid["validate_only"] = json!(true);
+            invalid[field] = value;
+            let (status, _, body) =
+                post(&app, "/v1/clusters/default/databases/sales/tables", invalid).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(body["error"]["code"], "invalid_argument");
+            assert!(
+                body["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("invalid table")
+            );
+        }
 
-        let mut outside_primary_key = partitioned_table();
-        outside_primary_key["validate_only"] = json!(true);
-        outside_primary_key["distribution"] = json!({"bucket_count": 2, "bucket_keys": ["amount"]});
+        let mut log_table = partitioned_table();
+        log_table["validate_only"] = json!(true);
+        log_table.as_object_mut().unwrap().remove("primary_key");
         let (status, _, body) = post(
             &app,
             "/v1/clusters/default/databases/sales/tables",
-            outside_primary_key,
+            log_table,
         )
         .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-
-        let mut empty_primary_key = partitioned_table();
-        empty_primary_key["validate_only"] = json!(true);
-        empty_primary_key["primary_key"] = json!([]);
-        let (status, _, body) = post(
-            &app,
-            "/v1/clusters/default/databases/sales/tables",
-            empty_primary_key,
-        )
-        .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["primary_key"], json!([]));
+        assert!(backend.calls().is_empty());
     }
 
     #[tokio::test]
@@ -1082,28 +1084,58 @@ mod tests {
     #[tokio::test]
     async fn a_conflict_and_a_missing_resource_keep_their_own_status() {
         let (backend, app) = gateway();
-        backend.fail_next(
-            GatewayError::already_exists("database already exists")
+        backend.fail_once(
+            Operation::DropDatabase,
+            GatewayError::failed_precondition("database is not empty")
                 .with_resource(Resource::Database),
         );
-
-        let (status, _, body) = post(
-            &app,
-            "/v1/clusters/default/databases",
-            json!({"database": "sales"}),
-        )
-        .await;
-        assert_eq!(status, StatusCode::CONFLICT);
-        assert_eq!(body["error"]["code"], "database_already_exists");
-
-        for (path, resource) in [
-            ("/v1/clusters/default/databases/absent", Resource::Database),
+        for (operation, path, definition, resource, code) in [
             (
+                Operation::CreateDatabase,
+                "/v1/clusters/default/databases",
+                json!({"database": "sales"}),
+                Resource::Database,
+                "database_already_exists",
+            ),
+            (
+                Operation::CreateTable,
+                "/v1/clusters/default/databases/sales/tables",
+                partitioned_table(),
+                Resource::Table,
+                "table_already_exists",
+            ),
+        ] {
+            backend.fail_once(
+                operation,
+                GatewayError::already_exists("already exists").with_resource(resource),
+            );
+            let (status, _, body) = post(&app, path, definition).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{operation:?}");
+            assert_eq!(body["error"]["code"], code);
+        }
+
+        let (status, body) = delete(&app, "/v1/clusters/default/databases/sales").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["code"], "database_not_empty");
+        let (status, _) = delete(&app, "/v1/clusters/default/databases/sales").await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        for (operation, path, resource) in [
+            (
+                Operation::DropDatabase,
+                "/v1/clusters/default/databases/absent",
+                Resource::Database,
+            ),
+            (
+                Operation::DropTable,
                 "/v1/clusters/default/databases/sales/tables/absent",
                 Resource::Table,
             ),
         ] {
-            backend.fail_next(GatewayError::not_found("missing").with_resource(resource));
+            backend.fail_once(
+                operation,
+                GatewayError::not_found("missing").with_resource(resource),
+            );
             let (status, body) = delete(&app, path).await;
             assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
             assert!(
@@ -1113,36 +1145,84 @@ mod tests {
                 "{path}: {body}"
             );
         }
-
-        backend.fail_next(
-            GatewayError::failed_precondition("database is not empty")
-                .with_resource(Resource::Database),
-        );
-        let (status, body) = delete(&app, "/v1/clusters/default/databases/sales").await;
-        assert_eq!(status, StatusCode::CONFLICT);
-        assert_eq!(body["error"]["code"], "database_not_empty");
     }
 
     #[tokio::test]
-    async fn a_partition_name_must_match_the_partition_keys() {
+    async fn partition_conversion_preserves_specs_and_backend_errors() {
         let (backend, app) = gateway();
-        define_partitioned_table(&backend);
+        let definition = serde_json::from_value(json!({
+            "table_name": "orders",
+            "columns": [
+                {"name": "region", "data_type": {"type": "STRING"}},
+                {"name": "dt", "data_type": {"type": "STRING"}}
+            ],
+            "partitioned_by": ["region", "dt"],
+            "distribution": {"bucket_count": 1, "bucket_keys": []}
+        }))
+        .unwrap();
+        backend.define_table(TableInfo::of(
+            TablePath::new("sales", "orders"),
+            1,
+            1,
+            super::table_descriptor("sales", definition).unwrap(),
+            0,
+            0,
+        ));
 
-        let (status, body) = delete(
-            &app,
-            "/v1/clusters/default/databases/sales/tables/orders/partitions/2026-08-25$eu",
-        )
-        .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(body["error"]["code"], "invalid_argument");
+        for name in ["eu", "eu$2026-08-25$extra"] {
+            let (status, body) = delete(
+                &app,
+                &format!("/v1/clusters/default/databases/sales/tables/orders/partitions/{name}"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(body["error"]["code"], "invalid_argument");
+        }
+        assert!(backend.calls().is_empty());
 
-        let (status, _, _) = post(
+        let (status, location, body) = post(
             &app,
             "/v1/clusters/default/databases/sales/tables/orders/partitions",
-            json!({"partition": {"region": "eu"}}),
+            json!({"partition": {"dt": "2026-08-25", "region": "eu"}}),
         )
         .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(
+            location.as_deref(),
+            Some("/v1/clusters/default/databases/sales/tables/orders/partitions/eu%242026-08-25")
+        );
+        assert_eq!(
+            body["partition"],
+            json!({"region": "eu", "dt": "2026-08-25"})
+        );
+
+        for partition in [
+            json!({}),
+            json!({"region": "eu"}),
+            json!({"dt": "2026-08-25", "region": "eu", "extra": "preserved"}),
+        ] {
+            backend.fail_once(
+                Operation::CreatePartition,
+                GatewayError::invalid_argument("backend rejected partition spec"),
+            );
+            let (status, _, body) = post(
+                &app,
+                "/v1/clusters/default/databases/sales/tables/orders/partitions",
+                json!({"partition": partition}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(body["error"]["message"], "backend rejected partition spec");
+            let calls = backend.calls();
+            let Some(FakeCall::CreatePartition(table, spec)) = calls.last() else {
+                panic!("expected create partition, got {calls:?}");
+            };
+            assert_eq!(table, &TablePath::new("sales", "orders"));
+            assert_eq!(
+                serde_json::to_value(spec.get_spec_map()).unwrap(),
+                partition
+            );
+        }
 
         let (status, _, body) = post(
             &app,
@@ -1152,12 +1232,13 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 
-        backend.fail_next(
+        backend.fail_once(
+            Operation::DropPartition,
             GatewayError::not_found("partition does not exist").with_resource(Resource::Partition),
         );
         let (status, body) = delete(
             &app,
-            "/v1/clusters/default/databases/sales/tables/orders/partitions/2026-08-25",
+            "/v1/clusters/default/databases/sales/tables/orders/partitions/eu%242026-08-25",
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
@@ -1165,24 +1246,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn schema_and_config_changes_must_use_separate_requests() {
+    async fn alterations_are_forwarded_and_backend_errors_are_preserved() {
         let (backend, app) = gateway();
 
-        let (status, _, body) = send(
-            &app,
-            Method::PATCH,
-            "/v1/clusters/default/databases/sales/tables/orders",
-            Some(json!({
-                "changes": [
-                    {"kind": "set_config", "key": "table.log.ttl", "value": "30d"},
-                    {"kind": "add_column", "name": "note", "data_type": {"type": "STRING"}},
-                ]
-            })),
-        )
-        .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(body["error"]["code"], "invalid_argument");
-        assert!(backend.calls().is_empty());
+        for changes in [
+            json!([]),
+            json!([
+                {"kind": "set_config", "key": "table.log.ttl", "value": "30d"},
+                {"kind": "add_column", "name": "note", "data_type": {"type": "STRING"}},
+            ]),
+        ] {
+            backend.fail_once(
+                Operation::AlterTable,
+                GatewayError::invalid_argument("backend rejected alteration"),
+            );
+            let (status, _, body) = send(
+                &app,
+                Method::PATCH,
+                "/v1/clusters/default/databases/sales/tables/orders",
+                Some(json!({"changes": changes})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(body["error"]["code"], "invalid_argument");
+            assert_eq!(body["error"]["message"], "backend rejected alteration");
+        }
+
+        let calls = backend.calls();
+        assert_eq!(calls.len(), 2);
+        for (i, call) in calls.iter().enumerate() {
+            let FakeCall::AlterTable(table, changes) = call else {
+                panic!("expected alter table, got {call:?}");
+            };
+            assert_eq!(table, &TablePath::new("sales", "orders"));
+            assert_eq!(changes.add_columns.len(), i);
+            assert_eq!(changes.config_changes.len(), i);
+        }
     }
 
     #[tokio::test]

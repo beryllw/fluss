@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! FIP-49 catalog metadata endpoints.
+//! Catalog metadata endpoints.
 
 use crate::backend::context::RequestContext;
 use crate::backend::types::ClusterId;
@@ -401,13 +401,14 @@ pub(super) fn resolve_cluster(
 #[cfg(test)]
 mod tests {
     use crate::backend::FlussBackend;
-    use crate::backend::fake::FakeFlussBackend;
+    use crate::backend::fake::{FakeFlussBackend, Operation};
+    use crate::error::GatewayError;
     use crate::protocol::rest::test_support;
     use axum::body::Body;
     use axum::http::{Request as HttpRequest, StatusCode};
     use fluss::metadata::{
-        BigIntType, DataType, DecimalType, Schema, StringType, TableDescriptor, TableInfo,
-        TablePath,
+        BigIntType, DataType, DecimalType, PartitionInfo, ResolvedPartitionSpec, Schema,
+        StringType, TableDescriptor, TableInfo, TablePath,
     };
     use http_body_util::BodyExt;
     use std::collections::HashMap;
@@ -489,8 +490,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_clusters_and_bad_parameters_keep_their_own_status() {
-        let app = app(catalog());
+    async fn metadata_errors_keep_their_own_status() {
+        let backend = catalog();
+        let app = app(Arc::clone(&backend));
 
         for path in [
             "/v1/clusters/other/databases",
@@ -520,6 +522,29 @@ mod tests {
         let (status, body) = get(&app, path).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["code"], "invalid_argument");
+
+        for (operation, path) in [
+            (Operation::ListDatabases, "/v1/clusters/default/databases"),
+            (
+                Operation::ListTables,
+                "/v1/clusters/default/databases/sales/tables",
+            ),
+            (
+                Operation::DescribeTable,
+                "/v1/clusters/default/databases/sales/tables/orders",
+            ),
+            (
+                Operation::ListPartitions,
+                "/v1/clusters/default/databases/sales/tables/orders/partitions",
+            ),
+        ] {
+            backend.fail_once(operation, GatewayError::unavailable("backend unavailable"));
+            let (status, body) = get(&app, path).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{operation:?}");
+            assert_eq!(body["error"]["code"], "unavailable");
+            assert_eq!(body["error"]["message"], "backend unavailable");
+            assert_eq!(get(&app, path).await.0, StatusCode::OK, "{operation:?}");
+        }
     }
 
     #[tokio::test]
@@ -601,9 +626,20 @@ mod tests {
         let table = TablePath::new("sales", "orders");
         backend.define_table(described_table());
         for name in ["2026-08-26", "2026-08-24", "2026-08-25"] {
-            backend.define_partition(&table, name);
+            let spec =
+                ResolvedPartitionSpec::new(Arc::from(["dt".to_string()]), vec![name.to_string()])
+                    .expect("a fixture partition");
+            backend.define_partition(&table, PartitionInfo::new(1, spec));
         }
+        backend.define_database("sales");
+        let mut updated = described_table();
+        updated.comment = Some("updated table".to_string());
+        backend.define_table(updated);
         let app = app(backend);
+
+        let (status, body) = get(&app, "/v1/clusters/default/databases/sales/tables/orders").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["comment"], "updated table");
 
         let (status, body) = get(
             &app,

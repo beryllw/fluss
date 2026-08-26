@@ -44,7 +44,7 @@ pub(crate) fn map_fluss_error(what: &str, error: FlussClientError) -> GatewayErr
         }
         _ => {
             log::error!("the Fluss request failed while trying to {what}: {error}");
-            // An unclassifiable native failure is the backend's, not the gateway's (FIP-49 `backend`).
+            // Unclassified native failures use `backend`, not `internal`.
             GatewayError::backend(format!("Fluss failed while trying to {what}"))
         }
     }

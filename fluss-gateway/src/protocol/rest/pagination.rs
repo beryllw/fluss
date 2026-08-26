@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Keyset pagination for the FIP-49 list endpoints.
+//! Keyset pagination for catalog list endpoints.
 //!
 //! The page token is self-describing: it carries the cluster and collection it belongs to, its scope,
 //! and the last name of the page it follows, base64url-encoded. Nothing is stored server-side, so any
@@ -36,9 +36,9 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 
-/// Page size when the request does not ask for one (FIP-49).
+/// Default page size.
 const DEFAULT_MAX_RESULTS: usize = 100;
-/// Largest page the gateway serves (FIP-49). Not configurable: it bounds one response body.
+/// Maximum page size, bounding one response body.
 const MAX_MAX_RESULTS: usize = 1000;
 /// Current token layout. A token from another version is rejected, never reinterpreted.
 const TOKEN_VERSION: u32 = 1;
@@ -344,7 +344,7 @@ mod tests {
         }
     }
 
-    /// The FIP-49 page-size contract, and the parameters the endpoints do not define.
+    /// Page-size bounds and unsupported query parameters.
     #[test]
     fn the_page_size_is_bounded_and_unknown_parameters_are_refused() {
         let parse = |query: &str| Page::parse(&uri(query), "default", Collection::Databases, None);

@@ -17,7 +17,7 @@
 
 //! Health endpoints.
 //!
-//! `GET /health` returns the FIP-49 `{status, uptime_ms}` shape and answers from the event loop
+//! `GET /health` returns `{status, uptime_ms}` and answers from the event loop
 //! without a backend RPC; deeper diagnostics live in the Prometheus metrics, not in this payload.
 //! `GET /ready` is the readiness counterpart: 200 only while the gateway accepts traffic.
 
@@ -37,7 +37,7 @@ pub fn routes() -> OpenApiRouter<RestState> {
         .routes(routes!(ready))
 }
 
-/// Response of `GET /health` (FIP-49): liveness plus process uptime.
+/// Response of `GET /health`: liveness plus process uptime.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct HealthResponse {
     pub status: &'static str,
@@ -45,7 +45,7 @@ pub struct HealthResponse {
     pub uptime_ms: u64,
 }
 
-/// The FIP-49 health summary: `{status, uptime_ms}`, always 200 while the process answers.
+/// Returns process liveness and uptime without a backend RPC.
 #[utoipa::path(
     get,
     path = "/health",
@@ -130,7 +130,7 @@ mod tests {
         serde_json::from_slice(&bytes).expect("json body")
     }
 
-    /// `/health` answers the FIP-49 `{status, uptime_ms}` shape and nothing else.
+    /// `/health` answers `{status, uptime_ms}` and nothing else.
     #[tokio::test]
     async fn health_answers_status_and_uptime_only() {
         let response = get(app(), "/health").await;
@@ -141,7 +141,7 @@ mod tests {
         assert_eq!(
             json.as_object().expect("object").len(),
             2,
-            "no diagnostic fields beyond the FIP shape: {json}"
+            "no diagnostic fields beyond status and uptime_ms: {json}"
         );
     }
 

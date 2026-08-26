@@ -1023,9 +1023,8 @@ impl GatewayConfig {
         }
 
         if cluster.identity_mode == IdentityMode::User {
-            // Refused rather than silently downgraded to the shared service account: turning
-            // "isolated per caller" into "everyone shares one identity" is a security problem, not a
-            // degradation (FIP-49: configuring user mode fails at startup until Fluss ships act-as).
+            // Reject user mode until per-caller identities are supported; never fall back to
+            // the shared service account.
             problems.push(format!(
                 "{} user is not supported yet: fluss-rust cannot send a SASL authorization ID, and \
                  client authentication is not implemented",

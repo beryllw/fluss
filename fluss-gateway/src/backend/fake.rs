@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Recorded backend calls and fixed catalog responses for protocol tests.
+//! Fixed catalog fixtures, recorded mutations, and operation-scoped failures for protocol tests.
 
 use crate::backend::context::RequestContext;
 use crate::backend::types::ClusterId;
@@ -23,23 +23,39 @@ use crate::backend::{FlussBackend, unknown_cluster};
 use crate::error::{GatewayError, GatewayResult, Resource};
 use async_trait::async_trait;
 use fluss::metadata::{
-    AlterTableChanges, DataType, PartitionInfo, PartitionSpec, ResolvedPartitionSpec, Schema,
-    TableDescriptor, TableInfo, TablePath,
+    AlterTableChanges, DataType, PartitionInfo, PartitionSpec, Schema, TableDescriptor, TableInfo,
+    TablePath,
 };
-use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::collections::{BTreeMap, HashMap, btree_map::Entry};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 const FIXTURE_TIME: i64 = 1_700_000_000_000;
 
 struct FakeTable {
     info: TableInfo,
-    partitions: BTreeMap<String, PartitionInfo>,
+    partitions: Vec<PartitionInfo>,
 }
 
+#[derive(Default)]
 struct FakeState {
     databases: BTreeMap<String, BTreeMap<String, FakeTable>>,
     calls: Vec<FakeCall>,
-    next_failure: Option<GatewayError>,
+    failures: HashMap<Operation, GatewayError>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Operation {
+    ListDatabases,
+    CreateDatabase,
+    DropDatabase,
+    ListTables,
+    DescribeTable,
+    CreateTable,
+    AlterTable,
+    DropTable,
+    ListPartitions,
+    CreatePartition,
+    DropPartition,
 }
 
 #[derive(Debug, Clone)]
@@ -72,11 +88,7 @@ impl FakeFlussBackend {
     pub fn with_catalog(databases: &[(&str, &[&str])]) -> Self {
         let backend = Self {
             clusters: vec![cluster_id("default")],
-            state: Mutex::new(FakeState {
-                databases: BTreeMap::new(),
-                calls: Vec::new(),
-                next_failure: None,
-            }),
+            state: Mutex::default(),
         };
         for (database, tables) in databases {
             backend.define_database(database);
@@ -97,80 +109,62 @@ impl FakeFlussBackend {
     }
 
     pub fn define_database(&self, name: &str) {
-        self.state()
-            .databases
-            .insert(name.to_string(), BTreeMap::new());
+        self.state().databases.entry(name.to_string()).or_default();
     }
 
     pub fn define_table(&self, info: TableInfo) {
         let mut state = self.state();
-        state
+        let tables = state
             .databases
             .entry(info.table_path.database().to_string())
-            .or_default()
-            .insert(
-                info.table_path.table().to_string(),
-                FakeTable {
+            .or_default();
+        match tables.entry(info.table_path.table().to_string()) {
+            Entry::Occupied(mut entry) => entry.get_mut().info = info,
+            Entry::Vacant(entry) => {
+                entry.insert(FakeTable {
                     info,
-                    partitions: BTreeMap::new(),
-                },
-            );
+                    partitions: Vec::new(),
+                });
+            }
+        }
     }
 
-    pub fn define_partition(&self, table: &TablePath, name: &str) {
+    pub fn define_partition(&self, table: &TablePath, info: PartitionInfo) {
         let mut state = self.state();
         let entry = state
             .databases
             .get_mut(table.database())
             .and_then(|tables| tables.get_mut(table.table()))
             .expect("the fixture table is defined");
-        let values = name.split('$').map(str::to_string).collect();
-        let resolved = ResolvedPartitionSpec::new(Arc::clone(&entry.info.partition_keys), values)
-            .expect("the fixture partition name matches");
-        entry
-            .partitions
-            .insert(name.to_string(), PartitionInfo::new(1, resolved));
+        entry.partitions.push(info);
     }
 
-    pub fn fail_next(&self, error: GatewayError) {
-        self.state().next_failure = Some(error);
+    pub fn fail_once(&self, operation: Operation, error: GatewayError) {
+        self.state().failures.insert(operation, error);
     }
 
     pub fn calls(&self) -> Vec<FakeCall> {
         self.state().calls.clone()
     }
 
-    fn read<T>(
+    fn call<T>(
         &self,
         ctx: &RequestContext,
+        operation: Operation,
+        mutation: Option<FakeCall>,
         answer: impl FnOnce(&FakeState) -> GatewayResult<T>,
     ) -> GatewayResult<T> {
-        self.check_cluster(ctx)?;
-        answer(&self.state())
-    }
-
-    fn record<T>(
-        &self,
-        ctx: &RequestContext,
-        call: FakeCall,
-        answer: impl FnOnce(&FakeState) -> GatewayResult<T>,
-    ) -> GatewayResult<T> {
-        self.check_cluster(ctx)?;
+        if !self.has_cluster(ctx.cluster_id().as_str()) {
+            return Err(unknown_cluster(ctx.cluster_id().as_str()));
+        }
         let mut state = self.state();
-        if let Some(error) = state.next_failure.take() {
+        if let Some(call) = mutation {
+            state.calls.push(call);
+        }
+        if let Some(error) = state.failures.remove(&operation) {
             return Err(error);
         }
-        let result = answer(&state)?;
-        state.calls.push(call);
-        Ok(result)
-    }
-
-    fn check_cluster(&self, ctx: &RequestContext) -> GatewayResult<()> {
-        if self.has_cluster(ctx.cluster_id().as_str()) {
-            Ok(())
-        } else {
-            Err(unknown_cluster(ctx.cluster_id().as_str()))
-        }
+        answer(&state)
     }
 
     fn state(&self) -> MutexGuard<'_, FakeState> {
@@ -192,15 +186,6 @@ fn fixture_table(table: TablePath) -> TableInfo {
         .distributed_by(Some(1), Vec::new())
         .build()
         .expect("the fixture descriptor is valid");
-    table_info(table, descriptor)
-}
-
-fn table_info(table: TablePath, descriptor: TableDescriptor) -> TableInfo {
-    let descriptor = if descriptor.table_distribution().is_some() {
-        descriptor
-    } else {
-        descriptor.with_bucket_count(1)
-    };
     TableInfo::of(table, 1, 1, descriptor, FIXTURE_TIME, FIXTURE_TIME)
 }
 
@@ -237,19 +222,25 @@ impl FlussBackend for FakeFlussBackend {
     }
 
     async fn list_databases(&self, ctx: &RequestContext) -> GatewayResult<Vec<String>> {
-        self.read(ctx, |state| Ok(state.databases.keys().cloned().collect()))
-    }
-
-    async fn create_database(&self, ctx: &RequestContext, database: &str) -> GatewayResult<()> {
-        self.record(ctx, FakeCall::CreateDatabase(database.to_string()), |_| {
-            Ok(())
+        self.call(ctx, Operation::ListDatabases, None, |state| {
+            Ok(state.databases.keys().cloned().collect())
         })
     }
 
-    async fn drop_database(&self, ctx: &RequestContext, database: &str) -> GatewayResult<()> {
-        self.record(
+    async fn create_database(&self, ctx: &RequestContext, database: &str) -> GatewayResult<()> {
+        self.call(
             ctx,
-            FakeCall::DropDatabase(database.to_string()),
+            Operation::CreateDatabase,
+            Some(FakeCall::CreateDatabase(database.to_string())),
+            |_| Ok(()),
+        )
+    }
+
+    async fn drop_database(&self, ctx: &RequestContext, database: &str) -> GatewayResult<()> {
+        self.call(
+            ctx,
+            Operation::DropDatabase,
+            Some(FakeCall::DropDatabase(database.to_string())),
             |_| Ok(()),
         )
     }
@@ -259,7 +250,7 @@ impl FlussBackend for FakeFlussBackend {
         ctx: &RequestContext,
         database: &str,
     ) -> GatewayResult<Vec<String>> {
-        self.read(ctx, |state| {
+        self.call(ctx, Operation::ListTables, None, |state| {
             Ok(database_of(state, database)?.keys().cloned().collect())
         })
     }
@@ -269,7 +260,9 @@ impl FlussBackend for FakeFlussBackend {
         ctx: &RequestContext,
         table: &TablePath,
     ) -> GatewayResult<TableInfo> {
-        self.read(ctx, |state| Ok(table_of(state, table)?.info.clone()))
+        self.call(ctx, Operation::DescribeTable, None, |state| {
+            Ok(table_of(state, table)?.info.clone())
+        })
     }
 
     async fn create_table(
@@ -278,10 +271,11 @@ impl FlussBackend for FakeFlussBackend {
         table: &TablePath,
         descriptor: &TableDescriptor,
     ) -> GatewayResult<TableInfo> {
-        self.record(
+        self.call(
             ctx,
-            FakeCall::CreateTable(table.clone(), descriptor.clone()),
-            |_| Ok(table_info(table.clone(), descriptor.clone())),
+            Operation::CreateTable,
+            Some(FakeCall::CreateTable(table.clone(), descriptor.clone())),
+            |state| Ok(table_of(state, table)?.info.clone()),
         )
     }
 
@@ -291,13 +285,21 @@ impl FlussBackend for FakeFlussBackend {
         table: &TablePath,
         changes: AlterTableChanges,
     ) -> GatewayResult<TableInfo> {
-        self.record(ctx, FakeCall::AlterTable(table.clone(), changes), |state| {
-            Ok(table_of(state, table)?.info.clone())
-        })
+        self.call(
+            ctx,
+            Operation::AlterTable,
+            Some(FakeCall::AlterTable(table.clone(), changes)),
+            |state| Ok(table_of(state, table)?.info.clone()),
+        )
     }
 
     async fn drop_table(&self, ctx: &RequestContext, table: &TablePath) -> GatewayResult<()> {
-        self.record(ctx, FakeCall::DropTable(table.clone()), |_| Ok(()))
+        self.call(
+            ctx,
+            Operation::DropTable,
+            Some(FakeCall::DropTable(table.clone())),
+            |_| Ok(()),
+        )
     }
 
     async fn list_partitions(
@@ -305,12 +307,8 @@ impl FlussBackend for FakeFlussBackend {
         ctx: &RequestContext,
         table: &TablePath,
     ) -> GatewayResult<Vec<PartitionInfo>> {
-        self.read(ctx, |state| {
-            Ok(table_of(state, table)?
-                .partitions
-                .values()
-                .cloned()
-                .collect())
+        self.call(ctx, Operation::ListPartitions, None, |state| {
+            Ok(table_of(state, table)?.partitions.clone())
         })
     }
 
@@ -320,9 +318,10 @@ impl FlussBackend for FakeFlussBackend {
         table: &TablePath,
         spec: &PartitionSpec,
     ) -> GatewayResult<()> {
-        self.record(
+        self.call(
             ctx,
-            FakeCall::CreatePartition(table.clone(), spec.clone()),
+            Operation::CreatePartition,
+            Some(FakeCall::CreatePartition(table.clone(), spec.clone())),
             |_| Ok(()),
         )
     }
@@ -333,9 +332,10 @@ impl FlussBackend for FakeFlussBackend {
         table: &TablePath,
         spec: &PartitionSpec,
     ) -> GatewayResult<()> {
-        self.record(
+        self.call(
             ctx,
-            FakeCall::DropPartition(table.clone(), spec.clone()),
+            Operation::DropPartition,
+            Some(FakeCall::DropPartition(table.clone(), spec.clone())),
             |_| Ok(()),
         )
     }

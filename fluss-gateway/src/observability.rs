@@ -17,11 +17,8 @@
 
 //! Process logging and the gateway metric inventory.
 //!
-//! [`METRIC_DEFINITIONS`] tracks the FIP-49 metric table: every family declared here is one the
-//! specification names, with its kind, unit, description, and label set. Families the FIP defines for
-//! capabilities that do not exist yet — the backend write and connection-pool families, the re-exported
-//! client backpressure families — arrive with those capabilities. The inventory never grows a family of its
-//! own; the tests below enforce that against the table.
+//! [`METRIC_DEFINITIONS`] lists implemented metric families with their kinds, units, descriptions,
+//! and label sets. Families for future capabilities are added alongside their implementations.
 //!
 //! Labels describe an operation or a bounded outcome. `cluster`, sourced from validated configuration, is the
 //! only resource-name label the gateway itself emits.
@@ -59,8 +56,7 @@ static METRICS_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
 /// configured deadline.
 ///
 /// Without explicit buckets `metrics-exporter-prometheus` renders every histogram as a summary with
-/// pre-computed quantiles, which cannot be aggregated across gateway instances — and FIP-49 asks for a
-/// histogram.
+/// pre-computed quantiles, which cannot be aggregated across gateway instances.
 const DURATION_BUCKETS: &[f64] = &[
     0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
 ];
@@ -84,16 +80,13 @@ pub struct MetricDefinition {
     pub labels: &'static [&'static str],
 }
 
-/// The gateway's slice of the FIP-49 metric table.
-///
-/// Adding an emission site means adding its family here first, and a family may only be added if the FIP
-/// declares it.
+/// Implemented metric families and their labels.
 pub const METRIC_DEFINITIONS: &[MetricDefinition] = &[
     metric(
         "fluss_gateway_rest_requests_total",
         MetricKind::Counter,
         None,
-        "Completed REST requests. `operation` is the matched route template (FIP-49), `code` \
+        "Completed REST requests. `operation` is the matched route template, `code` \
          the HTTP status, and `cluster` the bounded configured-cluster label (`none` for \
          cluster-free routes, `unknown` for unconfigured IDs).",
         &["cluster", "method", "operation", "code"],
@@ -105,7 +98,7 @@ pub const METRIC_DEFINITIONS: &[MetricDefinition] = &[
         "REST request duration.",
         &["cluster", "method", "operation"],
     ),
-    // FIP-49 connection families, reported per configured cluster by the backend runtime. The per-user
+    // Connection families, reported per configured cluster by the backend runtime. The per-user
     // act-as pool of the user identity mode reports into the same families when it arrives: they count the
     // Fluss connections the gateway holds for a cluster, whoever they are opened for.
     metric(
@@ -129,7 +122,7 @@ pub const METRIC_DEFINITIONS: &[MetricDefinition] = &[
         "Fluss connections released for a configured cluster. `reason` is `idle` or `shutdown`.",
         &["cluster", "reason"],
     ),
-    // FIP-49 process and Tokio runtime families, sampled periodically by the runtime sampler.
+    // Process and Tokio runtime families, sampled periodically by the runtime sampler.
     metric(
         "process_cpu_seconds_total",
         MetricKind::Counter,
@@ -172,7 +165,7 @@ pub const METRIC_DEFINITIONS: &[MetricDefinition] = &[
         "Tasks waiting in the Tokio injection queue.",
         &[],
     ),
-    // FIP-49 also lists `tokio_worker_busy_seconds_total`; it needs the `tokio_unstable` runtime
+    // `tokio_worker_busy_seconds_total` needs the `tokio_unstable` runtime
     // metrics and is added once the build enables them.
 ];
 
@@ -222,10 +215,8 @@ pub fn init_metrics(enabled: bool) -> Result<(), String> {
 
 /// Records one completed REST request against the matched route template, never the raw URI.
 ///
-/// `operation` and `code` are the FIP-49 label names: the operation is the matched route
-/// template, the code the HTTP status. `cluster` is already bounded by the caller: a configured
-/// cluster ID, `unknown` for a request that named an unconfigured one, or `none` for routes
-/// without a cluster segment.
+/// `operation` is the matched route template; `code` is the HTTP status. The caller bounds
+/// `cluster` to a configured ID, `unknown` for unconfigured IDs, or `none` for cluster-free routes.
 pub fn http_request(cluster: &str, method: &str, operation: &str, code: u16, duration: Duration) {
     metrics::counter!(
         "fluss_gateway_rest_requests_total",
@@ -279,7 +270,7 @@ pub fn connections_active(cluster: &str, active: usize) {
     .set(active as f64);
 }
 
-/// Samples the FIP-49 process and Tokio runtime gauges once.
+/// Samples process and Tokio runtime gauges once.
 ///
 /// Called periodically by the lifecycle's runtime sampler; each source that a platform cannot
 /// provide is skipped rather than published as zero.
@@ -359,8 +350,7 @@ fn process_open_fds() -> Option<f64> {
     None
 }
 
-/// The soft file descriptor limit, from `getrlimit(2)`. FIP-49 pairs it with `process_open_fds` so the count
-/// can be read against its ceiling.
+/// The soft file descriptor limit from `getrlimit(2)`, paired with `process_open_fds`.
 #[cfg(unix)]
 fn process_max_fds() -> Option<f64> {
     let mut limit = std::mem::MaybeUninit::<libc::rlimit>::zeroed();
@@ -433,8 +423,8 @@ mod tests {
         assert_eq!(parse_level("module=debug"), LevelFilter::Info);
     }
 
-    /// The FIP-49 metric table, verbatim. The gateway may implement a subset of it and nothing outside it.
-    const FIP_49_FAMILIES: &[&str] = &[
+    /// Allowed metric families, including those reserved for future capabilities.
+    const ALLOWED_METRIC_FAMILIES: &[&str] = &[
         "fluss_gateway_rest_requests_total",
         "fluss_gateway_rest_request_duration_seconds",
         "fluss_gateway_backend_write_rows_total",
@@ -453,14 +443,12 @@ mod tests {
         "tokio_worker_busy_seconds_total",
     ];
 
-    /// Every declared family is one FIP-49 names — the inventory tracks the specification instead of
-    /// growing families of its own.
     #[test]
-    fn the_inventory_declares_nothing_the_fip_does_not() {
+    fn the_inventory_uses_only_allowed_families() {
         for definition in METRIC_DEFINITIONS {
             assert!(
-                FIP_49_FAMILIES.contains(&definition.name),
-                "{} is not in the FIP-49 metric table",
+                ALLOWED_METRIC_FAMILIES.contains(&definition.name),
+                "{} is not an allowed metric family",
                 definition.name
             );
         }
@@ -492,7 +480,7 @@ mod tests {
         assert_eq!(names.len(), total, "duplicate metric family declared");
     }
 
-    /// Gateway-owned families keep their label sets bounded. The FIP's re-exported
+    /// Gateway-owned families keep their label sets bounded. Re-exported
     /// `fluss_client_writer_kv_backpressure_*` families do carry `database` / `table`; they come from the
     /// client recorder, not from here, and this rule is relaxed for them when they arrive.
     #[test]

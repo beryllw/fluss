@@ -339,7 +339,7 @@ async fn start_internal(
                 shutdown.clone(),
             ),
         );
-        // Samples the FIP-49 process_* and tokio_* gauges alongside the exporter they feed.
+        // Sample process and Tokio metrics alongside their exporter.
         let sampler_shutdown = shutdown.clone();
         spawn_named(&mut tasks, "runtime metrics sampler", async move {
             let mut interval = tokio::time::interval(Duration::from_secs(10));

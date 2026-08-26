@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! FIP-49 data types using Fluss's persisted structured vocabulary.
+//! REST data types using Fluss's persisted structured vocabulary.
 
 use crate::error::{GatewayError, GatewayResult};
 use fluss::metadata::{
@@ -24,12 +24,10 @@ use fluss::metadata::{
     StringType, TimeType, TimestampLTzType, TimestampType, TinyIntType,
 };
 use serde::{Deserialize, Deserializer, Serialize};
-use std::collections::HashSet;
 use utoipa::openapi::{RefOr, Schema};
 use utoipa::{PartialSchema, ToSchema};
 
 const MAX_TYPE_NESTING: usize = 64;
-const MAX_FIXED_LENGTH: usize = i32::MAX as usize;
 
 /// The exact recursive Fluss type as it appears on the wire.
 #[derive(Debug, Deserialize, Serialize, ToSchema)]
@@ -71,7 +69,6 @@ pub enum WireDataType {
     Char {
         #[serde(default = "default_nullable", skip_serializing_if = "is_true")]
         nullable: bool,
-        #[schema(minimum = 1, maximum = 2147483647)]
         length: u32,
     },
     String {
@@ -118,7 +115,6 @@ pub enum WireDataType {
     Binary {
         #[serde(default = "default_nullable", skip_serializing_if = "is_true")]
         nullable: bool,
-        #[schema(minimum = 1, maximum = 2147483647)]
         length: usize,
     },
     Array {
@@ -272,19 +268,20 @@ impl From<&DataField> for WireRowField {
 impl TryFrom<WireDataType> for DataType {
     type Error = GatewayError;
 
-    /// Builds the native type while enforcing its persisted wire constraints.
+    /// Builds the native type using its constructors.
     fn try_from(data_type: WireDataType) -> Result<Self, Self::Error> {
         to_native(data_type, 0)
     }
 }
 
-/// Builds the native tree, applying only the rules a native constructor does not.
+/// Builds the native tree within the gateway's nesting limit.
 fn to_native(data_type: WireDataType, depth: usize) -> GatewayResult<DataType> {
     if depth > MAX_TYPE_NESTING {
         return Err(GatewayError::invalid_argument(format!(
             "the data type nests deeper than {MAX_TYPE_NESTING} levels"
         )));
     }
+    // TODO: Delegate length and ROW field validation once fluss-rs supports it.
     let converted = match data_type {
         WireDataType::Boolean { nullable } => {
             DataType::Boolean(BooleanType::with_nullable(nullable))
@@ -300,11 +297,6 @@ fn to_native(data_type: WireDataType, depth: usize) -> GatewayResult<DataType> {
         WireDataType::Float { nullable } => DataType::Float(FloatType::with_nullable(nullable)),
         WireDataType::Double { nullable } => DataType::Double(DoubleType::with_nullable(nullable)),
         WireDataType::Char { nullable, length } => {
-            if !(1..=i32::MAX as u32).contains(&length) {
-                return Err(GatewayError::invalid_argument(format!(
-                    "a CHAR length must be between 1 and {MAX_FIXED_LENGTH}"
-                )));
-            }
             DataType::Char(CharType::with_nullable(length, nullable))
         }
         WireDataType::String { nullable } => DataType::String(StringType::with_nullable(nullable)),
@@ -334,11 +326,6 @@ fn to_native(data_type: WireDataType, depth: usize) -> GatewayResult<DataType> {
         ),
         WireDataType::Bytes { nullable } => DataType::Bytes(BytesType::with_nullable(nullable)),
         WireDataType::Binary { nullable, length } => {
-            if !(1..=MAX_FIXED_LENGTH).contains(&length) {
-                return Err(GatewayError::invalid_argument(format!(
-                    "a BINARY length must be between 1 and {MAX_FIXED_LENGTH}"
-                )));
-            }
             DataType::Binary(BinaryType::with_nullable(nullable, length))
         }
         WireDataType::Array {
@@ -357,35 +344,19 @@ fn to_native(data_type: WireDataType, depth: usize) -> GatewayResult<DataType> {
             to_native(*key_type, depth + 1)?,
             to_native(*value_type, depth + 1)?,
         )),
-        WireDataType::Row { nullable, fields } => {
-            let mut names = HashSet::with_capacity(fields.len());
-            for field in &fields {
-                if field.name.is_empty() || field.name.chars().any(char::is_control) {
-                    return Err(GatewayError::invalid_argument(
-                        "a row field name must be non-empty and contain no control characters",
-                    ));
-                }
-                if !names.insert(field.name.as_str()) {
-                    return Err(GatewayError::invalid_argument(format!(
-                        "the row field `{}` is declared twice",
-                        field.name
-                    )));
-                }
-            }
-            DataType::Row(RowType::with_nullable(
-                nullable,
-                fields
-                    .into_iter()
-                    .map(|field| {
-                        Ok(DataField::new(
-                            field.name,
-                            to_native(field.field_type, depth + 1)?,
-                            field.description,
-                        ))
-                    })
-                    .collect::<GatewayResult<Vec<_>>>()?,
-            ))
-        }
+        WireDataType::Row { nullable, fields } => DataType::Row(RowType::with_nullable(
+            nullable,
+            fields
+                .into_iter()
+                .map(|field| {
+                    Ok(DataField::new(
+                        field.name,
+                        to_native(field.field_type, depth + 1)?,
+                        field.description,
+                    ))
+                })
+                .collect::<GatewayResult<Vec<_>>>()?,
+        )),
     };
     Ok(converted)
 }
@@ -615,23 +586,13 @@ mod tests {
     }
 
     #[test]
-    fn native_conversion_enforces_parameter_and_nesting_bounds() {
+    fn native_constructors_and_nesting_limit_define_validation() {
         for body in [
             json!({"type": "DECIMAL", "precision": 0, "scale": 0}),
             json!({"type": "DECIMAL", "precision": 2, "scale": 3}),
             json!({"type": "TIME_WITHOUT_TIME_ZONE", "precision": 10}),
             json!({"type": "TIMESTAMP_WITHOUT_TIME_ZONE", "precision": 10}),
             json!({"type": "TIMESTAMP_WITH_LOCAL_TIME_ZONE", "precision": 10}),
-            json!({"type": "CHAR", "length": 0}),
-            json!({"type": "CHAR", "length": MAX_FIXED_LENGTH + 1}),
-            json!({"type": "BINARY", "length": 0}),
-            json!({"type": "BINARY", "length": MAX_FIXED_LENGTH + 1}),
-            json!({"type": "ROW", "fields": [{"name": "", "field_type": {"type": "INTEGER"}}]}),
-            json!({"type": "ROW", "fields": [{"name": "a\nb", "field_type": {"type": "INTEGER"}}]}),
-            json!({"type": "ROW", "fields": [
-                {"name": "id", "field_type": {"type": "INTEGER"}},
-                {"name": "id", "field_type": {"type": "STRING"}}
-            ]}),
         ] {
             let wire: WireDataType =
                 serde_json::from_value(body.clone()).expect("the shape parses");
@@ -644,12 +605,23 @@ mod tests {
             );
         }
 
-        for type_name in ["CHAR", "BINARY"] {
-            for length in [1, MAX_FIXED_LENGTH] {
+        for length in [0, 1, u32::MAX] {
+            for (type_name, native) in [
+                ("CHAR", DataType::Char(CharType::new(length))),
+                ("BINARY", DataType::Binary(BinaryType::new(length as usize))),
+            ] {
                 let body = json!({"type": type_name, "length": length});
-                assert_eq!(render(&parse(body.clone()).unwrap()), body);
+                assert_eq!(parse(body.clone()).unwrap(), native);
+                assert_eq!(render(&native), body);
             }
         }
+
+        let fields = ["", "a\nb", "id", "id"]
+            .into_iter()
+            .map(|name| DataField::new(name, DataType::Int(IntType::new()), None))
+            .collect();
+        let native = DataType::Row(RowType::new(fields));
+        assert_eq!(parse(render(&native)).unwrap(), native);
 
         for depth in [MAX_TYPE_NESTING, MAX_TYPE_NESTING + 1] {
             let mut wire = WireDataType::Int { nullable: true };

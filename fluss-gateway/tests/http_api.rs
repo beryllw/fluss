@@ -70,7 +70,7 @@ async fn an_unknown_route_returns_the_shared_error_envelope() {
     assert_eq!(
         body["error"].as_object().expect("error object").len(),
         3,
-        "the FIP-49 envelope carries code, message, and the correlating request id: {body}"
+        "the error envelope carries code, message, and the correlating request id: {body}"
     );
 
     gateway.shutdown().await.expect("clean shutdown");

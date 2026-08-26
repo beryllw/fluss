@@ -134,7 +134,7 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
-    /// The checked-in `openapi.yaml` next to this crate's `Cargo.toml` (FIP-49).
+    /// The checked-in `openapi.yaml` next to this crate's `Cargo.toml`.
     fn checked_in_path() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("openapi.yaml")
     }
@@ -149,7 +149,7 @@ mod tests {
     }
 
     /// The checked-in document always matches the served one, so the published specification
-    /// cannot drift from the implementation (FIP-49 schema-validation contract).
+    /// cannot drift from the implementation.
     #[tokio::test]
     async fn the_checked_in_document_matches_the_served_one() {
         let checked_in = std::fs::read_to_string(checked_in_path())
@@ -213,7 +213,7 @@ mod tests {
             document["paths"]["/v1/clusters/{cluster}/databases/{database}"]
                 .get("get")
                 .is_none(),
-            "FIP-49 does not define describeDatabase"
+            "the API does not expose describeDatabase"
         );
         assert_eq!(
             schemas["TableResponse"]["required"],

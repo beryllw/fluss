@@ -5,7 +5,7 @@ components:
       description: Body of `PATCH /v1/clusters/{cluster}/databases/{database}/tables/{table}`.
       properties:
         changes:
-          description: Schema and config changes must be submitted in separate requests.
+          description: The server currently rejects mixing schema and config changes.
           items:
             $ref: '#/components/schemas/TableChangeBody'
           type: array
@@ -35,7 +35,7 @@ components:
         name:
           type: string
         nullable:
-          description: Defaults to true. A primary-key column must not be declared nullable.
+          description: Defaults to true; fluss-rs makes primary-key columns non-nullable.
           type:
           - boolean
           - 'null'
@@ -113,8 +113,7 @@ components:
         properties:
           length:
             format: int32
-            maximum: 2147483647
-            minimum: 1
+            minimum: 0
             type: integer
           type:
             enum:
@@ -220,8 +219,7 @@ components:
       - additionalProperties: false
         properties:
           length:
-            maximum: 2147483647
-            minimum: 1
+            minimum: 0
             type: integer
           type:
             enum:
@@ -337,7 +335,7 @@ components:
             type: string
           type: array
         primary_key:
-          description: Present makes it a primary-key table, absent a log table (FIP-49).
+          description: Primary-key columns; omit for a log table.
           items:
             type: string
           type:
@@ -464,7 +462,7 @@ components:
       - error
       type: object
     HealthResponse:
-      description: 'Response of `GET /health` (FIP-49): liveness plus process uptime.'
+      description: 'Response of `GET /health`: liveness plus process uptime.'
       properties:
         status:
           type: string
@@ -721,8 +719,7 @@ components:
         properties:
           length:
             format: int32
-            maximum: 2147483647
-            minimum: 1
+            minimum: 0
             type: integer
           nullable:
             type: boolean
@@ -844,8 +841,7 @@ components:
       - additionalProperties: false
         properties:
           length:
-            maximum: 2147483647
-            minimum: 1
+            minimum: 0
             type: integer
           nullable:
             type: boolean
@@ -949,7 +945,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
           description: Wrong method for this route
-      summary: 'The FIP-49 health summary: `{status, uptime_ms}`, always 200 while the process answers.'
+      summary: Returns process liveness and uptime without a backend RPC.
       tags:
       - health
   /ready:
@@ -1264,7 +1260,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
           description: Request deadline exceeded
-      summary: Drops one empty database.
+      summary: Drops a database only if it contains no tables.
       tags:
       - ddl
   /v1/clusters/{cluster}/databases/{database}/tables:
