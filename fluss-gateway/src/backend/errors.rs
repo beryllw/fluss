@@ -175,6 +175,11 @@ pub(crate) mod tests {
                 "database_not_empty",
             ),
             (
+                api_failure(FlussError::PartitionMaxNumException),
+                ErrorKind::FailedPrecondition,
+                "failed_precondition",
+            ),
+            (
                 api_failure(FlussError::InvalidDatabaseException),
                 ErrorKind::InvalidArgument,
                 "invalid_argument",

@@ -92,7 +92,7 @@ impl Page {
                     max_results = value
                         .parse()
                         .ok()
-                        .filter(is_supported_page_size)
+                        .filter(|value| (1..=MAX_MAX_RESULTS).contains(value))
                         .ok_or_else(|| {
                             GatewayError::invalid_argument(format!(
                                 "max_results must be between 1 and {MAX_MAX_RESULTS}"
@@ -122,36 +122,27 @@ impl Page {
     ///
     /// The gateway sorts by UTF-8 byte order, because Fluss does not promise an order and keyset
     /// pagination needs one.
-    pub fn apply(&self, mut names: Vec<String>) -> (Vec<String>, Option<String>) {
-        names.sort_unstable();
-        let start = match &self.after {
-            Some(after) => names.partition_point(|name| name.as_str() <= after.as_str()),
-            None => 0,
-        };
-        let remaining = &names[start..];
-        let has_more = remaining.len() > self.max_results;
-        let page: Vec<String> = remaining.iter().take(self.max_results).cloned().collect();
-        let next = page
-            .last()
-            .filter(|_| has_more)
-            .map(|last| encode_token(&self.cluster, self.collection, self.scope.as_deref(), last));
-        (page, next)
+    pub fn apply(&self, names: Vec<String>) -> (Vec<String>, Option<String>) {
+        self.apply_by(names, |name| Cow::Borrowed(name))
     }
 
-    /// Paginates entries by a derived name.
+    /// Paginates entries by a borrowed or computed name.
     pub fn apply_by<T>(
         &self,
         mut entries: Vec<T>,
-        key: impl Fn(&T) -> String,
+        key: impl Fn(&T) -> Cow<'_, str>,
     ) -> (Vec<T>, Option<String>) {
-        entries.sort_unstable_by_key(|entry| key(entry));
+        entries.sort_unstable_by(|left, right| key(left).cmp(&key(right)));
         let start = match &self.after {
-            Some(after) => entries.partition_point(|entry| key(entry).as_str() <= after.as_str()),
+            Some(after) => entries.partition_point(|entry| key(entry).as_ref() <= after.as_str()),
             None => 0,
         };
-        let mut page: Vec<T> = entries.split_off(start);
-        let has_more = page.len() > self.max_results;
-        page.truncate(self.max_results);
+        let has_more = entries.len() - start > self.max_results;
+        let page: Vec<T> = entries
+            .into_iter()
+            .skip(start)
+            .take(self.max_results)
+            .collect();
         let next = page.last().filter(|_| has_more).map(|last| {
             encode_token(
                 &self.cluster,
@@ -162,10 +153,6 @@ impl Page {
         });
         (page, next)
     }
-}
-
-fn is_supported_page_size(value: &usize) -> bool {
-    (1..=MAX_MAX_RESULTS).contains(value)
 }
 
 /// The token payload. Compact field names keep the encoded token short.

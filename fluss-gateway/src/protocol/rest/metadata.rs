@@ -106,7 +106,6 @@ pub struct TableResponse {
 
 impl From<&TableInfo> for TableResponse {
     fn from(info: &TableInfo) -> Self {
-        // TODO: Echo only explicit configs when fluss-rs separates them from server defaults.
         Self {
             database: info.table_path.database().to_string(),
             table: info.table_path.table().to_string(),
@@ -181,8 +180,10 @@ pub fn routes() -> OpenApiRouter<RestState> {
         (status = 200, description = "Databases in lexical order", body = DatabasesResponse),
         (status = 400, description = "Invalid page parameter or page token", body = ErrorEnvelope),
         (status = 404, description = "Unknown cluster", body = ErrorEnvelope),
+        (status = 413, description = "Request body above the configured limit", body = ErrorEnvelope),
         (status = 429, description = "Metadata concurrency limit exceeded", body = ErrorEnvelope),
         (status = 500, description = "Fluss backend failure", body = ErrorEnvelope),
+        (status = 501, description = "Fluss does not support the operation or API version", body = ErrorEnvelope),
         (status = 503, description = "Fluss is unavailable, or the gateway is starting or shutting down", body = ErrorEnvelope),
         (status = 504, description = "Request deadline exceeded", body = ErrorEnvelope),
     )
@@ -193,7 +194,7 @@ pub(crate) async fn list_databases(
     request: Request,
 ) -> Response {
     let request_id = request_id(&request);
-    let prepared = prepare(&state, &request, &cluster, Collection::Databases, None);
+    let prepared = prepare_page(&state, &request, &cluster, Collection::Databases, None);
     let result = async {
         let (backend, page, ctx) = prepared?;
         let (databases, next_page_token) = page.apply(backend.list_databases(&ctx).await?);
@@ -225,8 +226,10 @@ pub(crate) async fn list_databases(
         (status = 200, description = "Tables in lexical order", body = TablesResponse),
         (status = 400, description = "Invalid page parameter or page token", body = ErrorEnvelope),
         (status = 404, description = "Unknown cluster or database", body = ErrorEnvelope),
+        (status = 413, description = "Request body above the configured limit", body = ErrorEnvelope),
         (status = 429, description = "Metadata concurrency limit exceeded", body = ErrorEnvelope),
         (status = 500, description = "Fluss backend failure", body = ErrorEnvelope),
+        (status = 501, description = "Fluss does not support the operation or API version", body = ErrorEnvelope),
         (status = 503, description = "Fluss is unavailable, or the gateway is starting or shutting down", body = ErrorEnvelope),
         (status = 504, description = "Request deadline exceeded", body = ErrorEnvelope),
     )
@@ -237,7 +240,7 @@ pub(crate) async fn list_tables(
     request: Request,
 ) -> Response {
     let request_id = request_id(&request);
-    let prepared = prepare(
+    let prepared = prepare_page(
         &state,
         &request,
         &cluster,
@@ -270,10 +273,11 @@ pub(crate) async fn list_tables(
     responses(
         (status = 200, description = "The table metadata", body = TableResponse),
         (status = 400, description = "Unsupported query parameter", body = ErrorEnvelope),
-        (status = 403, description = "Fluss refused the operation", body = ErrorEnvelope),
         (status = 404, description = "Unknown cluster, database, or table", body = ErrorEnvelope),
+        (status = 413, description = "Request body above the configured limit", body = ErrorEnvelope),
         (status = 429, description = "Metadata concurrency limit exceeded", body = ErrorEnvelope),
         (status = 500, description = "Fluss backend failure", body = ErrorEnvelope),
+        (status = 501, description = "Fluss does not support the operation or API version", body = ErrorEnvelope),
         (status = 503, description = "Fluss is unavailable, or the gateway is starting or shutting down", body = ErrorEnvelope),
         (status = 504, description = "Request deadline exceeded", body = ErrorEnvelope),
     )
@@ -315,10 +319,11 @@ pub(crate) async fn describe_table(
     responses(
         (status = 200, description = "Partitions in partition-name order", body = PartitionsResponse),
         (status = 400, description = "Invalid page parameter or page token", body = ErrorEnvelope),
-        (status = 403, description = "Fluss refused the operation", body = ErrorEnvelope),
         (status = 404, description = "Unknown cluster, database, or table", body = ErrorEnvelope),
+        (status = 413, description = "Request body above the configured limit", body = ErrorEnvelope),
         (status = 429, description = "Metadata concurrency limit exceeded", body = ErrorEnvelope),
         (status = 500, description = "Fluss backend failure", body = ErrorEnvelope),
+        (status = 501, description = "Fluss does not support the operation or API version", body = ErrorEnvelope),
         (status = 503, description = "Fluss is unavailable, or the gateway is starting or shutting down", body = ErrorEnvelope),
         (status = 504, description = "Request deadline exceeded", body = ErrorEnvelope),
     )
@@ -332,7 +337,7 @@ pub(crate) async fn list_partitions(
     let table = TablePath::new(database, table);
     // The page token is scoped to the qualified table, so a token minted for one table cannot page
     // another.
-    let prepared = prepare(
+    let prepared = prepare_page(
         &state,
         &request,
         &cluster,
@@ -343,7 +348,7 @@ pub(crate) async fn list_partitions(
         let (backend, page, ctx) = prepared?;
         let (partitions, next_page_token) = page
             .apply_by(backend.list_partitions(&ctx, &table).await?, |partition| {
-                partition.get_partition_name()
+                partition.get_partition_name().into()
             });
         json_response(&PartitionsResponse {
             partitions: partitions.iter().map(partition_values).collect(),
@@ -364,7 +369,7 @@ fn partition_values(info: &PartitionInfo) -> HashMap<String, String> {
 }
 
 /// Validates the cluster and page request before calling the backend.
-fn prepare(
+fn prepare_page(
     state: &RestState,
     request: &Request,
     cluster: &str,
@@ -496,6 +501,7 @@ mod tests {
 
         for path in [
             "/v1/clusters/other/databases",
+            "/v1/clusters/other/databases?max_results=0",
             "/v1/clusters/Not%20A%20Cluster/databases",
             "/v1/clusters/other/databases/sales/tables",
         ] {
@@ -506,6 +512,8 @@ mod tests {
 
         for path in [
             "/v1/clusters/default/databases?max_results=0",
+            "/v1/clusters/default/databases?max_results=1&max_results=2",
+            "/v1/clusters/%FF/databases",
             "/v1/clusters/default/databases?page_token=nope!",
             "/v1/clusters/default/databases/missing/tables?max_results=99999",
         ] {
@@ -539,6 +547,9 @@ mod tests {
             ),
         ] {
             backend.fail_once(operation, GatewayError::unavailable("backend unavailable"));
+            let (status, body) = get(&app, &format!("{path}?unsupported=true")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{operation:?}");
+            assert_eq!(body["error"]["code"], "invalid_argument");
             let (status, body) = get(&app, path).await;
             assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{operation:?}");
             assert_eq!(body["error"]["code"], "unavailable");

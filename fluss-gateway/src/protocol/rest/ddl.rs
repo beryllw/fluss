@@ -17,8 +17,6 @@
 
 //! Catalog mutation endpoints.
 
-use crate::backend::FlussBackend;
-use crate::backend::context::RequestContext;
 use crate::error::{ErrorEnvelope, GatewayError, GatewayResult};
 use crate::protocol::rest::datatype::ColumnDataType;
 use crate::protocol::rest::metadata::{
@@ -28,9 +26,8 @@ use crate::protocol::rest::{
     RestState, error_response, json_response, json_response_with_status, parse_json_body,
     request_id,
 };
-use axum::body::Bytes;
-use axum::extract::{FromRequest, Path, Request, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::extract::{Path, Request, State};
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use fluss::metadata::{
     AddColumn, AlterConfig, AlterConfigOpType, AlterTableChanges, ColumnPositionType, DataType,
@@ -39,7 +36,6 @@ use fluss::metadata::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
 use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
@@ -158,13 +154,13 @@ pub struct CreatePartitionBody {
         (status = 201, description = "The created database", body = DatabaseResponse,
             headers(("Location" = String, description = "Created database URL"))),
         (status = 400, description = "Malformed body or invalid definition", body = ErrorEnvelope),
-        (status = 403, description = "Fluss refused the operation", body = ErrorEnvelope),
         (status = 404, description = "Unknown cluster", body = ErrorEnvelope),
         (status = 409, description = "The database already exists", body = ErrorEnvelope),
         (status = 413, description = "Request body above the configured limit", body = ErrorEnvelope),
         (status = 415, description = "The body is not JSON", body = ErrorEnvelope),
         (status = 429, description = "Metadata concurrency limit exceeded", body = ErrorEnvelope),
         (status = 500, description = "Fluss backend failure", body = ErrorEnvelope),
+        (status = 501, description = "Fluss does not support the operation or API version", body = ErrorEnvelope),
         (status = 503, description = "Fluss is unavailable, or the gateway is starting or shutting down", body = ErrorEnvelope),
         (status = 504, description = "Request deadline exceeded", body = ErrorEnvelope),
     )
@@ -174,10 +170,11 @@ pub(crate) async fn create_database(
     Path(cluster): Path<String>,
     request: Request,
 ) -> Response {
-    let (request_id, prepared) = split(&state, &cluster, request).await;
+    let request_id = request_id(&request);
+    let prepared = resolve_cluster(&state, &request, &cluster);
     let result = async {
-        let (backend, ctx, headers, bytes) = prepared?;
-        let body: CreateDatabaseBody = parse_json_body(&headers, &bytes)?;
+        let (backend, ctx) = prepared?;
+        let body: CreateDatabaseBody = parse_json_body(request).await?;
         let name = body.database;
         native_name("database name", &name, true)?;
         backend.create_database(&ctx, &name).await?;
@@ -201,11 +198,12 @@ pub(crate) async fn create_database(
     responses(
         (status = 204, description = "The database was dropped"),
         (status = 400, description = "Unsupported query parameter", body = ErrorEnvelope),
-        (status = 403, description = "Fluss refused the operation", body = ErrorEnvelope),
         (status = 404, description = "Unknown cluster or database", body = ErrorEnvelope),
         (status = 409, description = "The database still holds tables", body = ErrorEnvelope),
+        (status = 413, description = "Request body above the configured limit", body = ErrorEnvelope),
         (status = 429, description = "Metadata concurrency limit exceeded", body = ErrorEnvelope),
         (status = 500, description = "Fluss backend failure", body = ErrorEnvelope),
+        (status = 501, description = "Fluss does not support the operation or API version", body = ErrorEnvelope),
         (status = 503, description = "Fluss is unavailable, or the gateway is starting or shutting down", body = ErrorEnvelope),
         (status = 504, description = "Request deadline exceeded", body = ErrorEnvelope),
     )
@@ -242,13 +240,13 @@ pub(crate) async fn drop_database(
         (status = 201, description = "The created table", body = TableResponse,
             headers(("Location" = String, description = "Created table URL"))),
         (status = 400, description = "Malformed body or invalid definition", body = ErrorEnvelope),
-        (status = 403, description = "Fluss refused the operation", body = ErrorEnvelope),
         (status = 404, description = "Unknown cluster or database", body = ErrorEnvelope),
         (status = 409, description = "The table already exists", body = ErrorEnvelope),
         (status = 413, description = "Request body above the configured limit", body = ErrorEnvelope),
         (status = 415, description = "The body is not JSON", body = ErrorEnvelope),
         (status = 429, description = "Metadata concurrency limit exceeded", body = ErrorEnvelope),
         (status = 500, description = "Fluss backend failure", body = ErrorEnvelope),
+        (status = 501, description = "Fluss does not support the operation or API version", body = ErrorEnvelope),
         (status = 503, description = "Fluss is unavailable, or the gateway is starting or shutting down", body = ErrorEnvelope),
         (status = 504, description = "Request deadline exceeded", body = ErrorEnvelope),
     )
@@ -258,10 +256,11 @@ pub(crate) async fn create_table(
     Path((cluster, database)): Path<(String, String)>,
     request: Request,
 ) -> Response {
-    let (request_id, prepared) = split(&state, &cluster, request).await;
+    let request_id = request_id(&request);
+    let prepared = resolve_cluster(&state, &request, &cluster);
     let result = async {
-        let (backend, ctx, headers, bytes) = prepared?;
-        let body: CreateTableBody = parse_json_body(&headers, &bytes)?;
+        let (backend, ctx) = prepared?;
+        let body: CreateTableBody = parse_json_body(request).await?;
         let validate_only = body.validate_only;
         let table = TablePath::new(database, body.table_name.clone());
         let descriptor = table_descriptor(table.database(), body)?;
@@ -304,12 +303,12 @@ pub(crate) async fn create_table(
     responses(
         (status = 200, description = "The altered table", body = TableResponse),
         (status = 400, description = "Malformed body or invalid change", body = ErrorEnvelope),
-        (status = 403, description = "Fluss refused the operation", body = ErrorEnvelope),
         (status = 404, description = "Unknown cluster, database, or table", body = ErrorEnvelope),
         (status = 413, description = "Request body above the configured limit", body = ErrorEnvelope),
         (status = 415, description = "The body is not JSON", body = ErrorEnvelope),
         (status = 429, description = "Metadata concurrency limit exceeded", body = ErrorEnvelope),
         (status = 500, description = "Fluss backend failure", body = ErrorEnvelope),
+        (status = 501, description = "Fluss does not support the operation or API version", body = ErrorEnvelope),
         (status = 503, description = "Fluss is unavailable, or the gateway is starting or shutting down", body = ErrorEnvelope),
         (status = 504, description = "Request deadline exceeded", body = ErrorEnvelope),
     )
@@ -319,10 +318,11 @@ pub(crate) async fn alter_table(
     Path((cluster, database, table)): Path<(String, String, String)>,
     request: Request,
 ) -> Response {
-    let (request_id, prepared) = split(&state, &cluster, request).await;
+    let request_id = request_id(&request);
+    let prepared = resolve_cluster(&state, &request, &cluster);
     let result = async {
-        let (backend, ctx, headers, bytes) = prepared?;
-        let body: AlterTableBody = parse_json_body(&headers, &bytes)?;
+        let (backend, ctx) = prepared?;
+        let body: AlterTableBody = parse_json_body(request).await?;
         let table = TablePath::new(database, table);
         let changes = table_changes(body)?;
         let altered = backend.alter_table(&ctx, &table, changes).await?;
@@ -346,10 +346,11 @@ pub(crate) async fn alter_table(
     responses(
         (status = 204, description = "The table was dropped"),
         (status = 400, description = "Unsupported query parameter", body = ErrorEnvelope),
-        (status = 403, description = "Fluss refused the operation", body = ErrorEnvelope),
         (status = 404, description = "Unknown cluster, database, or table", body = ErrorEnvelope),
+        (status = 413, description = "Request body above the configured limit", body = ErrorEnvelope),
         (status = 429, description = "Metadata concurrency limit exceeded", body = ErrorEnvelope),
         (status = 500, description = "Fluss backend failure", body = ErrorEnvelope),
+        (status = 501, description = "Fluss does not support the operation or API version", body = ErrorEnvelope),
         (status = 503, description = "Fluss is unavailable, or the gateway is starting or shutting down", body = ErrorEnvelope),
         (status = 504, description = "Request deadline exceeded", body = ErrorEnvelope),
     )
@@ -388,13 +389,13 @@ pub(crate) async fn drop_table(
         (status = 201, description = "The created partition", body = PartitionResponse,
             headers(("Location" = String, description = "Created partition URL"))),
         (status = 400, description = "Malformed body, or a spec that does not match the partition keys", body = ErrorEnvelope),
-        (status = 403, description = "Fluss refused the operation", body = ErrorEnvelope),
         (status = 404, description = "Unknown cluster, database, or table", body = ErrorEnvelope),
-        (status = 409, description = "The partition already exists", body = ErrorEnvelope),
+        (status = 409, description = "The partition already exists or the table's partition limit was reached", body = ErrorEnvelope),
         (status = 413, description = "Request body above the configured limit", body = ErrorEnvelope),
         (status = 415, description = "The body is not JSON", body = ErrorEnvelope),
         (status = 429, description = "Metadata concurrency limit exceeded", body = ErrorEnvelope),
         (status = 500, description = "Fluss backend failure", body = ErrorEnvelope),
+        (status = 501, description = "Fluss does not support the operation or API version", body = ErrorEnvelope),
         (status = 503, description = "Fluss is unavailable, or the gateway is starting or shutting down", body = ErrorEnvelope),
         (status = 504, description = "Request deadline exceeded", body = ErrorEnvelope),
     )
@@ -404,10 +405,11 @@ pub(crate) async fn create_partition(
     Path((cluster, database, table)): Path<(String, String, String)>,
     request: Request,
 ) -> Response {
-    let (request_id, prepared) = split(&state, &cluster, request).await;
+    let request_id = request_id(&request);
+    let prepared = resolve_cluster(&state, &request, &cluster);
     let result = async {
-        let (backend, ctx, headers, bytes) = prepared?;
-        let body: CreatePartitionBody = parse_json_body(&headers, &bytes)?;
+        let (backend, ctx) = prepared?;
+        let body: CreatePartitionBody = parse_json_body(request).await?;
         let table = TablePath::new(database, table);
         let current = backend.describe_table(&ctx, &table).await?;
         for value in body.partition.values() {
@@ -447,10 +449,11 @@ pub(crate) async fn create_partition(
     responses(
         (status = 204, description = "The partition was dropped"),
         (status = 400, description = "Unsupported query parameter, or a name that does not match the partition keys", body = ErrorEnvelope),
-        (status = 403, description = "Fluss refused the operation", body = ErrorEnvelope),
         (status = 404, description = "Unknown cluster, database, table, or partition", body = ErrorEnvelope),
+        (status = 413, description = "Request body above the configured limit", body = ErrorEnvelope),
         (status = 429, description = "Metadata concurrency limit exceeded", body = ErrorEnvelope),
         (status = 500, description = "Fluss backend failure", body = ErrorEnvelope),
+        (status = 501, description = "Fluss does not support the operation or API version", body = ErrorEnvelope),
         (status = 503, description = "Fluss is unavailable, or the gateway is starting or shutting down", body = ErrorEnvelope),
         (status = 504, description = "Request deadline exceeded", body = ErrorEnvelope),
     )
@@ -581,31 +584,6 @@ fn encoding_failure(error: impl std::fmt::Display) -> GatewayError {
     GatewayError::internal("the gateway failed to encode the new column type")
 }
 
-type SplitRequest = GatewayResult<(Arc<dyn FlussBackend>, RequestContext, HeaderMap, Bytes)>;
-
-/// Resolves the request before buffering its body.
-async fn split(
-    state: &RestState,
-    cluster: &str,
-    request: Request,
-) -> (crate::protocol::rest::RequestId, SplitRequest) {
-    let request_id = request_id(&request);
-    let prepared = resolve_cluster(state, &request, cluster);
-    let (backend, ctx) = match prepared {
-        Ok(prepared) => prepared,
-        Err(error) => return (request_id, Err(error)),
-    };
-    let headers = request.headers().clone();
-    let body = Bytes::from_request(request, state).await.map_err(|error| {
-        if error.status() == StatusCode::PAYLOAD_TOO_LARGE {
-            GatewayError::limit_exceeded("request body exceeds the configured limit")
-        } else {
-            GatewayError::invalid_argument(format!("unreadable request body: {error}"))
-        }
-    });
-    (request_id, body.map(|body| (backend, ctx, headers, body)))
-}
-
 /// A 201 carrying the created resource and the `Location` that addresses it.
 fn created_response<T: Serialize>(value: &T, location: &str) -> GatewayResult<Response> {
     let mut response = json_response_with_status(StatusCode::CREATED, value)?;
@@ -660,7 +638,7 @@ mod tests {
     use crate::backend::fake::{FakeCall, FakeFlussBackend, Operation};
     use crate::error::{GatewayError, Resource};
     use crate::protocol::rest::test_support;
-    use axum::body::Body;
+    use axum::body::{Body, Bytes};
     use axum::http::{Method, Request as HttpRequest, StatusCode, header};
     use fluss::metadata::{
         AlterConfigOpType, BigIntType, Column, DataType, DecimalType, Schema, StringType,
@@ -1286,24 +1264,64 @@ mod tests {
 
     #[tokio::test]
     async fn a_mutation_is_checked_before_its_body() {
-        let (_, app) = gateway();
+        let (backend, app) = gateway();
 
-        let (status, _, body) = post(
-            &app,
-            "/v1/clusters/other/databases",
-            json!({"database": "sales"}),
-        )
-        .await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
-        assert_eq!(body["error"]["code"], "cluster_not_found");
-
-        let (status, _, _) = post(
-            &app,
-            "/v1/clusters/default/databases?dry_run=true",
-            json!({"database": "sales"}),
-        )
-        .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        for (method, resource) in [
+            (Method::POST, "/databases"),
+            (Method::DELETE, "/databases/sales"),
+            (Method::POST, "/databases/sales/tables"),
+            (Method::PATCH, "/databases/sales/tables/orders"),
+            (Method::DELETE, "/databases/sales/tables/orders"),
+            (Method::POST, "/databases/sales/tables/orders/partitions"),
+            (
+                Method::DELETE,
+                "/databases/sales/tables/orders/partitions/eu",
+            ),
+        ] {
+            for (cluster, query, status, code) in [
+                (
+                    "other",
+                    "?dry_run=true",
+                    StatusCode::NOT_FOUND,
+                    "cluster_not_found",
+                ),
+                (
+                    "default",
+                    "?dry_run=true",
+                    StatusCode::BAD_REQUEST,
+                    "invalid_argument",
+                ),
+                ("%FF", "", StatusCode::BAD_REQUEST, "invalid_argument"),
+            ] {
+                let path = format!("/v1/clusters/{cluster}{resource}{query}");
+                let body = Body::from_stream(futures_util::stream::poll_fn(
+                    |_| -> std::task::Poll<Option<Result<Bytes, std::io::Error>>> {
+                        panic!("rejected request body must not be read");
+                    },
+                ));
+                let response = app
+                    .clone()
+                    .oneshot(
+                        HttpRequest::builder()
+                            .method(method.clone())
+                            .uri(&path)
+                            .body(body)
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), status, "{method} {path}");
+                let request_id = response.headers()["x-request-id"]
+                    .to_str()
+                    .unwrap()
+                    .to_string();
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                let body: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(body["error"]["code"], code, "{method} {path}");
+                assert_eq!(body["error"]["request_id"], request_id, "{method} {path}");
+            }
+        }
+        assert!(backend.calls().is_empty());
 
         let (status, _, body) = post(
             &app,
@@ -1313,6 +1331,8 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(body["error"]["code"], "limit_exceeded");
+
+        assert!(backend.calls().is_empty());
     }
 
     #[test]

@@ -276,12 +276,16 @@ mod tests {
                 let Some(operation) = item.get(method) else {
                     continue;
                 };
-                for status in ["429", "500"] {
+                for status in ["400", "404", "413", "429", "500", "501", "503", "504"] {
                     assert!(
                         operation["responses"].get(status).is_some(),
                         "{method} {path} must declare {status}"
                     );
                 }
+                assert!(
+                    operation["responses"].get("403").is_none(),
+                    "{method} {path} must not declare caller authorization failures"
+                );
             }
         }
 

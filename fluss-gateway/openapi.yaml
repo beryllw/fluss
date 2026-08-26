@@ -1076,6 +1076,12 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
           description: Unknown cluster
+        '413':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Request body above the configured limit
         '429':
           content:
             application/json:
@@ -1088,6 +1094,12 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
           description: Fluss backend failure
+        '501':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Fluss does not support the operation or API version
         '503':
           content:
             application/json:
@@ -1136,12 +1148,6 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
           description: Malformed body or invalid definition
-        '403':
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorEnvelope'
-          description: Fluss refused the operation
         '404':
           content:
             application/json:
@@ -1178,6 +1184,12 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
           description: Fluss backend failure
+        '501':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Fluss does not support the operation or API version
         '503':
           content:
             application/json:
@@ -1218,12 +1230,6 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
           description: Unsupported query parameter
-        '403':
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorEnvelope'
-          description: Fluss refused the operation
         '404':
           content:
             application/json:
@@ -1236,6 +1242,12 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
           description: The database still holds tables
+        '413':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Request body above the configured limit
         '429':
           content:
             application/json:
@@ -1248,6 +1260,12 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
           description: Fluss backend failure
+        '501':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Fluss does not support the operation or API version
         '503':
           content:
             application/json:
@@ -1312,6 +1330,12 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
           description: Unknown cluster or database
+        '413':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Request body above the configured limit
         '429':
           content:
             application/json:
@@ -1324,6 +1348,12 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
           description: Fluss backend failure
+        '501':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Fluss does not support the operation or API version
         '503':
           content:
             application/json:
@@ -1384,12 +1414,6 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
           description: Malformed body or invalid definition
-        '403':
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorEnvelope'
-          description: Fluss refused the operation
         '404':
           content:
             application/json:
@@ -1426,6 +1450,12 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
           description: Fluss backend failure
+        '501':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Fluss does not support the operation or API version
         '503':
           content:
             application/json:
@@ -1472,18 +1502,18 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
           description: Unsupported query parameter
-        '403':
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorEnvelope'
-          description: Fluss refused the operation
         '404':
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
           description: Unknown cluster, database, or table
+        '413':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Request body above the configured limit
         '429':
           content:
             application/json:
@@ -1496,6 +1526,12 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
           description: Fluss backend failure
+        '501':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Fluss does not support the operation or API version
         '503':
           content:
             application/json:
@@ -1545,18 +1581,18 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
           description: Unsupported query parameter
-        '403':
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorEnvelope'
-          description: Fluss refused the operation
         '404':
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
           description: Unknown cluster, database, or table
+        '413':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Request body above the configured limit
         '429':
           content:
             application/json:
@@ -1569,6 +1605,12 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
           description: Fluss backend failure
+        '501':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Fluss does not support the operation or API version
         '503':
           content:
             application/json:
@@ -1624,12 +1666,6 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
           description: Malformed body or invalid change
-        '403':
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorEnvelope'
-          description: Fluss refused the operation
         '404':
           content:
             application/json:
@@ -1660,6 +1696,12 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
           description: Fluss backend failure
+        '501':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Fluss does not support the operation or API version
         '503':
           content:
             application/json:
@@ -1724,18 +1766,18 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
           description: Invalid page parameter or page token
-        '403':
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorEnvelope'
-          description: Fluss refused the operation
         '404':
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
           description: Unknown cluster, database, or table
+        '413':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Request body above the configured limit
         '429':
           content:
             application/json:
@@ -1748,6 +1790,12 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
           description: Fluss backend failure
+        '501':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Fluss does not support the operation or API version
         '503':
           content:
             application/json:
@@ -1808,12 +1856,6 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
           description: Malformed body, or a spec that does not match the partition keys
-        '403':
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorEnvelope'
-          description: Fluss refused the operation
         '404':
           content:
             application/json:
@@ -1825,7 +1867,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
-          description: The partition already exists
+          description: The partition already exists or the table's partition limit was reached
         '413':
           content:
             application/json:
@@ -1850,6 +1892,12 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
           description: Fluss backend failure
+        '501':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Fluss does not support the operation or API version
         '503':
           content:
             application/json:
@@ -1902,18 +1950,18 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
           description: Unsupported query parameter, or a name that does not match the partition keys
-        '403':
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorEnvelope'
-          description: Fluss refused the operation
         '404':
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
           description: Unknown cluster, database, table, or partition
+        '413':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Request body above the configured limit
         '429':
           content:
             application/json:
@@ -1926,6 +1974,12 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
           description: Fluss backend failure
+        '501':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Fluss does not support the operation or API version
         '503':
           content:
             application/json:

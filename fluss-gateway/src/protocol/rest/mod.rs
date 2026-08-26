@@ -44,7 +44,7 @@ use crate::lifecycle::Readiness;
 use crate::observability;
 use axum::Router;
 use axum::body::{Body, Bytes};
-use axum::extract::{DefaultBodyLimit, MatchedPath, Request};
+use axum::extract::{DefaultBodyLimit, FromRequest, MatchedPath, Request};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -179,17 +179,22 @@ pub(crate) fn json_response_with_status<T: Serialize>(
     Ok(response)
 }
 
-/// Deserializes a JSON request body, requiring a JSON `Content-Type`.
-pub fn parse_json_body<T: DeserializeOwned>(
-    headers: &HeaderMap,
-    body: &Bytes,
-) -> Result<T, GatewayError> {
-    validate_json_content_type(headers)?;
-    serde_json::from_slice(body)
+/// Reads a size-limited request body and deserializes it as JSON.
+pub async fn parse_json_body<T: DeserializeOwned>(mut request: Request) -> Result<T, GatewayError> {
+    let headers = std::mem::take(request.headers_mut());
+    let body = Bytes::from_request(request, &()).await.map_err(|error| {
+        if error.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            GatewayError::limit_exceeded("request body exceeds the configured limit")
+        } else {
+            GatewayError::invalid_argument(format!("unreadable request body: {error}"))
+        }
+    })?;
+    validate_json_content_type(&headers)?;
+    serde_json::from_slice(&body)
         .map_err(|error| GatewayError::invalid_argument(format!("invalid JSON body: {error}")))
 }
 
-pub(crate) fn validate_json_content_type(headers: &HeaderMap) -> Result<(), GatewayError> {
+fn validate_json_content_type(headers: &HeaderMap) -> Result<(), GatewayError> {
     let Some(value) = headers.get(header::CONTENT_TYPE) else {
         return Err(GatewayError::new(
             crate::error::ErrorKind::UnsupportedMediaType,
@@ -360,12 +365,7 @@ fn apply_acceptance_guard(router: Router, readiness: Arc<Readiness>) -> Router {
         let readiness = readiness.clone();
         async move {
             if let Err(error) = readiness.ensure_accepting() {
-                let request_id = request
-                    .extensions()
-                    .get::<RequestId>()
-                    .cloned()
-                    .unwrap_or_default();
-                return error_response(&error, &request_id);
+                return error_response(&error, &request_id(&request));
             }
             next.run(request).await
         }
@@ -419,11 +419,7 @@ fn apply_data_limits(router: Router, options: &RestOptions) -> Router {
     let max_body_bytes = options.max_body_bytes;
 
     let limits = move |mut request: Request, next: Next| async move {
-        let request_id = request
-            .extensions()
-            .get::<RequestId>()
-            .cloned()
-            .unwrap_or_default();
+        let request_id = request_id(&request);
         request
             .extensions_mut()
             .insert(deadline_from_now(request_timeout));
@@ -490,11 +486,7 @@ fn apply_common_middleware(router: Router, backend: Option<Arc<dyn FlussBackend>
 /// response, where a dropped connection would have been recorded nowhere. The payload goes to the
 /// log, never into the response, since it can carry internal detail.
 async fn catch_panic(request: Request, next: Next) -> Response {
-    let request_id = request
-        .extensions()
-        .get::<RequestId>()
-        .cloned()
-        .unwrap_or_default();
+    let request_id = request_id(&request);
     match AssertUnwindSafe(next.run(request)).catch_unwind().await {
         Ok(response) => response,
         Err(payload) => {
@@ -529,11 +521,7 @@ fn request_log(
                 .to_string();
             let cluster =
                 cluster_label(backend.as_deref(), &route, request.uri().path()).to_string();
-            let request_id = request
-                .extensions()
-                .get::<RequestId>()
-                .cloned()
-                .unwrap_or_default();
+            let request_id = request_id(&request);
             let response = next.run(request).await;
             let elapsed = started.elapsed();
             let status = response.status();
@@ -639,11 +627,7 @@ fn normalize_error(response: Response, request_id: &RequestId) -> Response {
 }
 
 async fn unknown_route(method: Method, uri: Uri, request: Request) -> Response {
-    let request_id = request
-        .extensions()
-        .get::<RequestId>()
-        .cloned()
-        .unwrap_or_default();
+    let request_id = request_id(&request);
     error_response(
         &GatewayError::not_found(format!("no route for {method} {}", uri.path())),
         &request_id,
@@ -693,7 +677,7 @@ pub mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::routing::{get, post};
+    use axum::routing::get;
     use http_body_util::BodyExt;
     use serde::Deserialize;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -715,33 +699,48 @@ mod tests {
         serde_json::from_slice(&bytes).expect("json body")
     }
 
-    #[test]
-    fn shared_json_parser_enforces_media_type_and_serde_strictness() {
-        let body = Bytes::from_static(br#"{"value": 7}"#);
-        assert!(parse_json_body::<BodyFixture>(&HeaderMap::new(), &body).is_err());
-
-        let mut headers = HeaderMap::new();
-        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
-        assert!(parse_json_body::<BodyFixture>(&headers, &body).is_err());
-
-        headers.insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/vnd.fluss+json; charset=utf-8"),
-        );
-        assert_eq!(
-            parse_json_body::<BodyFixture>(&headers, &body).unwrap(),
-            BodyFixture { value: 7 }
-        );
-        for bad in [
-            br#"{"value": 7, "unknown": true}"#.as_slice(),
-            br#"{"value": 7, "value": 8}"#.as_slice(),
-            br#"{"value":"#.as_slice(),
+    #[tokio::test]
+    async fn shared_json_parser_enforces_media_type_and_serde_strictness() {
+        for (content_type, expected) in [
+            (None, Err(ErrorKind::UnsupportedMediaType)),
+            (Some("text/plain"), Err(ErrorKind::UnsupportedMediaType)),
+            (Some("application/json"), Ok(BodyFixture { value: 7 })),
+            (
+                Some("application/vnd.fluss+json; charset=utf-8"),
+                Ok(BodyFixture { value: 7 }),
+            ),
         ] {
-            assert!(
-                parse_json_body::<BodyFixture>(&headers, &Bytes::copy_from_slice(bad)).is_err()
-            );
+            let mut request = Request::builder();
+            if let Some(content_type) = content_type {
+                request = request.header(header::CONTENT_TYPE, content_type);
+            }
+            let request = request.body(Body::from(r#"{"value": 7}"#)).unwrap();
+            let result = parse_json_body::<BodyFixture>(request)
+                .await
+                .map_err(|error| error.kind());
+            assert_eq!(result, expected, "{content_type:?}");
         }
-        assert!(parse_json_body::<BodyFixture>(&headers, &Bytes::new()).is_err());
+        for body in [
+            r#"{"value": 7, "unknown": true}"#,
+            r#"{"value": 7, "value": 8}"#,
+            r#"{"value":"#,
+            "",
+        ] {
+            let request = Request::builder()
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            let error = parse_json_body::<BodyFixture>(request).await.unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::InvalidArgument, "{body}");
+        }
+
+        let stream =
+            futures_util::stream::iter([Err::<Bytes, _>(std::io::Error::other("read failed"))]);
+        let error = parse_json_body::<BodyFixture>(Request::new(Body::from_stream(stream)))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidArgument);
+        assert!(error.message().starts_with("unreadable request body:"));
     }
 
     #[tokio::test]
@@ -774,26 +773,38 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_body_yields_413_envelope() {
-        let app = apply_middleware(
-            Router::new().route("/echo", post(|| async { "ok" })),
-            &test_support::test_options(),
-        );
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/echo")
-                    .header(header::CONTENT_LENGTH, "1048576")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let state = test_support::test_state();
+        state.readiness.set_serving();
+        let app = build_router(state, &test_support::test_options());
+        for (method, path) in [
+            (Method::POST, "/v1/clusters/default/databases"),
+            (
+                Method::GET,
+                "/v1/clusters/default/databases/sales/tables/orders",
+            ),
+            (
+                Method::DELETE,
+                "/v1/clusters/default/databases/sales/tables/orders",
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method.clone())
+                        .uri(path)
+                        .header(header::CONTENT_LENGTH, "1048576")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
 
-        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-        let json = body_json(response).await;
-        assert_eq!(json["error"]["code"], "limit_exceeded");
-        assert!(json["error"]["request_id"].as_str().is_some());
+            assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE, "{method}");
+            let json = body_json(response).await;
+            assert_eq!(json["error"]["code"], "limit_exceeded", "{method}");
+            assert!(json["error"]["request_id"].as_str().is_some(), "{method}");
+        }
     }
 
     #[tokio::test]
