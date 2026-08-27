@@ -270,6 +270,24 @@ pub fn connections_active(cluster: &str, active: usize) {
     .set(active as f64);
 }
 
+/// Records rows submitted to a configured cluster, including indeterminate completions.
+pub fn write_rows(cluster: &str, rows: u64) {
+    metrics::counter!(
+        "fluss_gateway_backend_write_rows_total",
+        "cluster" => cluster.to_string()
+    )
+    .increment(rows);
+}
+
+/// Records REST write-body bytes for a configured cluster.
+pub fn write_bytes(cluster: &str, bytes: u64) {
+    metrics::counter!(
+        "fluss_gateway_backend_write_bytes_total",
+        "cluster" => cluster.to_string()
+    )
+    .increment(bytes);
+}
+
 /// Samples process and Tokio runtime gauges once.
 ///
 /// Called periodically by the lifecycle's runtime sampler; each source that a platform cannot

@@ -299,7 +299,13 @@ async fn start_internal(
         .map_err(|error| format!("failed to read the bound metrics listener address: {error}"))?;
 
     let readiness = Arc::new(Readiness::new());
-    let router = rest::build(&config.server.rest, backend.clone(), &readiness, local_addr);
+    let router = rest::build(
+        &config.server.rest,
+        &config.request_limits,
+        backend.clone(),
+        &readiness,
+        local_addr,
+    );
     let header_read_timeout = config.server.rest.header_read_timeout.get();
     let connection_drain = connection_drain_budget(config.shutdown.drain_timeout.get());
     let shutdown = CancellationToken::new();

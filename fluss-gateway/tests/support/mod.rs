@@ -73,6 +73,29 @@ impl Api {
             .await
     }
 
+    /// Sends an already-encoded JSON body and returns the raw response.
+    pub async fn post_json_text(&self, path: &str, body: &str) -> reqwest::Response {
+        self.client
+            .post(self.url(path))
+            .header("content-type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .expect("POST request")
+    }
+
+    /// POSTs an already-encoded JSON body and returns its successful JSON response.
+    pub async fn post_json_text_ok(&self, path: &str, body: &str) -> Value {
+        let response = self.post_json_text(path, body).await;
+        let status = response.status();
+        let payload: Value = response.json().await.expect("JSON body");
+        assert!(
+            status.is_success(),
+            "POST {path} answered {status}: {payload}"
+        );
+        payload
+    }
+
     pub async fn patch(&self, path: &str, body: &Value) -> (u16, Option<String>, Value) {
         self.send(self.client.patch(self.url(path)).json(body), path)
             .await

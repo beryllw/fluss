@@ -112,6 +112,8 @@ error_kinds! {
     UnsupportedMediaType => 415, "unsupported_media_type", retry_after: false;
     /// A bounded resource (per-user act-as connections) is at capacity.
     ResourceExhausted => 429, "resource_exhausted", retry_after: true;
+    /// A KV write the store refused under backpressure after client retries.
+    StorageBackpressure => 429, "storage_backpressure", retry_after: true;
     /// Work was cancelled by the caller or by shutdown.
     Cancelled => 499, "cancelled", retry_after: false;
     /// The Fluss backend failed in a way the gateway cannot classify further, distinguishable from a
@@ -333,6 +335,10 @@ impl GatewayError {
             .unwrap_or_else(|| self.kind.code())
     }
 
+    pub(crate) fn resource(&self) -> Option<Resource> {
+        self.resource
+    }
+
     /// Names the resource this error is about, selecting the resource-specific code.
     ///
     /// The metadata and DDL capabilities are the first emitters; the vocabulary ships with the wire contract.
@@ -443,7 +449,12 @@ mod tests {
             // `Retry-After` is meaningful only where the caller is meant to come back.
             assert_eq!(
                 kind.retry_after(),
-                matches!(kind, ErrorKind::ResourceExhausted | ErrorKind::Unavailable),
+                matches!(
+                    kind,
+                    ErrorKind::ResourceExhausted
+                        | ErrorKind::StorageBackpressure
+                        | ErrorKind::Unavailable
+                ),
                 "retry_after for {code}"
             );
             codes.push(code);
@@ -538,8 +549,5 @@ mod tests {
             "wire codes are unique across kinds and resource forms"
         );
         assert!(codes.windows(2).all(|pair| pair[0] < pair[1]), "sorted");
-        // The write path's entry-level `storage_backpressure` is not a request status and arrives with the
-        // capability that emits it.
-        assert!(!codes.contains(&"storage_backpressure"));
     }
 }

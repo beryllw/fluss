@@ -121,6 +121,11 @@ impl RequestContext {
         self.deadline.saturating_duration_since(Instant::now())
     }
 
+    /// The absolute instant this request must be answered by.
+    pub fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
     pub fn cancellation(&self) -> &CancellationToken {
         &self.cancellation
     }

@@ -19,7 +19,7 @@
 
 use crate::backend::context::RequestContext;
 use crate::backend::types::ClusterId;
-use crate::backend::{FlussBackend, unknown_cluster};
+use crate::backend::{FlussBackend, RowWriteError, WriteRequest, WriteResult, unknown_cluster};
 use crate::error::{GatewayError, GatewayResult, Resource};
 use async_trait::async_trait;
 use fluss::metadata::{
@@ -41,6 +41,8 @@ struct FakeState {
     databases: BTreeMap<String, BTreeMap<String, FakeTable>>,
     calls: Vec<FakeCall>,
     failures: HashMap<Operation, GatewayError>,
+    writes: Vec<Option<Vec<String>>>,
+    write_failures: Vec<(usize, GatewayError)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -56,6 +58,7 @@ pub enum Operation {
     ListPartitions,
     CreatePartition,
     DropPartition,
+    Write,
 }
 
 #[derive(Debug, Clone)]
@@ -129,6 +132,19 @@ impl FakeFlussBackend {
         }
     }
 
+    pub fn with_table(self, info: TableInfo) -> Self {
+        self.define_table(info);
+        self
+    }
+
+    pub fn fail_rows(&self, failures: Vec<(usize, GatewayError)>) {
+        self.state().write_failures = failures;
+    }
+
+    pub fn writes(&self) -> Vec<Option<Vec<String>>> {
+        self.state().writes.clone()
+    }
+
     pub fn define_partition(&self, table: &TablePath, info: PartitionInfo) {
         let mut state = self.state();
         let entry = state
@@ -187,6 +203,70 @@ fn fixture_table(table: TablePath) -> TableInfo {
         .build()
         .expect("the fixture descriptor is valid");
     TableInfo::of(table, 1, 1, descriptor, FIXTURE_TIME, FIXTURE_TIME)
+}
+
+fn write_table_info(
+    table: &str,
+    schema_id: i32,
+    columns: Vec<(&str, DataType)>,
+    primary_key: Option<&[&str]>,
+) -> TableInfo {
+    let mut schema = Schema::builder();
+    for (name, data_type) in columns {
+        schema = schema.column(name, data_type);
+    }
+    if let Some(keys) = primary_key {
+        schema = schema.primary_key(keys.iter().copied());
+    }
+    let descriptor = TableDescriptor::builder()
+        .schema(schema.build().expect("valid fixture schema"))
+        .distributed_by(Some(3), Vec::new())
+        .build()
+        .expect("valid fixture table");
+    TableInfo::of(
+        TablePath::new("fluss", table),
+        1,
+        schema_id,
+        descriptor,
+        0,
+        0,
+    )
+}
+
+pub(crate) fn users_table_info(schema_id: i32) -> TableInfo {
+    write_table_info(
+        "users",
+        schema_id,
+        vec![
+            (
+                "id",
+                DataType::Int(fluss::metadata::IntType::with_nullable(false)),
+            ),
+            (
+                "name",
+                DataType::String(fluss::metadata::StringType::with_nullable(true)),
+            ),
+        ],
+        Some(&["id"]),
+    )
+}
+
+pub(crate) fn log_table_info(schema_id: i32) -> TableInfo {
+    write_table_info(
+        "applog",
+        schema_id,
+        vec![
+            (
+                "ts",
+                DataType::BigInt(fluss::metadata::BigIntType::with_nullable(false)),
+            ),
+            (
+                "message",
+                DataType::String(fluss::metadata::StringType::with_nullable(true)),
+            ),
+        ],
+        None,
+    )
 }
 
 fn database_of<'state>(
@@ -252,6 +332,16 @@ impl FlussBackend for FakeFlussBackend {
     ) -> GatewayResult<Vec<String>> {
         self.call(ctx, Operation::ListTables, None, |state| {
             Ok(database_of(state, database)?.keys().cloned().collect())
+        })
+    }
+
+    async fn table_info(
+        &self,
+        ctx: &RequestContext,
+        table: &TablePath,
+    ) -> GatewayResult<TableInfo> {
+        self.call(ctx, Operation::DescribeTable, None, |state| {
+            Ok(table_of(state, table)?.info.clone())
         })
     }
 
@@ -338,5 +428,30 @@ impl FlussBackend for FakeFlussBackend {
             Some(FakeCall::DropPartition(table.clone(), spec.clone())),
             |_| Ok(()),
         )
+    }
+
+    async fn write(
+        &self,
+        ctx: &RequestContext,
+        request: WriteRequest,
+    ) -> GatewayResult<WriteResult> {
+        let row_count = request.rows().len() as u64;
+        self.state()
+            .writes
+            .push(request.partial_update_columns().map(<[String]>::to_vec));
+        self.call(ctx, Operation::Write, None, move |state| {
+            let failures = state
+                .write_failures
+                .iter()
+                .map(|(index, error)| RowWriteError {
+                    index: *index,
+                    error: error.clone(),
+                })
+                .collect();
+            Ok(WriteResult {
+                row_count,
+                failures,
+            })
+        })
     }
 }

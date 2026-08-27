@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Schema-aware streaming conversion from one raw FIP-49 JSON row to [`GenericRow`].
+//! Schema-aware streaming conversion from raw JSON rows to [`GenericRow`].
 //!
 //! Serde owns JSON syntax and container traversal. Schema-matching ARRAY, MAP, and ROW values
 //! recurse only along the validated [`RowType`], bounded by [`MAX_TYPE_NESTING`]. Scalar and
@@ -49,11 +49,10 @@ const MILLIS_PER_DAY: i64 = 86_400_000;
 
 /// Whether a row supplies a complete mutation or only selected fields.
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
 pub(crate) enum RowShape<'a> {
     /// Every non-nullable column must be present. Missing nullable columns become null.
     Complete,
-    /// Only the named columns must be present and non-null. Other missing columns become null.
+    /// Named non-nullable columns must be present. Other missing columns become null.
     Sparse(&'a [String]),
 }
 
@@ -70,16 +69,15 @@ pub(crate) struct RowDecodeError {
     error: GatewayError,
 }
 
-#[allow(dead_code)]
 impl RowDecodeError {
-    fn schema_mismatch(error: GatewayError) -> Self {
+    pub(crate) fn schema_mismatch(error: GatewayError) -> Self {
         Self {
             kind: RowDecodeErrorKind::SchemaMismatch,
             error,
         }
     }
 
-    fn invalid(error: GatewayError) -> Self {
+    pub(crate) fn invalid(error: GatewayError) -> Self {
         Self {
             kind: RowDecodeErrorKind::InvalidValue,
             error,
@@ -92,6 +90,7 @@ impl RowDecodeError {
     }
 
     /// Returns the client-safe error message.
+    #[allow(dead_code)]
     pub(crate) fn message(&self) -> &str {
         self.error.message()
     }
@@ -115,7 +114,6 @@ struct SchemaDecoderInner {
 
 /// Immutable reusable decoder compiled from one Fluss row type.
 #[derive(Clone)]
-#[allow(dead_code)]
 pub(crate) struct SchemaDecoder {
     inner: Arc<SchemaDecoderInner>,
 }
@@ -129,7 +127,6 @@ impl fmt::Debug for SchemaDecoder {
     }
 }
 
-#[allow(dead_code)]
 impl SchemaDecoder {
     /// Builds a decoder for a complete table row type.
     pub(crate) fn new(row_type: RowType) -> Result<Self, GatewayError> {
@@ -151,11 +148,6 @@ impl SchemaDecoder {
                 column_indexes,
             }),
         })
-    }
-
-    /// Returns the exact row type this decoder was built from.
-    pub(crate) fn row_type(&self) -> &RowType {
-        &self.inner.row_type
     }
 
     /// Decodes one raw JSON object into complete schema order.
@@ -205,7 +197,8 @@ impl SchemaDecoder {
                             )),
                         ));
                     };
-                    required[*index] = true;
+                    required[*index] =
+                        !self.inner.row_type.fields()[*index].data_type.is_nullable();
                 }
                 Ok(required)
             }
@@ -1583,44 +1576,28 @@ mod tests {
     }
 
     #[test]
-    fn sparse_rows_require_named_columns_even_when_the_schema_allows_null() {
+    fn sparse_rows_require_only_non_nullable_targets() {
         let decoder = SchemaDecoder::new(row_type(vec![
-            field("key", DataType::String(StringType::new())),
-            field("version", DataType::Int(IntType::with_nullable(false))),
-            field("note", DataType::String(StringType::new())),
+            field("id", DataType::Int(IntType::with_nullable(false))),
+            field("name", DataType::String(StringType::new())),
         ]))
         .unwrap();
-        let required = vec!["key".to_string()];
+        let targets = vec!["id".to_string(), "name".to_string()];
 
-        let missing = decoder
-            .decode_row("entry `missing`", br#"{}"#, RowShape::Sparse(&required))
-            .unwrap_err();
-        assert!(missing.is_schema_mismatch());
-
-        let explicit_null = decoder
-            .decode_row(
-                "entry `null`",
-                br#"{"key":null}"#,
-                RowShape::Sparse(&required),
-            )
-            .unwrap_err();
-        assert!(!explicit_null.is_schema_mismatch());
-
-        let decoded = decoder
-            .decode_row(
-                "entry `present`",
-                br#"{"note":"kept","key":"k"}"#,
-                RowShape::Sparse(&required),
-            )
-            .unwrap();
-        assert_eq!(
-            decoded.values,
-            vec![
-                Datum::String(Cow::Borrowed("k")),
-                Datum::Null,
-                Datum::String(Cow::Borrowed("kept")),
-            ]
-        );
+        for json in [br#"{"id":1}"#.as_slice(), br#"{"id":1,"name":null}"#] {
+            assert!(
+                decoder
+                    .decode_row("entry", json, RowShape::Sparse(&targets))
+                    .is_ok()
+            );
+        }
+        for json in [br#"{}"#.as_slice(), br#"{"id":null}"#] {
+            assert!(
+                decoder
+                    .decode_row("entry", json, RowShape::Sparse(&targets))
+                    .is_err()
+            );
+        }
     }
 
     #[test]
@@ -2120,7 +2097,6 @@ mod tests {
         ));
         let error = SchemaDecoder::new(row_type(vec![field("v", complex_key)])).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Unsupported);
-        assert!(!error.message().contains("FIP-49"));
 
         let mut too_deep = DataType::Int(IntType::new());
         for _ in 0..=MAX_TYPE_NESTING {
@@ -2138,6 +2114,6 @@ mod tests {
             DataType::Boolean(BooleanType::new()),
         )]))
         .unwrap();
-        assert_eq!(decoder.clone().row_type(), decoder.row_type());
+        let _clone = decoder.clone();
     }
 }

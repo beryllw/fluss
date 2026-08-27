@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Schema-aware conversion from FIP-49 JSON values to Fluss rows.
+//! Schema-aware conversion from JSON values to Fluss rows.
 //!
 //! The decoder streams one raw JSON object through the table schema. Serde traverses containers
 //! once, numeric leaves retain their exact lexemes, and map visitors observe duplicate fields.

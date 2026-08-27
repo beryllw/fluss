@@ -27,22 +27,7 @@ pub(crate) fn map_fluss_error(
     error: FlussClientError,
     ctx: Option<&RequestContext>,
 ) -> GatewayError {
-    let mapped = error
-        .api_error()
-        .and_then(|api_error| map_api_error(what, api_error))
-        .unwrap_or_else(|| match &error {
-            FlussClientError::UnsupportedOperation { .. }
-            | FlussClientError::UnsupportedVersion { .. } => GatewayError::unsupported(format!(
-                "Fluss does not support the request while trying to {what}"
-            )),
-            FlussClientError::IllegalArgument { .. } => GatewayError::invalid_argument(format!(
-                "Fluss rejected the request while trying to {what}"
-            )),
-            _ if error.is_retriable() => {
-                GatewayError::unavailable(format!("Fluss is unavailable while trying to {what}"))
-            }
-            _ => GatewayError::backend(format!("Fluss failed while trying to {what}")),
-        });
+    let mapped = classify_fluss_error(what, &error);
     let level = match mapped.kind() {
         ErrorKind::Backend | ErrorKind::Internal => log::Level::Error,
         ErrorKind::Unavailable | ErrorKind::Unsupported => log::Level::Warn,
@@ -57,6 +42,36 @@ pub(crate) fn map_fluss_error(
     mapped
 }
 
+/// Classifies a native failure without logging or exposing its detail.
+pub(crate) fn classify_fluss_error(what: &str, error: &FlussClientError) -> GatewayError {
+    error
+        .api_error()
+        .and_then(|api_error| map_api_error(what, api_error))
+        .unwrap_or_else(|| match error {
+            FlussClientError::UnsupportedOperation { .. }
+            | FlussClientError::UnsupportedVersion { .. } => GatewayError::unsupported(format!(
+                "Fluss does not support the request while trying to {what}"
+            )),
+            FlussClientError::IllegalArgument { .. }
+            | FlussClientError::RowConvertError { .. }
+            | FlussClientError::ArrowError { .. } => GatewayError::invalid_argument(format!(
+                "Fluss rejected the request while trying to {what}"
+            )),
+            FlussClientError::BufferExhausted { .. } => GatewayError::resource_exhausted(format!(
+                "the Fluss write buffer is exhausted while trying to {what}"
+            )),
+            FlussClientError::WriterClosed { .. }
+            | FlussClientError::RpcError { .. }
+            | FlussClientError::WakeupError { .. } => {
+                GatewayError::unavailable(format!("Fluss is unavailable while trying to {what}"))
+            }
+            _ if error.is_retriable() => {
+                GatewayError::unavailable(format!("Fluss is unavailable while trying to {what}"))
+            }
+            _ => GatewayError::backend(format!("Fluss failed while trying to {what}")),
+        })
+}
+
 /// Maps the protocol error codes that carry a meaning of their own. `None` falls through to the
 /// transport-level classification.
 fn map_api_error(what: &str, api_error: FlussError) -> Option<GatewayError> {
@@ -65,7 +80,7 @@ fn map_api_error(what: &str, api_error: FlussError) -> Option<GatewayError> {
             "the database does not exist while trying to {what}"
         ))
         .with_resource(Resource::Database),
-        FlussError::TableNotExist => {
+        FlussError::TableNotExist | FlussError::UnknownTableOrBucketException => {
             GatewayError::not_found(format!("the table does not exist while trying to {what}"))
                 .with_resource(Resource::Table)
         }
@@ -112,9 +127,12 @@ fn map_api_error(what: &str, api_error: FlussError) -> Option<GatewayError> {
         FlussError::InvalidDatabaseException => GatewayError::invalid_argument(format!(
             "Fluss rejected the name while trying to {what}"
         )),
-        FlussError::InvalidTableException => GatewayError::invalid_argument(format!(
+        FlussError::InvalidTableException
+        | FlussError::InvalidTargetColumn
+        | FlussError::NonPrimaryKeyTableException => GatewayError::invalid_argument(format!(
             "Fluss rejected the table request while trying to {what}"
-        )),
+        ))
+        .with_resource(Resource::Table),
         FlussError::InvalidConfigException => GatewayError::invalid_argument(format!(
             "the configuration is invalid while trying to {what}"
         )),
@@ -130,6 +148,13 @@ fn map_api_error(what: &str, api_error: FlussError) -> Option<GatewayError> {
         FlussError::RequestTimeOut => {
             GatewayError::deadline_exceeded(format!("Fluss timed out while trying to {what}"))
         }
+        FlussError::RecordTooLargeException => GatewayError::limit_exceeded(format!(
+            "the encoded row is too large while trying to {what}"
+        )),
+        FlussError::StorageBackpressureException => GatewayError::new(
+            ErrorKind::StorageBackpressure,
+            format!("Fluss refused the write under storage backpressure while trying to {what}"),
+        ),
         FlussError::UnsupportedVersion => GatewayError::unsupported(format!(
             "Fluss does not support the request while trying to {what}"
         )),
@@ -302,8 +327,8 @@ pub(crate) mod tests {
                 FlussClientError::RowConvertError {
                     message: "server detail".to_string(),
                 },
-                ErrorKind::Backend,
-                "backend",
+                ErrorKind::InvalidArgument,
+                "invalid_argument",
             ),
         ];
         for (native, expected_kind, expected_code) in cases {

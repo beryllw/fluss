@@ -21,7 +21,8 @@ mod support;
 
 use fluss::client::FlussConnection;
 use fluss::config::Config;
-use fluss::metadata::{DataTypes, Schema, TableDescriptor, TablePath};
+use fluss::metadata::{DataTypes, Schema, TableBucket, TableDescriptor, TablePath};
+use fluss::row::{DataGetters, GenericRow};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -30,6 +31,8 @@ use support::{Api, ChildGuard, await_http_ok, binary, free_port};
 
 const DATABASE: &str = "gateway_e2e";
 const TABLE: &str = "events";
+const LOG_TABLE: &str = "applog";
+const KV_TABLE: &str = "profiles";
 const JOURNEY_DATABASE: &str = "gateway_e2e_journey";
 const SERVICE_ACCOUNT: &str = "admin";
 const SERVICE_SECRET: &str = "admin-secret";
@@ -227,7 +230,7 @@ async fn assert_metadata_apis(
     assert_eq!(
         api.get_ok(&format!("/v1/clusters/default/databases/{DATABASE}/tables"))
             .await,
-        serde_json::json!({"tables": [TABLE]})
+        serde_json::json!({"tables": [LOG_TABLE, TABLE, KV_TABLE]})
     );
     if catalog_journey {
         assert_catalog_journey(&api).await;
@@ -407,6 +410,270 @@ async fn assert_catalog_journey(api: &Api) {
     );
 }
 
+/// Writes over HTTP and reads back with the native client.
+async fn assert_write_apis(
+    bootstrap_servers: &str,
+    security_protocol: &str,
+    connection: &FlussConnection,
+) {
+    let gateway_port = free_port();
+    let directory = tempfile::tempdir().expect("temporary Gateway config directory");
+    let config = write_gateway_config(
+        &directory,
+        gateway_port,
+        bootstrap_servers,
+        security_protocol,
+    );
+    let child = binary()
+        .arg("--config")
+        .arg(config)
+        .spawn()
+        .expect("start the Gateway binary");
+    let mut gateway = ChildGuard(child);
+    let base = format!("http://127.0.0.1:{gateway_port}");
+    assert!(
+        await_http_ok(&format!("{base}/ready"), Duration::from_secs(15)).await,
+        "Gateway becomes ready"
+    );
+    let api = Api::new(base);
+
+    let appended = api
+        .post_json_text_ok(
+            &format!("/v1/clusters/default/databases/{DATABASE}/tables/{LOG_TABLE}/records"),
+            r#"{"entries":[
+                {"id":"a1","append":{"ts":"1700000000000","message":"first"}},
+                {"id":"a2","append":{"ts":"1700000000001","message":"second"}}
+            ]}"#,
+        )
+        .await;
+    assert_eq!(appended["success_count"], 2, "{appended}");
+
+    // Upsert rows, then delete one.
+    let records = format!("/v1/clusters/default/databases/{DATABASE}/tables/{KV_TABLE}/records");
+    let upserted = api
+        .post_json_text_ok(
+            &records,
+            r#"{"entries":[
+                {"id":"u1","upsert":{"id":1,"name":"ada","note":"first"}},
+                {"id":"u2","upsert":{"id":2,"name":"bob","note":"second"}},
+                {"id":"u3","upsert":{"id":3,"name":"cyd","note":"third"}},
+                {"id":"u4","upsert":{"id":4,"name":"dee","note":"fourth"}},
+                {"id":"u5","upsert":{"id":5,"name":"eve","note":"fifth"}}
+            ]}"#,
+        )
+        .await;
+    assert_eq!(upserted["success_count"], 5, "{upserted}");
+
+    let deleted = api
+        .post_json_text_ok(&records, r#"{"entries":[{"id":"d1","delete":{"id":3}}]}"#)
+        .await;
+    assert_eq!(deleted["success_count"], 1, "{deleted}");
+
+    let updated = api
+        .post_json_text_ok(
+            &records,
+            r#"{"partial_update_columns":["id","note"],
+                "entries":[{"id":"p1","upsert":{"id":2,"note":"amended"}},
+                           {"id":"p2","upsert":{"id":4}},
+                           {"id":"p3","upsert":{"id":5,"note":null}}]}"#,
+        )
+        .await;
+    assert_eq!(updated["success_count"], 3, "{updated}");
+
+    let rejected = api
+        .post_json_text(
+            &records,
+            r#"{"entries":[
+                {"id":"ok","upsert":{"id":9,"name":"nine","note":"nine"}},
+                {"id":"bad","upsert":{"id":10,"nope":"unknown column"}}
+            ]}"#,
+        )
+        .await;
+    assert_eq!(rejected.status(), 400);
+
+    assert_schema_recreation(&api, connection).await;
+
+    // The Gateway is shut down before the read-back, which also proves the rows were durable rather
+    // than buffered in the process that wrote them.
+    gateway.send_sigterm();
+    let status = gateway.wait_for_exit(Duration::from_secs(35)).await;
+    assert_eq!(status.code(), Some(0), "Gateway drains cleanly");
+
+    assert_log_rows_reached_fluss(connection).await;
+    assert_kv_rows_reached_fluss(connection).await;
+}
+
+async fn assert_schema_recreation(api: &Api, connection: &FlussConnection) {
+    let path = TablePath::new(DATABASE, "recreated_profiles");
+    let records =
+        format!("/v1/clusters/default/databases/{DATABASE}/tables/recreated_profiles/records");
+    let descriptor = |columns: [&str; 2]| {
+        TableDescriptor::builder()
+            .schema(
+                Schema::builder()
+                    .column("id", DataTypes::int())
+                    .column(columns[0], DataTypes::string())
+                    .column(columns[1], DataTypes::string())
+                    .primary_key(["id"])
+                    .build()
+                    .unwrap(),
+            )
+            .distributed_by(Some(1), Vec::new())
+            .build()
+            .unwrap()
+    };
+    let admin = connection.get_admin().unwrap();
+    admin
+        .create_table(&path, &descriptor(["name", "note"]), false)
+        .await
+        .unwrap();
+    let body = r#"{"entries":[{"id":"e1","upsert":{"id":1,"name":"expected-name","note":"expected-note"}}]}"#;
+    let warm = api.post_json_text_ok(&records, body).await;
+    assert_eq!(warm["success_count"], 1, "{warm}");
+    let original = connection
+        .get_table(&path)
+        .await
+        .unwrap()
+        .get_table_info()
+        .clone();
+
+    admin.drop_table(&path, false).await.unwrap();
+    admin
+        .create_table(&path, &descriptor(["note", "name"]), false)
+        .await
+        .unwrap();
+
+    let table = connection.get_table(&path).await.unwrap();
+    assert_eq!(table.get_table_info().schema_id, original.schema_id);
+    assert_ne!(table.get_table_info().table_id, original.table_id);
+    let mut lookuper = table.new_lookup().unwrap().create_lookuper().unwrap();
+    let mut key = GenericRow::new(1);
+    key.set_field(0, 1);
+    assert!(
+        lookuper
+            .lookup(&key)
+            .await
+            .unwrap()
+            .get_single_row()
+            .unwrap()
+            .is_none(),
+        "the recreated table starts empty"
+    );
+
+    let mut written = None;
+    for _ in 0..3 {
+        let response = api.post_json_text(&records, body).await;
+        let status = response.status();
+        let payload: serde_json::Value = response.json().await.unwrap();
+        if status.is_success() && payload["success_count"] == 1 {
+            written = Some(payload);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let written = written.expect("a retry recovers from stale table metadata");
+    assert_eq!(written["success_count"], 1, "{written}");
+    let result = lookuper.lookup(&key).await.unwrap();
+    let row = result
+        .get_single_row()
+        .unwrap()
+        .expect("the retried row is written");
+    assert_eq!(row.get_string(1).unwrap(), "expected-note");
+    assert_eq!(row.get_string(2).unwrap(), "expected-name");
+}
+
+/// Reads the appended rows back with a bounded scan of the log table's only bucket.
+async fn assert_log_rows_reached_fluss(connection: &FlussConnection) {
+    let path = TablePath::new(DATABASE, LOG_TABLE);
+    let table = connection
+        .get_table(&path)
+        .await
+        .expect("open the log table");
+    let table_id = table.get_table_info().get_table_id();
+    let mut scanner = table
+        .new_scan()
+        .limit(16)
+        .expect("a positive scan limit")
+        .create_bucket_batch_scanner(TableBucket::new(table_id, 0))
+        .expect("a bounded scanner over the only bucket");
+    let batches = scanner
+        .collect_all_batches()
+        .await
+        .expect("scan the appended rows");
+    assert_eq!(
+        batches
+            .iter()
+            .map(|batch| batch.num_records())
+            .sum::<usize>(),
+        2
+    );
+}
+
+async fn assert_kv_rows_reached_fluss(connection: &FlussConnection) {
+    let path = TablePath::new(DATABASE, KV_TABLE);
+    let table = connection
+        .get_table(&path)
+        .await
+        .expect("open the KV table");
+    let mut lookuper = table
+        .new_lookup()
+        .expect("prepare the lookup")
+        .create_lookuper()
+        .expect("create the lookuper");
+
+    let mut key = GenericRow::new(1);
+    key.set_field(0, 1);
+    let first = lookuper.lookup(&key).await.expect("look up id 1");
+    let row = first
+        .get_single_row()
+        .expect("decode the row")
+        .expect("id 1 was upserted");
+    assert_eq!(row.get_string(1).expect("name"), "ada");
+    assert_eq!(row.get_string(2).expect("note"), "first");
+
+    let mut key = GenericRow::new(1);
+    key.set_field(0, 2);
+    let second = lookuper.lookup(&key).await.expect("look up id 2");
+    let row = second
+        .get_single_row()
+        .expect("decode the row")
+        .expect("id 2 was upserted");
+    assert_eq!(row.get_string(1).expect("name"), "bob");
+    assert_eq!(row.get_string(2).expect("note"), "amended");
+
+    for (id, name) in [(4, "dee"), (5, "eve")] {
+        let mut key = GenericRow::new(1);
+        key.set_field(0, id);
+        let result = lookuper.lookup(&key).await.unwrap();
+        let row = result
+            .get_single_row()
+            .unwrap()
+            .expect("partial-update row exists");
+        assert_eq!(row.get_string(1).unwrap(), name);
+        assert!(
+            row.is_null_at(2).unwrap(),
+            "missing and explicit-null targets clear note"
+        );
+    }
+
+    let mut key = GenericRow::new(1);
+    key.set_field(0, 3);
+    let third = lookuper.lookup(&key).await.expect("look up id 3");
+    assert!(
+        third.get_single_row().expect("decode the row").is_none(),
+        "id 3 was deleted"
+    );
+
+    // The rejected batch was all-or-nothing, so neither of its entries reached the table.
+    let mut key = GenericRow::new(1);
+    key.set_field(0, 9);
+    let rejected = lookuper.lookup(&key).await.expect("look up id 9");
+    assert!(
+        rejected.get_single_row().expect("decode the row").is_none(),
+        "a batch rejected by preflight writes nothing"
+    );
+}
+
 #[tokio::test]
 async fn metadata_apis_support_plaintext_and_sasl_fluss_clusters() {
     let cluster = tokio::task::spawn_blocking(|| FlussCluster::start(free_cluster_port_pair()))
@@ -443,8 +710,43 @@ async fn metadata_apis_support_plaintext_and_sasl_fluss_clusters() {
         .await
         .expect("create the E2E table");
 
+    let log_descriptor = TableDescriptor::builder()
+        .schema(
+            Schema::builder()
+                .column("ts", DataTypes::bigint())
+                .column("message", DataTypes::string())
+                .build()
+                .expect("build the log schema"),
+        )
+        .distributed_by(Some(1), Vec::new())
+        .build()
+        .expect("build the log descriptor");
+    admin
+        .create_table(&TablePath::new(DATABASE, LOG_TABLE), &log_descriptor, false)
+        .await
+        .expect("create the log table");
+
+    let kv_descriptor = TableDescriptor::builder()
+        .schema(
+            Schema::builder()
+                .column("id", DataTypes::int())
+                .column("name", DataTypes::string())
+                .column("note", DataTypes::string())
+                .primary_key(["id"])
+                .build()
+                .expect("build the KV schema"),
+        )
+        .distributed_by(Some(1), Vec::new())
+        .build()
+        .expect("build the KV descriptor");
+    admin
+        .create_table(&TablePath::new(DATABASE, KV_TABLE), &kv_descriptor, false)
+        .await
+        .expect("create the KV table");
+
     assert_metadata_apis(&cluster.plaintext_bootstrap_servers, "plaintext", false).await;
     assert_metadata_apis(&cluster.sasl_bootstrap_servers, "sasl", true).await;
+    assert_write_apis(&cluster.sasl_bootstrap_servers, "sasl", &connection).await;
 
     connection
         .close(Duration::from_secs(10))

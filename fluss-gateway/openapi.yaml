@@ -447,6 +447,7 @@ components:
       - partition_already_exists
       - partition_not_found
       - resource_exhausted
+      - storage_backpressure
       - table_already_exists
       - table_not_found
       - timeout
@@ -944,6 +945,116 @@ components:
       required:
       - name
       - field_type
+      type: object
+    WriteEntrySchema:
+      description: |-
+        One request entry. Exactly one of `append`, `upsert`, or `delete` is required, and its value is
+        the row object.
+      properties:
+        append:
+          type: object
+        delete:
+          type: object
+        id:
+          description: Opaque caller correlation value, unique within the request, echoed by every outcome.
+          type: string
+        upsert:
+          type: object
+      required:
+      - id
+      - append
+      - upsert
+      - delete
+      type: object
+    WriteFailureResponse:
+      properties:
+        error_code:
+          description: |-
+            A stable error code, plus `storage_backpressure` — a KV write the store refused under
+            backpressure. `timeout` marks an indeterminate outcome: the row may already be applied.
+          type: string
+        id:
+          type: string
+        message:
+          type: string
+      required:
+      - id
+      - error_code
+      - message
+      type: object
+    WriteRequestSchema:
+      additionalProperties: false
+      description: Schema-only mirror of the request body, for the generated document.
+      properties:
+        entries:
+          items:
+            $ref: '#/components/schemas/WriteEntrySchema'
+          minItems: 1
+          type: array
+        partial_update:
+          description: |-
+            Optional partial-update flag. If true, columns are required; if false, columns are forbidden.
+            Omitting the flag allows `partial_update_columns` to enable partial updates.
+          type:
+          - boolean
+          - 'null'
+        partial_update_columns:
+          description: |-
+            Columns targeted by every entry in this batch. KV tables only.
+
+            It must include every primary-key column, and for a strict subset every non-primary-key
+            column of the table must be nullable. Missing or explicit-null nullable targets are written
+            as null; untargeted columns are preserved. Deletes require only primary-key values and clear
+            the targeted non-key columns; the row is removed when all non-key columns become null.
+          items:
+            type: string
+          minItems: 1
+          type:
+          - array
+          - 'null'
+      required:
+      - entries
+      type: object
+    WriteResponse:
+      description: Ordered, entry-correlated outcomes of one batch.
+      properties:
+        error_count:
+          format: int64
+          minimum: 0
+          type: integer
+        failures:
+          description: |-
+            Failures in input order. A verdict can be shared by entries that landed in one accumulator
+            batch.
+          items:
+            $ref: '#/components/schemas/WriteFailureResponse'
+          type: array
+        row_count:
+          format: int64
+          minimum: 0
+          type: integer
+        success_count:
+          format: int64
+          minimum: 0
+          type: integer
+        successes:
+          description: Successes in input order.
+          items:
+            $ref: '#/components/schemas/WriteSuccessResponse'
+          type: array
+      required:
+      - row_count
+      - success_count
+      - error_count
+      - successes
+      - failures
+      type: object
+    WriteSuccessResponse:
+      properties:
+        id:
+          type: string
+      required:
+      - id
       type: object
 info:
   description: Stateless REST gateway for Apache Fluss
@@ -2018,6 +2129,105 @@ paths:
       summary: Drops one partition by its Fluss name.
       tags:
       - ddl
+  /v1/clusters/{cluster}/databases/{database}/tables/{table}/records:
+    post:
+      description: 'Writes a batch in input order after validating every row against the table schema. A validation failure rejects the whole batch with 400 before anything is submitted. Delivery is at least once from the caller''s perspective: the gateway never resubmits after submission, but client retries and caller retries can duplicate log appends. An entry whose code is `timeout` may have been applied, and entries sharing one accumulator batch can share a verdict.'
+      operationId: writeRecords
+      parameters:
+      - description: Configured cluster ID
+        in: path
+        name: cluster
+        required: true
+        schema:
+          type: string
+      - description: Exact database name
+        in: path
+        name: database
+        required: true
+        schema:
+          type: string
+      - description: Exact table name
+        in: path
+        name: table
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WriteRequestSchema'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WriteResponse'
+          description: Ordered entry outcomes; completion can be indeterminate after submission
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Malformed request, or preflight rejected the whole batch
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Unknown cluster or table
+        '406':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: A JSON response is not acceptable
+        '413':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Body or row limit exceeded
+        '415':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Unsupported request media type
+        '429':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: The write concurrency gate or rate limit is exhausted; retry after the `Retry-After` pause
+        '500':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Fluss backend failure
+        '501':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Fluss does not support the operation or API version
+        '503':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Fluss is unavailable, the gateway is starting or shutting down, or the table/schema changed before submission
+        '504':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: The request deadline passed; writes may still complete after submission
+      summary: Writes a batch of records to a table
+      tags:
+      - records
   /v1/openapi.json:
     get:
       operationId: getOpenApi
