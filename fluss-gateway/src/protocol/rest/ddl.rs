@@ -93,7 +93,7 @@ pub struct CreateTableBody {
     /// Fluss table properties, validated by the server.
     #[serde(default)]
     pub configs: HashMap<String, String>,
-    /// Custom table metadata; avoid the `table.` prefix used by Fluss configs.
+    /// Custom table metadata; keys must not use the reserved `table.` prefix.
     #[serde(default)]
     pub custom_properties: HashMap<String, String>,
     pub comment: Option<String>,
@@ -487,6 +487,15 @@ pub(crate) async fn drop_partition(
 fn table_descriptor(database: &str, body: CreateTableBody) -> GatewayResult<TableDescriptor> {
     native_name("database name", database, true)?;
     native_name("table name", &body.table_name, true)?;
+    if body
+        .custom_properties
+        .keys()
+        .any(|key| key.starts_with("table."))
+    {
+        return Err(GatewayError::invalid_argument(
+            "custom property keys must not use the reserved `table.` prefix",
+        ));
+    }
 
     let mut schema = Schema::builder();
     for column in body.columns {
@@ -959,6 +968,21 @@ mod tests {
                 );
             }
         }
+        assert!(backend.calls().is_empty());
+
+        let mut definition = partitioned_table();
+        definition["custom_properties"] = json!({"table.custom": "value"});
+        let (status, _, body) = post(
+            &app,
+            "/v1/clusters/default/databases/sales/tables",
+            definition,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(
+            body["error"]["message"],
+            "custom property keys must not use the reserved `table.` prefix"
+        );
         assert!(backend.calls().is_empty());
 
         let mut definition = partitioned_table();

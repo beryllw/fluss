@@ -330,7 +330,7 @@ components:
         custom_properties:
           additionalProperties:
             type: string
-          description: Custom table metadata; avoid the `table.` prefix used by Fluss configs.
+          description: Custom table metadata; keys must not use the reserved `table.` prefix.
           propertyNames:
             type: string
           type: object
