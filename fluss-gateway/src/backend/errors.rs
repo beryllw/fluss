@@ -112,12 +112,20 @@ fn map_api_error(what: &str, api_error: FlussError) -> Option<GatewayError> {
         FlussError::InvalidDatabaseException => GatewayError::invalid_argument(format!(
             "Fluss rejected the name while trying to {what}"
         )),
-        FlussError::InvalidTableException
-        | FlussError::InvalidConfigException
-        | FlussError::InvalidAlterTableException
-        | FlussError::InvalidReplicationFactor
-        | FlussError::BucketMaxNumException => GatewayError::invalid_argument(format!(
-            "Fluss rejected the definition while trying to {what}"
+        FlussError::InvalidTableException => GatewayError::invalid_argument(format!(
+            "Fluss rejected the table request while trying to {what}"
+        )),
+        FlussError::InvalidConfigException => GatewayError::invalid_argument(format!(
+            "the configuration is invalid while trying to {what}"
+        )),
+        FlussError::InvalidAlterTableException => GatewayError::invalid_argument(format!(
+            "Fluss rejected the requested table alteration while trying to {what}"
+        )),
+        FlussError::InvalidReplicationFactor => GatewayError::invalid_argument(format!(
+            "the replication factor is invalid while trying to {what}"
+        )),
+        FlussError::BucketMaxNumException => GatewayError::invalid_argument(format!(
+            "the requested bucket count exceeds the maximum while trying to {what}"
         )),
         FlussError::RequestTimeOut => {
             GatewayError::deadline_exceeded(format!("Fluss timed out while trying to {what}"))
@@ -170,10 +178,11 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn native_failures_map_to_their_gateway_class_and_code() {
+    fn native_failures_map_to_gateway_errors_and_logs() {
         log::set_logger(&TestLogger).expect("install the test logger");
         log::set_max_level(log::LevelFilter::Debug);
         let ctx = RequestContext::for_test("default", Duration::from_secs(5));
+        let operation = "complete the request";
         let cases = [
             (
                 api_failure(FlussError::DatabaseNotExist),
@@ -300,37 +309,41 @@ pub(crate) mod tests {
         for (native, expected_kind, expected_code) in cases {
             let api_error = native.api_error();
             let rendered = native.to_string();
-            let mapped = map_fluss_error("list the partitions", native, Some(&ctx));
+            let mapped = map_fluss_error(operation, native, Some(&ctx));
             assert_eq!(mapped.kind(), expected_kind, "{rendered}");
             assert_eq!(mapped.code(), expected_code, "{rendered}");
-            assert!(
-                mapped.message().contains("list the partitions"),
-                "{}",
-                mapped.message()
-            );
+            assert!(mapped.message().contains(operation), "{}", mapped.message());
             assert!(
                 !mapped.message().contains("server detail"),
                 "the native detail must stay in the log: {}",
                 mapped.message()
             );
-            match api_error {
-                Some(FlussError::InvalidDatabaseException) => assert_eq!(
+            let expected_reason = match api_error {
+                Some(FlussError::InvalidDatabaseException) => Some("Fluss rejected the name"),
+                Some(FlussError::InvalidTableException) => Some("Fluss rejected the table request"),
+                Some(FlussError::InvalidConfigException) => Some("the configuration is invalid"),
+                Some(FlussError::InvalidAlterTableException) => {
+                    Some("Fluss rejected the requested table alteration")
+                }
+                Some(FlussError::InvalidReplicationFactor) => {
+                    Some("the replication factor is invalid")
+                }
+                Some(FlussError::BucketMaxNumException) => {
+                    Some("the requested bucket count exceeds the maximum")
+                }
+                Some(FlussError::TableNotPartitionedException) => {
+                    Some("the table is not partitioned")
+                }
+                Some(FlussError::PartitionSpecInvalidException) => {
+                    Some("Fluss rejected the partition spec")
+                }
+                _ => None,
+            };
+            if let Some(reason) = expected_reason {
+                assert_eq!(
                     mapped.message(),
-                    "Fluss rejected the name while trying to list the partitions"
-                ),
-                Some(FlussError::InvalidTableException) => assert_eq!(
-                    mapped.message(),
-                    "Fluss rejected the definition while trying to list the partitions"
-                ),
-                Some(FlussError::TableNotPartitionedException) => assert_eq!(
-                    mapped.message(),
-                    "the table is not partitioned while trying to list the partitions"
-                ),
-                Some(FlussError::PartitionSpecInvalidException) => assert_eq!(
-                    mapped.message(),
-                    "Fluss rejected the partition spec while trying to list the partitions"
-                ),
-                _ => {}
+                    format!("{reason} while trying to {operation}")
+                );
             }
             let logs = LOGS.take();
             assert_eq!(logs.len(), 1, "{logs:?}");
@@ -341,7 +354,7 @@ pub(crate) mod tests {
             assert!(logs[0].1.contains("request_id=test-request"), "{logs:?}");
             assert!(logs[0].1.contains("cluster=default"), "{logs:?}");
             assert!(
-                logs[0].1.contains("operation=\"list the partitions\""),
+                logs[0].1.contains(&format!("operation={operation:?}")),
                 "{logs:?}"
             );
         }
