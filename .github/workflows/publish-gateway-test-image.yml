@@ -60,10 +60,10 @@ jobs:
       - name: Log in to GitHub Container Registry
         shell: bash
         run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" \
+          echo "${{ secrets.ACCESS_TOKEN }}" \
             | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
 
-      - name: Build, smoke test, and push architecture image
+      - name: Build, smoke test, and export architecture image
         shell: bash
         env:
           GATEWAY_ARCH: ${{ matrix.arch }}
@@ -75,6 +75,24 @@ jobs:
           export FLUSS_VERSION="dev-${IMAGE_TAG}"
           export GATEWAY_IMAGE="${IMAGE}:${IMAGE_TAG}-${GATEWAY_ARCH}"
           docker/fluss-gateway/build.sh
+          docker save \
+            --output "/tmp/fluss-gateway-${IMAGE_TAG}-${GATEWAY_ARCH}.tar" \
+            "${GATEWAY_IMAGE}"
+
+      - name: Upload architecture image
+        uses: actions/upload-artifact@v4
+        with:
+          name: fluss-gateway-${{ env.IMAGE_TAG }}-${{ matrix.arch }}
+          path: /tmp/fluss-gateway-${{ env.IMAGE_TAG }}-${{ matrix.arch }}.tar
+          compression-level: 0
+          retention-days: 7
+
+      - name: Push architecture image
+        shell: bash
+        env:
+          GATEWAY_ARCH: ${{ matrix.arch }}
+        run: |
+          export GATEWAY_IMAGE="${IMAGE}:${IMAGE_TAG}-${GATEWAY_ARCH}"
           docker push "${GATEWAY_IMAGE}"
 
   publish-manifest:
@@ -86,7 +104,7 @@ jobs:
       - name: Log in to GitHub Container Registry
         shell: bash
         run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" \
+          echo "${{ secrets.ACCESS_TOKEN }}" \
             | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
 
       - name: Publish and inspect manifest
