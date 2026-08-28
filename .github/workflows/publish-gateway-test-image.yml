@@ -1,0 +1,99 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: Publish Gateway Test Image
+
+on:
+  push:
+    branches:
+      - codex/publish-gateway-image-4098
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/fluss-gateway
+  IMAGE_TAG: 1b940e41226c
+  SOURCE_SHA: 1b940e41226c6ba2bd1fd5dd1de4fd7609e8ace6
+
+jobs:
+  build-and-push:
+    name: Build and push Gateway (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Log in to GitHub Container Registry
+        shell: bash
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
+
+      - name: Build, smoke test, and push architecture image
+        shell: bash
+        env:
+          GATEWAY_ARCH: ${{ matrix.arch }}
+          GATEWAY_BUILD_CACHE_FROM: type=gha,scope=fluss-gateway-${{ matrix.arch }}
+          GATEWAY_BUILD_CACHE_TO: type=gha,mode=max,scope=fluss-gateway-${{ matrix.arch }}
+          RUN_SMOKE: "true"
+          VCS_REF: ${{ env.SOURCE_SHA }}
+        run: |
+          export FLUSS_VERSION="dev-${IMAGE_TAG}"
+          export GATEWAY_IMAGE="${IMAGE}:${IMAGE_TAG}-${GATEWAY_ARCH}"
+          docker/fluss-gateway/build.sh
+          docker push "${GATEWAY_IMAGE}"
+
+  publish-manifest:
+    name: Publish multi-architecture manifest
+    needs: build-and-push
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Log in to GitHub Container Registry
+        shell: bash
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
+
+      - name: Publish and inspect manifest
+        shell: bash
+        run: |
+          docker buildx imagetools create \
+            --tag "${IMAGE}:${IMAGE_TAG}" \
+            "${IMAGE}:${IMAGE_TAG}-amd64" \
+            "${IMAGE}:${IMAGE_TAG}-arm64"
+          docker buildx imagetools inspect "${IMAGE}:${IMAGE_TAG}"
