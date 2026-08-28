@@ -221,7 +221,7 @@ fn validate_operations(
         {
             return Err(RowDecodeError::invalid(GatewayError::invalid_argument(
                 format!(
-                    "log tables accept only append operations, but entry `{}` is a {}",
+                    "log tables accept only append operations, but entry `{}` uses the `{}` operation",
                     entry.id,
                     entry.operation.name()
                 ),
@@ -291,23 +291,22 @@ fn sparse_targets(
             ));
         }
     }
-    if selected.len() < fields.len() {
-        for field in fields {
-            if table
-                .get_primary_keys()
-                .iter()
-                .any(|key| key == field.name())
-            {
-                continue;
-            }
-            if !field.data_type().is_nullable() {
-                return Err(RowDecodeError::schema_mismatch(
-                    GatewayError::invalid_argument(format!(
-                        "a partial update requires every non-primary-key column to be nullable, but column `{}` is NOT NULL",
-                        field.name()
-                    )),
-                ));
-            }
+    for field in fields {
+        if table
+            .get_primary_keys()
+            .iter()
+            .any(|key| key == field.name())
+            || auto_increment.iter().any(|name| name == field.name())
+        {
+            continue;
+        }
+        if !field.data_type().is_nullable() {
+            return Err(RowDecodeError::schema_mismatch(
+                GatewayError::invalid_argument(format!(
+                    "a partial update requires every non-primary-key, non-auto-increment column to be nullable, but column `{}` is NOT NULL",
+                    field.name()
+                )),
+            ));
         }
     }
     Ok(Some(columns.to_vec()))
@@ -358,7 +357,7 @@ fn preflight(
                 .map_or(RowShape::Complete, RowShape::Sparse),
             Operation::Delete => RowShape::Sparse(&primary_keys),
         };
-        rows.push(decoder.decode_row(&entry.id, &entry.row_json, shape)?);
+        rows.push(decoder.decode_row(&format!("entry `{}`", entry.id), &entry.row_json, shape)?);
         change_types.push(match entry.operation {
             Operation::Append => ChangeType::AppendOnly,
             Operation::Upsert => ChangeType::Insert,
@@ -393,68 +392,53 @@ fn ensure_json_acceptable(headers: &axum::http::HeaderMap) -> GatewayResult<()> 
 ///
 /// The row objects stay as raw JSON so that number lexemes survive to schema-aware decoding: a
 /// BIGINT or DECIMAL sent as a base-10 string must not pass through an `f64`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
-struct WriteBody<'a> {
-    #[serde(default)]
-    partial_update: Option<bool>,
-    #[serde(default)]
-    partial_update_columns: Option<Vec<String>>,
-    #[serde(borrow)]
-    entries: Vec<WriteBodyEntry<'a>>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WriteBodyEntry<'a> {
-    id: String,
-    #[serde(default, borrow, deserialize_with = "deserialize_operation")]
-    append: Option<&'a RawValue>,
-    #[serde(default, borrow, deserialize_with = "deserialize_operation")]
-    upsert: Option<&'a RawValue>,
-    #[serde(default, borrow, deserialize_with = "deserialize_operation")]
-    delete: Option<&'a RawValue>,
-}
-
-// Preserve explicit null so it cannot hide a second operation in an entry.
-fn deserialize_operation<'de, D>(deserializer: D) -> Result<Option<&'de RawValue>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    <&RawValue>::deserialize(deserializer).map(Some)
-}
-
-/// Schema-only mirror of the request body, for the generated document.
-#[derive(Debug, Serialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct WriteRequestSchema {
+pub struct WriteBody<T> {
     /// Optional partial-update flag. If true, columns are required; if false, columns are forbidden.
     /// Omitting the flag allows `partial_update_columns` to enable partial updates.
+    #[serde(default)]
     pub partial_update: Option<bool>,
     /// Columns targeted by every entry in this batch. KV tables only.
     ///
-    /// It must include every primary-key column, and for a strict subset every non-primary-key
-    /// column of the table must be nullable. Missing or explicit-null nullable targets are written
-    /// as null; untargeted columns are preserved. Deletes require only primary-key values and clear
-    /// the targeted non-key columns; the row is removed when all non-key columns become null.
+    /// Every primary-key column must be included, and every non-primary-key,
+    /// non-auto-increment column in the table must be nullable. Missing or explicit-null nullable
+    /// targets are written as null; untargeted columns are preserved. Deletes require only
+    /// primary-key values and clear the targeted non-key columns; the row is removed when all
+    /// non-key columns become null.
+    #[serde(default)]
     #[schema(min_items = 1)]
     pub partial_update_columns: Option<Vec<String>>,
     #[schema(min_items = 1)]
-    pub entries: Vec<WriteEntrySchema>,
+    pub entries: Vec<WriteBodyEntry<T>>,
 }
 
 /// One request entry. Exactly one of `append`, `upsert`, or `delete` is required, and its value is
 /// the row object.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct WriteEntrySchema {
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+#[serde(bound(deserialize = "T: Deserialize<'de>"))]
+pub struct WriteBodyEntry<T> {
     /// Opaque caller correlation value, unique within the request, echoed by every outcome.
     pub id: String,
+    #[serde(default, deserialize_with = "deserialize_operation")]
     #[schema(value_type = Object)]
-    pub append: Option<serde_json::Value>,
+    pub append: Option<T>,
+    #[serde(default, deserialize_with = "deserialize_operation")]
     #[schema(value_type = Object)]
-    pub upsert: Option<serde_json::Value>,
+    pub upsert: Option<T>,
+    #[serde(default, deserialize_with = "deserialize_operation")]
     #[schema(value_type = Object)]
-    pub delete: Option<serde_json::Value>,
+    pub delete: Option<T>,
+}
+
+// Preserve explicit null so it cannot hide a second operation in an entry.
+fn deserialize_operation<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -501,7 +485,7 @@ pub struct WriteResponse {
         ("database" = String, Path, description = "Exact database name"),
         ("table" = String, Path, description = "Exact table name")
     ),
-    request_body(content = WriteRequestSchema, content_type = "application/json"),
+    request_body(content = WriteBody<serde_json::Value>, content_type = "application/json"),
     responses(
         (status = 200, description = "Ordered entry outcomes; completion can be indeterminate after submission", body = WriteResponse),
         (status = 400, description = "Malformed request, or preflight rejected the whole batch", body = ErrorEnvelope),
@@ -546,7 +530,7 @@ async fn run_write(
     let body = collect_body(request).await?;
     state.write_rate.admit(body.len())?;
 
-    let parsed: WriteBody<'_> = serde_json::from_slice(&body).map_err(|error| {
+    let parsed: WriteBody<&RawValue> = serde_json::from_slice(&body).map_err(|error| {
         GatewayError::invalid_argument(format!(
             "the request body is not a valid write body: {error}"
         ))
@@ -605,7 +589,7 @@ async fn collect_body(request: Request) -> Result<Bytes, GatewayError> {
 }
 
 fn partial_update_columns<'a>(
-    body: &'a WriteBody<'_>,
+    body: &'a WriteBody<&RawValue>,
 ) -> Result<Option<&'a [String]>, GatewayError> {
     match (body.partial_update, body.partial_update_columns.as_deref()) {
         (Some(true), None) => Err(GatewayError::invalid_argument(
@@ -619,7 +603,7 @@ fn partial_update_columns<'a>(
 }
 
 /// Validates the entry envelope and lifts each row object out as raw bytes.
-fn prepared_entries(body: &WriteBody<'_>) -> Result<Vec<PreparedEntry>, GatewayError> {
+fn prepared_entries(body: &WriteBody<&RawValue>) -> Result<Vec<PreparedEntry>, GatewayError> {
     if body.entries.is_empty() {
         return Err(GatewayError::invalid_argument(
             "a write request must carry at least one entry",
@@ -696,6 +680,7 @@ mod tests {
     use crate::protocol::rest::{RestOptions, test_support};
     use axum::body::Body;
     use axum::http::{Request as HttpRequest, StatusCode};
+    use fluss::metadata::{DataType, Schema, TableDescriptor};
     use http_body_util::BodyExt;
     use std::sync::Arc;
     use tower::ServiceExt;
@@ -774,6 +759,32 @@ mod tests {
             Some(vec!["id".to_string(), "name".to_string()])
         );
         assert!(sparse_targets(&table, None).unwrap().is_none());
+    }
+
+    #[test]
+    fn partial_updates_require_nullable_non_key_columns() {
+        let schema = Schema::builder()
+            .column(
+                "id",
+                DataType::Int(fluss::metadata::IntType::with_nullable(false)),
+            )
+            .column(
+                "name",
+                DataType::String(fluss::metadata::StringType::with_nullable(false)),
+            )
+            .primary_key(["id"])
+            .build()
+            .unwrap();
+        let descriptor = TableDescriptor::builder()
+            .schema(schema)
+            .distributed_by(Some(1), Vec::new())
+            .build()
+            .unwrap();
+        let table = TableInfo::of(TablePath::new("fluss", "strict"), 1, 1, descriptor, 0, 0);
+
+        let error =
+            sparse_targets(&table, Some(&["id".to_string(), "name".to_string()])).unwrap_err();
+        assert!(error.message().contains("column `name` is NOT NULL"));
     }
 
     async fn post(app: &axum::Router, path: &str, body: &str) -> (StatusCode, serde_json::Value) {
@@ -901,6 +912,10 @@ mod tests {
             (
                 r#"{"partial_update_columns":["id","id"],"entries":[{"id":"e1","upsert":{"id":1}}]}"#,
                 "duplicate partial-update column",
+            ),
+            (
+                r#"{"entries":[{"id":"e1","upsert":{"id":1,"unknown":2}}]}"#,
+                "entry `e1`: unknown column",
             ),
             (
                 r#"{"entries":[{"id":"e1","upsert":{"id":1}}],"nope":1}"#,

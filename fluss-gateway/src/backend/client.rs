@@ -113,22 +113,6 @@ impl NativeFlussBackend {
         .await
     }
 
-    async fn request_table_info(
-        &self,
-        ctx: &RequestContext,
-        connection: &FlussConnection,
-        table: &TablePath,
-    ) -> GatewayResult<TableInfo> {
-        ctx.run(async {
-            connection
-                .get_table(table)
-                .await
-                .map(|table| table.get_table_info().clone())
-                .map_err(|error| map_fluss_error("describe the table", error, Some(ctx)))
-        })
-        .await
-    }
-
     async fn submit_write(
         connection: &Arc<FlussConnection>,
         ctx: &RequestContext,
@@ -241,7 +225,7 @@ impl FlussBackend for NativeFlussBackend {
         {
             return Ok(table);
         }
-        self.request_table_info(ctx, &connection, table).await
+        self.describe_table(ctx, table).await
     }
 
     async fn describe_table(
