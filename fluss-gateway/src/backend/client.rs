@@ -153,6 +153,7 @@ impl NativeFlussBackend {
 
         let deadline = ctx.deadline();
         for (index, future) in pending {
+            // TODO: Surface dropped tables as table_not_found after fluss-rust fixes #4136.
             let error = match tokio::time::timeout_at(deadline.into(), future).await {
                 Ok(Ok(())) => continue,
                 Ok(Err(error)) => classify_unknown(error),
