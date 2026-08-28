@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-name: Publish Gateway Test Image
+name: Build Gateway Test Image Artifacts
 
 on:
   push:
@@ -25,20 +25,19 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
-  IMAGE: ghcr.io/${{ github.repository_owner }}/fluss-gateway
+  IMAGE: fluss-gateway
   IMAGE_TAG: 1b940e41226c
   SOURCE_SHA: 1b940e41226c6ba2bd1fd5dd1de4fd7609e8ace6
 
 jobs:
-  build-and-push:
-    name: Build and push Gateway (${{ matrix.arch }})
+  build-and-upload:
+    name: Build and upload Gateway (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     strategy:
@@ -56,12 +55,6 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
-
-      - name: Log in to GitHub Container Registry
-        shell: bash
-        run: |
-          echo "${{ secrets.ACCESS_TOKEN }}" \
-            | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
 
       - name: Build, smoke test, and export architecture image
         shell: bash
@@ -86,32 +79,3 @@ jobs:
           path: /tmp/fluss-gateway-${{ env.IMAGE_TAG }}-${{ matrix.arch }}.tar
           compression-level: 0
           retention-days: 7
-
-      - name: Push architecture image
-        shell: bash
-        env:
-          GATEWAY_ARCH: ${{ matrix.arch }}
-        run: |
-          export GATEWAY_IMAGE="${IMAGE}:${IMAGE_TAG}-${GATEWAY_ARCH}"
-          docker push "${GATEWAY_IMAGE}"
-
-  publish-manifest:
-    name: Publish multi-architecture manifest
-    needs: build-and-push
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    steps:
-      - name: Log in to GitHub Container Registry
-        shell: bash
-        run: |
-          echo "${{ secrets.ACCESS_TOKEN }}" \
-            | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
-
-      - name: Publish and inspect manifest
-        shell: bash
-        run: |
-          docker buildx imagetools create \
-            --tag "${IMAGE}:${IMAGE_TAG}" \
-            "${IMAGE}:${IMAGE_TAG}-amd64" \
-            "${IMAGE}:${IMAGE_TAG}-arm64"
-          docker buildx imagetools inspect "${IMAGE}:${IMAGE_TAG}"
