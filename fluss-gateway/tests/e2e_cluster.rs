@@ -505,8 +505,8 @@ async fn assert_write_apis(
 
 async fn assert_schema_recreation(api: &Api, connection: &FlussConnection) {
     let path = TablePath::new(DATABASE, "recreated_profiles");
-    let records =
-        format!("/v1/clusters/default/databases/{DATABASE}/tables/recreated_profiles/records");
+    let table = format!("/v1/clusters/default/databases/{DATABASE}/tables/recreated_profiles");
+    let records = format!("{table}/records");
     let descriptor = |columns: [&str; 2]| {
         TableDescriptor::builder()
             .schema(
@@ -543,6 +543,10 @@ async fn assert_schema_recreation(api: &Api, connection: &FlussConnection) {
         .await
         .unwrap();
 
+    let refreshed = api.get_ok(&table).await;
+    assert_eq!(refreshed["columns"][1]["name"], "note");
+    assert_eq!(refreshed["columns"][2]["name"], "name");
+
     let table = connection.get_table(&path).await.unwrap();
     assert_eq!(table.get_table_info().schema_id, original.schema_id);
     assert_ne!(table.get_table_info().table_id, original.table_id);
@@ -560,18 +564,7 @@ async fn assert_schema_recreation(api: &Api, connection: &FlussConnection) {
         "the recreated table starts empty"
     );
 
-    let mut written = None;
-    for _ in 0..3 {
-        let response = api.post_json_text(&records, body).await;
-        let status = response.status();
-        let payload: serde_json::Value = response.json().await.unwrap();
-        if status.is_success() && payload["success_count"] == 1 {
-            written = Some(payload);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    let written = written.expect("a retry recovers from stale table metadata");
+    let written = api.post_json_text_ok(&records, body).await;
     assert_eq!(written["success_count"], 1, "{written}");
     let result = lookuper.lookup(&key).await.unwrap();
     let row = result

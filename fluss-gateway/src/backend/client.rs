@@ -249,8 +249,10 @@ impl FlussBackend for NativeFlussBackend {
         ctx: &RequestContext,
         table: &TablePath,
     ) -> GatewayResult<TableInfo> {
-        let connection = ctx.run(self.cache_for(ctx)?.connection(ctx)).await?;
-        self.request_table_info(ctx, &connection, table).await
+        self.admin_call(ctx, "describe the table", |admin| async move {
+            admin.get_table_info(table).await
+        })
+        .await
     }
 
     async fn create_table(
