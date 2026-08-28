@@ -395,10 +395,6 @@ fn ensure_json_acceptable(headers: &axum::http::HeaderMap) -> GatewayResult<()> 
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WriteBody<T> {
-    /// Optional partial-update flag. If true, columns are required; if false, columns are forbidden.
-    /// Omitting the flag allows `partial_update_columns` to enable partial updates.
-    #[serde(default)]
-    pub partial_update: Option<bool>,
     /// Columns targeted by every entry in this batch. KV tables only.
     ///
     /// Every primary-key column must be included, and every non-primary-key,
@@ -542,7 +538,7 @@ async fn run_write(
             state.write_max_rows
         )));
     }
-    let partial_update_columns = partial_update_columns(&parsed)?;
+    let partial_update_columns = parsed.partial_update_columns.as_deref();
     let entries = prepared_entries(&parsed)?;
 
     let path = TablePath::new(database, table);
@@ -586,20 +582,6 @@ async fn collect_body(request: Request) -> Result<Bytes, GatewayError> {
             GatewayError::invalid_argument(format!("the request body is unreadable: {error}"))
         }
     })
-}
-
-fn partial_update_columns<'a>(
-    body: &'a WriteBody<&RawValue>,
-) -> Result<Option<&'a [String]>, GatewayError> {
-    match (body.partial_update, body.partial_update_columns.as_deref()) {
-        (Some(true), None) => Err(GatewayError::invalid_argument(
-            "partial_update requires partial_update_columns",
-        )),
-        (Some(false), Some(_)) => Err(GatewayError::invalid_argument(
-            "partial_update_columns conflicts with partial_update: false",
-        )),
-        (_, columns) => Ok(columns),
-    }
 }
 
 /// Validates the entry envelope and lifts each row object out as raw bytes.
@@ -894,16 +876,8 @@ mod tests {
                 "duplicate write entry ID",
             ),
             (
-                r#"{"partial_update":true,"entries":[{"id":"e1","upsert":{"id":1}}]}"#,
-                "requires partial_update_columns",
-            ),
-            (
                 r#"{"partial_update_columns":"id","entries":[{"id":"e1","upsert":{"id":1}}]}"#,
                 "expected a sequence",
-            ),
-            (
-                r#"{"partial_update":false,"partial_update_columns":["id"],"entries":[{"id":"e1","upsert":{"id":1}}]}"#,
-                "conflicts with partial_update: false",
             ),
             (
                 r#"{"partial_update_columns":[],"entries":[{"id":"e1","upsert":{"id":1}}]}"#,

@@ -977,13 +977,6 @@ components:
             $ref: '#/components/schemas/WriteBodyEntry_Value'
           minItems: 1
           type: array
-        partial_update:
-          description: |-
-            Optional partial-update flag. If true, columns are required; if false, columns are forbidden.
-            Omitting the flag allows `partial_update_columns` to enable partial updates.
-          type:
-          - boolean
-          - 'null'
         partial_update_columns:
           description: |-
             Columns targeted by every entry in this batch. KV tables only.
