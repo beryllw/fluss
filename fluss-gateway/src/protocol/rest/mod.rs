@@ -547,6 +547,8 @@ async fn catch_panic(request: Request, next: Next) -> Response {
 
 /// Logs and counts one completed request.
 ///
+/// Metrics use the bounded matched `route`; only the access log includes the concrete `path`.
+///
 /// The `cluster` label stays bounded: a route without a `{cluster}` segment reports `none`, and a
 /// segment that names no configured cluster reports `unknown`, so a caller-supplied value can never
 /// become a label value.
@@ -558,14 +560,14 @@ fn request_log(
         Box::pin(async move {
             let started = Instant::now();
             let method = request.method().clone();
+            let path = request.uri().path().to_string();
             let route = request
                 .extensions()
                 .get::<MatchedPath>()
                 .map(MatchedPath::as_str)
                 .unwrap_or("<unmatched>")
                 .to_string();
-            let cluster =
-                cluster_label(backend.as_deref(), &route, request.uri().path()).to_string();
+            let cluster = cluster_label(backend.as_deref(), &route, &path).to_string();
             let request_id = request_id(&request);
             let response = next.run(request).await;
             let elapsed = started.elapsed();
@@ -579,7 +581,14 @@ fn request_log(
             );
             log::info!(
                 "{}",
-                format_request_log(&method, &route, &request_id, status, elapsed.as_millis())
+                format_request_log(
+                    &method,
+                    &route,
+                    &path,
+                    &request_id,
+                    status,
+                    elapsed.as_millis(),
+                )
             );
             response
         })
@@ -604,12 +613,13 @@ fn cluster_label<'a>(backend: Option<&dyn FlussBackend>, route: &str, path: &'a 
 fn format_request_log(
     method: &Method,
     route: &str,
+    path: &str,
     request_id: &RequestId,
     status: StatusCode,
     elapsed_ms: u128,
 ) -> String {
     format!(
-        "method={method} route={route} request_id={} status={} elapsed_ms={elapsed_ms}",
+        "method={method} route={route} path={path} request_id={} status={} elapsed_ms={elapsed_ms}",
         request_id.as_str(),
         status.as_u16()
     )
@@ -1136,17 +1146,18 @@ mod tests {
     }
 
     #[test]
-    fn request_log_contains_protocol_context() {
+    fn request_log_contains_route_and_path_context() {
         let message = format_request_log(
             &Method::POST,
             "/v1/clusters/{cluster}/databases",
+            "/v1/clusters/default/databases",
             &RequestId(Arc::from("request-7")),
             StatusCode::CREATED,
             23,
         );
         assert_eq!(
             message,
-            "method=POST route=/v1/clusters/{cluster}/databases request_id=request-7 status=201 elapsed_ms=23"
+            "method=POST route=/v1/clusters/{cluster}/databases path=/v1/clusters/default/databases request_id=request-7 status=201 elapsed_ms=23"
         );
     }
 }
