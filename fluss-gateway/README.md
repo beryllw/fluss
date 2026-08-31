@@ -28,6 +28,9 @@ The gateway is an executable, not a library on crates.io, and it is its own
 Cargo workspace so its dependencies never touch the `fluss-rust` workspace's
 lock file or its generated dependency inventories.
 
+For the 1.0 preview scope, known limitations, and deployment security model,
+see the [Fluss Gateway documentation](../website/docs/gateway/index.md).
+
 ## Status
 
 The gateway provides configuration validation, lifecycle management, request-id,
@@ -113,8 +116,8 @@ docker run --rm \
   --cap-drop ALL \
   --security-opt no-new-privileges \
   --stop-timeout 35 \
-  -p 8080:8080 \
-  -p 9095:9095 \
+  -p 127.0.0.1:8080:8080 \
+  -p 127.0.0.1:9095:9095 \
   -e FLUSS_GATEWAY__CLUSTER__DEFAULT__BOOTSTRAP__SERVERS=host.docker.internal:9123 \
   fluss-gateway:dev
 ```
