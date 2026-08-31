@@ -143,8 +143,9 @@ curl -sS --fail-with-body -X POST \
   }'
 ```
 
-Without `partial_update_columns`, `upsert` is a full write. Omitted nullable
-columns are written as null:
+For a primary-key table without an auto-increment column, omitting
+`partial_update_columns` makes `upsert` a full write. Omitted nullable columns
+are written as null:
 
 ```bash
 curl -sS --fail-with-body -X POST \
@@ -158,8 +159,14 @@ curl -sS --fail-with-body -X POST \
   }'
 ```
 
-For a partial update, list the primary-key and target columns. All non-key
-columns in the table must be nullable; columns outside the list are preserved:
+Tables with an auto-increment column are an exception: `partial_update_columns`
+is required, must include every primary-key column, and must not include the
+auto-increment column. Omitting `partial_update_columns` or targeting the
+auto-increment column returns HTTP 400.
+
+For a partial update, list the primary-key and target columns. Every
+non-primary-key, non-auto-increment column in the table must be nullable;
+columns outside the list are preserved:
 
 ```bash
 curl -sS --fail-with-body -X POST \
