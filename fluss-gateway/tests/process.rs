@@ -150,6 +150,7 @@ async fn canonical_credentials_are_redacted_from_startup_diagnostics() {
         .read_to_string(&mut stderr)
         .expect("read stderr");
     assert!(stderr.contains("effective configuration"), "{stderr}");
+    assert!(stderr.contains("method=GET route=/health"), "{stderr}");
     assert!(stderr.contains("canonical-user"), "{stderr}");
     for credential in ["canonical-secret", "token-secret"] {
         assert!(

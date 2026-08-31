@@ -96,7 +96,7 @@ The wrapper resolves `FLUSS_HOME` from its own location, uses
 `conf/gateway.yaml` by default, and forwards additional CLI options to the
 binary. The convenience distribution follows the Java distribution and binds
 listeners to loopback by default. Set `RUST_LOG=debug` when temporary diagnostic
-logging is needed.
+logging, including per-request access logs, is needed.
 
 The container image also installs into `/opt/fluss`, uses the `fluss` user with
 UID/GID 9999, and reads `/opt/fluss/conf/gateway.yaml`. The image is assembled

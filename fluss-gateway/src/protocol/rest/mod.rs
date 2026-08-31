@@ -579,7 +579,7 @@ fn request_log(
                 status.as_u16(),
                 elapsed,
             );
-            log::info!(
+            log::debug!(
                 "{}",
                 format_request_log(
                     &method,
