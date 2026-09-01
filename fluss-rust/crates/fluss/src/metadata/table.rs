@@ -253,6 +253,7 @@ pub struct SchemaBuilder {
     columns: Vec<Column>,
     primary_key: Option<PrimaryKey>,
     auto_increment_col_names: Vec<String>,
+    highest_field_id: Option<i32>,
 }
 
 impl SchemaBuilder {
@@ -330,9 +331,23 @@ impl SchemaBuilder {
         Ok(self)
     }
 
+    pub(crate) fn highest_field_id(mut self, highest_field_id: i32) -> Self {
+        self.highest_field_id = Some(highest_field_id);
+        self
+    }
+
     pub fn build(&self) -> Result<Schema> {
         let columns = Self::normalize_columns(&self.columns, self.primary_key.as_ref())?;
-        let (columns_with_ids, highest_field_id) = Self::assign_all_field_ids(columns)?;
+        let (columns_with_ids, maximum_field_id) = Self::assign_all_field_ids(columns)?;
+        let highest_field_id = self.highest_field_id.unwrap_or(maximum_field_id);
+
+        if !columns_with_ids.is_empty() && highest_field_id < maximum_field_id {
+            return Err(IllegalArgument {
+                message: format!(
+                    "Highest field id ({highest_field_id}) must be greater than or equal to the maximum field id ({maximum_field_id})"
+                ),
+            });
+        }
 
         if !self.auto_increment_col_names.is_empty() && self.primary_key.is_none() {
             return Err(IllegalArgument {
