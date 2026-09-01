@@ -308,6 +308,11 @@ impl SchemaBuilder {
         constraint_name: N,
         column_names: Vec<P>,
     ) -> Self {
+        assert!(
+            self.primary_key.is_none(),
+            "Multiple primary keys are not supported."
+        );
+
         self.primary_key = Some(PrimaryKey::new(
             constraint_name.into(),
             column_names.into_iter().map(|s| s.into()).collect(),
@@ -1688,6 +1693,15 @@ mod tests {
                 "unexpected error: {err}"
             );
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "Multiple primary keys are not supported.")]
+    fn multiple_primary_keys_are_rejected() {
+        Schema::builder()
+            .column("id", DataTypes::int())
+            .primary_key(["id"])
+            .primary_key_named("another_pk", vec!["id"]);
     }
 
     #[test]
