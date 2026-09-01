@@ -45,6 +45,7 @@ import org.apache.hudi.common.model.HoodieTableType;
 import org.apache.hudi.common.model.HoodieWriteStat;
 import org.apache.hudi.common.model.WriteOperationType;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
+import org.apache.hudi.common.table.timeline.HoodieActiveTimeline;
 import org.apache.hudi.common.table.timeline.HoodieTimeline;
 import org.apache.hudi.common.util.Option;
 import org.apache.hudi.configuration.FlinkOptions;
@@ -76,12 +77,14 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.anyList;
 import static org.mockito.Mockito.anyMap;
+import static org.mockito.Mockito.anyString;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.eq;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 /** Test for tiering Fluss records to Hudi via {@link HudiLakeTieringFactory}. */
@@ -249,6 +252,54 @@ class HudiTieringTest {
                     .hasMessageContaining("hudi.hoodie.allow.empty.commit");
             assertThat(committer.getMissingLakeSnapshot(null)).isNull();
         }
+    }
+
+    @Test
+    void testEmptyCommitDoesNotPublishCheckpointMetadata() throws Exception {
+        TestingCommitterContext context = createTestingCommitterContext();
+        HoodieActiveTimeline activeTimeline = mock(HoodieActiveTimeline.class);
+        HoodieTimeline completedTimeline = mock(HoodieTimeline.class);
+        when(context.metaClient.getActiveTimeline()).thenReturn(activeTimeline);
+        when(activeTimeline.filterCompletedInstants()).thenReturn(completedTimeline);
+        when(completedTimeline.containsInstant(DATA_INSTANT)).thenReturn(true);
+        when(context.writeClient.startCommit(anyString(), eq(context.metaClient)))
+                .thenReturn(DATA_INSTANT);
+        when(context.writeClient.commitStats(
+                        eq(DATA_INSTANT), anyList(), any(Option.class), anyString()))
+                .thenReturn(true);
+
+        LakeCommitResult result =
+                context.committer.commit(
+                        context.committer.toCommittable(Collections.emptyList()),
+                        Collections.emptyMap());
+
+        assertThat(result.getCommittedSnapshotId()).isEqualTo(Long.parseLong(DATA_INSTANT));
+        verifyNoInteractions(context.ckpMetadata);
+    }
+
+    @Test
+    void testEmptyCommitFailureRollsBackWithoutCheckpointMetadata() throws Exception {
+        TestingCommitterContext context = createTestingCommitterContext();
+        HoodieActiveTimeline activeTimeline = mock(HoodieActiveTimeline.class);
+        HoodieTimeline completedTimeline = mock(HoodieTimeline.class);
+        when(context.metaClient.getActiveTimeline()).thenReturn(activeTimeline);
+        when(activeTimeline.filterCompletedInstants()).thenReturn(completedTimeline);
+        when(context.writeClient.startCommit(anyString(), eq(context.metaClient)))
+                .thenReturn(DATA_INSTANT);
+        when(context.writeClient.commitStats(
+                        eq(DATA_INSTANT), anyList(), any(Option.class), anyString()))
+                .thenReturn(true);
+        when(context.writeClient.rollback(DATA_INSTANT)).thenReturn(true);
+
+        assertThatThrownBy(
+                        () ->
+                                context.committer.commit(
+                                        context.committer.toCommittable(Collections.emptyList()),
+                                        Collections.emptyMap()))
+                .isInstanceOf(IOException.class)
+                .hasMessageContaining("was not completed");
+        verify(context.writeClient).rollback(DATA_INSTANT);
+        verifyNoInteractions(context.ckpMetadata);
     }
 
     @Test
@@ -453,6 +504,7 @@ class HudiTieringTest {
         org.apache.flink.configuration.Configuration flinkConfig =
                 new org.apache.flink.configuration.Configuration();
         flinkConfig.set(FlinkOptions.COMPACTION_SCHEDULE_ENABLED, true);
+        flinkConfig.set(FlinkOptions.OPERATION, WriteOperationType.UPSERT.value());
 
         when(hudiTableInfo.getWriteClient()).thenReturn(writeClient);
         when(hudiTableInfo.getMetaClient()).thenReturn(metaClient);

@@ -249,10 +249,11 @@ public class HudiLakeCommitter implements LakeCommitter<HudiWriteResult, HudiCom
             String commitActionType =
                     CommitUtils.getCommitActionType(
                             writeOperationType, hudiTableInfo.getTableType());
+            // Unlike writer-created instants, no writer needs to discover a committer-created
+            // empty instant, so do not publish it through checkpoint metadata.
             instant = writeClient.startCommit(commitActionType, metaClient);
             metaClient.getActiveTimeline().transitionRequestedToInflight(commitActionType, instant);
             writeClient.setWriteTimer(commitActionType);
-            ckpMetadata.startInstant(instant);
 
             boolean committed =
                     writeClient.commitStats(
@@ -276,7 +277,6 @@ public class HudiLakeCommitter implements LakeCommitter<HudiWriteResult, HudiCom
                                 + " was not completed, ensure 'hudi.hoodie.allow.empty.commit' is "
                                 + "not disabled in the table properties.");
             }
-            ckpMetadata.commitInstant(instant);
             LOG.info("Committed empty Hudi instant {} to persist tiering progress.", instant);
             return LakeCommitResult.committedIsReadable(parseSnapshotId(instant));
         } catch (Exception e) {
@@ -287,9 +287,9 @@ public class HudiLakeCommitter implements LakeCommitter<HudiWriteResult, HudiCom
                                     "Failed to commit empty Hudi instant " + instant + ".", e);
             if (instant != null) {
                 try {
-                    abortInstant(instant);
-                } catch (IOException abortFailure) {
-                    failure.addSuppressed(abortFailure);
+                    rollbackInstant(instant);
+                } catch (IOException rollbackFailure) {
+                    failure.addSuppressed(rollbackFailure);
                 }
             }
             throw failure;
@@ -338,15 +338,9 @@ public class HudiLakeCommitter implements LakeCommitter<HudiWriteResult, HudiCom
     private void abortInstant(String instant) throws IOException {
         IOException failure = null;
         try {
-            boolean rolledBack = writeClient.rollback(instant);
-            if (!rolledBack) {
-                throw new IOException("Hudi rollback returned false for instant " + instant + ".");
-            }
-        } catch (Exception e) {
-            failure =
-                    addSuppressed(
-                            failure,
-                            new IOException("Failed to rollback Hudi instant " + instant + ".", e));
+            rollbackInstant(instant);
+        } catch (IOException e) {
+            failure = addSuppressed(failure, e);
         }
 
         try {
@@ -364,6 +358,17 @@ public class HudiLakeCommitter implements LakeCommitter<HudiWriteResult, HudiCom
 
         if (failure != null) {
             throw failure;
+        }
+    }
+
+    private void rollbackInstant(String instant) throws IOException {
+        try {
+            boolean rolledBack = writeClient.rollback(instant);
+            if (!rolledBack) {
+                throw new IOException("Hudi rollback returned false for instant " + instant + ".");
+            }
+        } catch (Exception e) {
+            throw new IOException("Failed to rollback Hudi instant " + instant + ".", e);
         }
     }
 
