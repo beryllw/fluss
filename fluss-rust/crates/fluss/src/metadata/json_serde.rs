@@ -1017,7 +1017,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_deserialization_rejects_highest_field_id_below_maximum() {
+    fn schema_deserialization_clamps_highest_field_id_to_computed_minimum() {
         let json = json!({
             "version": 1,
             "columns": [
@@ -1027,13 +1027,16 @@ mod tests {
             "highest_field_id": 0
         });
 
-        let error = Schema::deserialize_json(&json).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("must be greater than or equal to the maximum field id (1)"),
-            "{error}"
-        );
+        let schema = Schema::deserialize_json(&json).unwrap();
+        assert_eq!(schema.highest_field_id(), 1);
+
+        let empty_json = json!({
+            "version": 1,
+            "columns": [],
+            "highest_field_id": -3
+        });
+        let empty_schema = Schema::deserialize_json(&empty_json).unwrap();
+        assert_eq!(empty_schema.highest_field_id(), -1);
     }
 
     #[test]

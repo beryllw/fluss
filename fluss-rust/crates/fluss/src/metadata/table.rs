@@ -339,15 +339,10 @@ impl SchemaBuilder {
     pub fn build(&self) -> Result<Schema> {
         let columns = Self::normalize_columns(&self.columns, self.primary_key.as_ref())?;
         let (columns_with_ids, maximum_field_id) = Self::assign_all_field_ids(columns)?;
-        let highest_field_id = self.highest_field_id.unwrap_or(maximum_field_id);
-
-        if !columns_with_ids.is_empty() && highest_field_id < maximum_field_id {
-            return Err(IllegalArgument {
-                message: format!(
-                    "Highest field id ({highest_field_id}) must be greater than or equal to the maximum field id ({maximum_field_id})"
-                ),
-            });
-        }
+        let highest_field_id = self
+            .highest_field_id
+            .unwrap_or(maximum_field_id)
+            .max(maximum_field_id);
 
         if !self.auto_increment_col_names.is_empty() && self.primary_key.is_none() {
             return Err(IllegalArgument {
