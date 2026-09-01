@@ -531,6 +531,19 @@ impl SchemaBuilder {
             return Ok(columns.to_vec());
         };
 
+        if pk.column_names.is_empty() {
+            return Err(Error::invalid_table(
+                "Primary key constraint must be defined for at least a single column.",
+            ));
+        }
+
+        let primary_key_names: Vec<_> = pk.column_names.iter().collect();
+        if let Some(duplicates) = Self::find_duplicates(&primary_key_names) {
+            return Err(Error::invalid_table(format!(
+                "Primary key constraint must not contain duplicate columns. Found: {duplicates:?}"
+            )));
+        }
+
         let pk_set: HashSet<_> = pk.column_names.iter().collect();
         let all_columns: HashSet<_> = columns.iter().map(|c| &c.name).collect();
         if !pk_set.is_subset(&all_columns) {
@@ -1651,6 +1664,31 @@ impl LakeSnapshot {
 mod tests {
     use super::*;
     use crate::metadata::DataTypes;
+
+    #[test]
+    fn invalid_primary_keys_are_rejected() {
+        for (primary_keys, expected_message) in [
+            (
+                Vec::<&str>::new(),
+                "Primary key constraint must be defined for at least a single column.",
+            ),
+            (
+                vec!["id", "id"],
+                "Primary key constraint must not contain duplicate columns.",
+            ),
+        ] {
+            let err = Schema::builder()
+                .column("id", DataTypes::int())
+                .primary_key(primary_keys)
+                .build()
+                .unwrap_err();
+
+            assert!(
+                err.to_string().contains(expected_message),
+                "unexpected error: {err}"
+            );
+        }
+    }
 
     #[test]
     fn auto_increment_column_requires_a_primary_key_table() {
