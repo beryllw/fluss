@@ -291,7 +291,7 @@ impl SchemaBuilder {
         self
     }
 
-    pub fn primary_key<I, S>(self, column_names: I) -> Self
+    pub fn primary_key<I, S>(self, column_names: I) -> Result<Self>
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
@@ -307,17 +307,18 @@ impl SchemaBuilder {
         mut self,
         constraint_name: N,
         column_names: Vec<P>,
-    ) -> Self {
-        assert!(
-            self.primary_key.is_none(),
-            "Multiple primary keys are not supported."
-        );
+    ) -> Result<Self> {
+        if self.primary_key.is_some() {
+            return Err(IllegalArgument {
+                message: "Multiple primary keys are not supported.".to_string(),
+            });
+        }
 
         self.primary_key = Some(PrimaryKey::new(
             constraint_name.into(),
             column_names.into_iter().map(|s| s.into()).collect(),
         ));
-        self
+        Ok(self)
     }
 
     /// Declares a column to be auto-incremented. With an auto-increment column in the table,
@@ -1685,6 +1686,7 @@ mod tests {
             let err = Schema::builder()
                 .column("id", DataTypes::int())
                 .primary_key(primary_keys)
+                .unwrap()
                 .build()
                 .unwrap_err();
 
@@ -1696,12 +1698,19 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Multiple primary keys are not supported.")]
     fn multiple_primary_keys_are_rejected() {
-        Schema::builder()
+        let err = Schema::builder()
             .column("id", DataTypes::int())
             .primary_key(["id"])
-            .primary_key_named("another_pk", vec!["id"]);
+            .unwrap()
+            .primary_key_named("another_pk", vec!["id"])
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("Multiple primary keys are not supported."),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -1726,6 +1735,7 @@ mod tests {
             .column("id", DataTypes::bigint())
             .column("name", DataTypes::string())
             .primary_key(["id"])
+            .unwrap()
             .enable_auto_increment("id")
             .unwrap()
             .build()
@@ -1743,6 +1753,7 @@ mod tests {
             .column("id", DataTypes::int())
             .column("seq", DataTypes::string())
             .primary_key(["id"])
+            .unwrap()
             .enable_auto_increment("seq")
             .unwrap()
             .build()
@@ -1758,6 +1769,7 @@ mod tests {
                 .column("id", DataTypes::int())
                 .column("seq", accepted)
                 .primary_key(["id"])
+                .unwrap()
                 .enable_auto_increment("seq")
                 .unwrap()
                 .build()
@@ -1823,6 +1835,7 @@ mod tests {
             .column("id", DataTypes::int())
             .column("name", DataTypes::string())
             .primary_key(vec!["id".to_string()])
+            .unwrap()
             .build()
             .unwrap();
 

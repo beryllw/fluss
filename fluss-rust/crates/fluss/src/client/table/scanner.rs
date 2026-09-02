@@ -3140,7 +3140,7 @@ mod tests {
             .column("name", DataTypes::string());
 
         if has_primary_key {
-            schema_builder = schema_builder.primary_key(vec!["id"]);
+            schema_builder = schema_builder.primary_key(vec!["id"]).unwrap();
         }
 
         let schema = schema_builder.build().unwrap();
