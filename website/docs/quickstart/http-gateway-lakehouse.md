@@ -239,6 +239,12 @@ docker compose up -d
 docker compose ps
 ```
 
+:::note
+The `sql-client` service may exit after `docker compose up -d` because no
+interactive terminal is attached. This is expected. You will start a new SQL
+Client container with `docker compose run --rm sql-client` later in this guide.
+:::
+
 5. Wait until the Gateway can reach Fluss.
 
 ```shell
