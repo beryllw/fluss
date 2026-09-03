@@ -16,6 +16,9 @@ Fluss Gateway is a stateless REST service for metadata, DDL, and schema-aware
 batch writes. Any Gateway instance can handle any request, so instances can be
 scaled behind a load balancer.
 
+To follow an end-to-end user story, see
+[Ingest HTTP Events into a Real-Time Lakehouse](../quickstart/http-gateway-lakehouse.md).
+
 ## Capabilities and limitations
 
 | Area | Operations |
