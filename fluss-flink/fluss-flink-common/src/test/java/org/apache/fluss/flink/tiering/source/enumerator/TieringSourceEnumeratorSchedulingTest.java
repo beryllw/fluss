@@ -34,7 +34,6 @@ import org.apache.fluss.rpc.messages.LakeTieringHeartbeatResponse;
 import org.apache.fluss.testutils.common.ManuallyTriggeredScheduledExecutorService;
 import org.apache.fluss.types.DataTypes;
 
-import org.apache.flink.api.connector.source.ReaderInfo;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
@@ -152,28 +151,22 @@ class TieringSourceEnumeratorSchedulingTest {
     @Test
     void testFailOverPreventsContinuationClaim() throws Throwable {
         try (Fixture fixture = new Fixture(2)) {
-            fixture.context.registerSourceReader(1, 0, "localhost-1");
-            fixture.enumerator.addReader(1);
+            fixture.registerReader(1, 0);
             fixture.addTable(1, true);
             fixture.requestTable();
-            assertThat(fixture.timer.getActiveNonPeriodicScheduledTask()).hasSize(1);
 
             // Reader 0 restarts while reader 1 is still on attempt 0, so failover is in progress.
-            fixture.context.registerSourceReader(0, 1, "localhost-0");
-            fixture.enumerator.addReader(0);
-
-            fixture.timer.triggerNonPeriodicScheduledTasks();
-            fixture.context.runCoordinatorCalls();
+            fixture.registerReader(0, 1);
 
             // The failover guard must leave the next table to the periodic poll.
+            fixture.fireContinuation();
             assertThat(fixture.claims()).hasSize(1);
             assertThat(fixture.timer.getActiveNonPeriodicScheduledTask()).isEmpty();
             assertThat(fixture.context.getOneTimeCallables()).isEmpty();
 
             // Once all readers reach the same attempt, the periodic poll claims the next table.
             fixture.addTable(2, true);
-            fixture.context.registerSourceReader(1, 1, "localhost-1");
-            fixture.enumerator.addReader(1);
+            fixture.registerReader(1, 1);
             fixture.context.runPeriodicCallable(0);
 
             assertThat(fixture.claims()).hasSize(2);
@@ -190,8 +183,7 @@ class TieringSourceEnumeratorSchedulingTest {
 
             fixture.enumerator.close();
             // Even if the timer still fires, the closed guard prevents any further claim.
-            fixture.timer.triggerNonPeriodicScheduledTasks();
-            fixture.context.runCoordinatorCalls();
+            fixture.fireContinuation();
 
             assertThat(fixture.context.getOneTimeCallables()).isEmpty();
             assertThat(fixture.claims()).hasSize(1);
@@ -230,8 +222,12 @@ class TieringSourceEnumeratorSchedulingTest {
                             30_000L,
                             timer);
             enumerator.start(gateway, admin, generator);
-            context.registerReader(new ReaderInfo(0, "localhost"));
-            enumerator.addReader(0);
+            registerReader(0, 0);
+        }
+
+        private void registerReader(int subtaskId, int attemptNumber) {
+            context.registerSourceReader(subtaskId, attemptNumber, "localhost-" + subtaskId);
+            enumerator.addReader(subtaskId);
         }
 
         private CompletableFuture<LakeTieringHeartbeatResponse> respondToHeartbeat(
@@ -281,13 +277,17 @@ class TieringSourceEnumeratorSchedulingTest {
                     .collect(Collectors.toList());
         }
 
-        private void runContinuation() throws Throwable {
+        private void fireContinuation() {
             assertThat(timer.getActiveNonPeriodicScheduledTask()).hasSize(1);
             assertThat(context.getOneTimeCallables()).isEmpty();
             timer.triggerNonPeriodicScheduledTasks();
             // The timer only hops back to the coordinator thread; it issues no RPC itself.
             assertThat(context.getOneTimeCallables()).isEmpty();
             context.runCoordinatorCalls();
+        }
+
+        private void runContinuation() throws Throwable {
+            fireContinuation();
             assertThat(context.getOneTimeCallables()).hasSize(1);
             context.runNextOneTimeCallable();
         }
