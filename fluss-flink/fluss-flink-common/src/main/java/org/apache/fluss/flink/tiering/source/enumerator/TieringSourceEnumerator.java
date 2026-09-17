@@ -534,9 +534,7 @@ public class TieringSourceEnumerator
             return;
         }
         emptyTableContinuationScheduled = true;
-        // After the delay, hop back to the coordinator thread and claim the next table; if there is
-        // no demand, requestTieringTableSplitsViaHeartBeat() claims nothing and we fall back to the
-        // periodic poll.
+        // Falls back to the periodic poll when no table can be claimed.
         timerService.schedule(
                 () ->
                         context.runInCoordinatorThread(

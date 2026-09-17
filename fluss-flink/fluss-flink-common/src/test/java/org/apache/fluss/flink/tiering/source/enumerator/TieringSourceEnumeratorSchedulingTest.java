@@ -150,6 +150,38 @@ class TieringSourceEnumeratorSchedulingTest {
     }
 
     @Test
+    void testFailOverPreventsContinuationClaim() throws Throwable {
+        try (Fixture fixture = new Fixture(2)) {
+            fixture.context.registerSourceReader(1, 0, "localhost-1");
+            fixture.enumerator.addReader(1);
+            fixture.addTable(1, true);
+            fixture.requestTable();
+            assertThat(fixture.timer.getActiveNonPeriodicScheduledTask()).hasSize(1);
+
+            // Reader 0 restarts while reader 1 is still on attempt 0, so failover is in progress.
+            fixture.context.registerSourceReader(0, 1, "localhost-0");
+            fixture.enumerator.addReader(0);
+
+            fixture.timer.triggerNonPeriodicScheduledTasks();
+            fixture.context.runCoordinatorCalls();
+
+            // The failover guard must leave the next table to the periodic poll.
+            assertThat(fixture.claims()).hasSize(1);
+            assertThat(fixture.timer.getActiveNonPeriodicScheduledTask()).isEmpty();
+            assertThat(fixture.context.getOneTimeCallables()).isEmpty();
+
+            // Once all readers reach the same attempt, the periodic poll claims the next table.
+            fixture.addTable(2, true);
+            fixture.context.registerSourceReader(1, 1, "localhost-1");
+            fixture.enumerator.addReader(1);
+            fixture.context.runPeriodicCallable(0);
+
+            assertThat(fixture.claims()).hasSize(2);
+            assertThat(fixture.timer.getActiveNonPeriodicScheduledTask()).hasSize(1);
+        }
+    }
+
+    @Test
     void testClosePreventsScheduledContinuation() throws Exception {
         try (Fixture fixture = new Fixture()) {
             fixture.addTable(1, true);
@@ -172,7 +204,7 @@ class TieringSourceEnumeratorSchedulingTest {
     }
 
     private static class Fixture implements AutoCloseable {
-        private final TestingContext context = new TestingContext();
+        private final TestingContext context;
         private final ManuallyTriggeredScheduledExecutorService timer =
                 new ManuallyTriggeredScheduledExecutorService();
         private final Admin admin = mock(Admin.class);
@@ -182,6 +214,11 @@ class TieringSourceEnumeratorSchedulingTest {
         private final TieringSourceEnumerator enumerator;
 
         private Fixture() {
+            this(1);
+        }
+
+        private Fixture(int parallelism) {
+            this.context = new TestingContext(parallelism);
             CoordinatorGateway gateway = mock(CoordinatorGateway.class);
             when(gateway.lakeTieringHeartbeat(any()))
                     .thenAnswer(invocation -> respondToHeartbeat(invocation.getArgument(0)));
@@ -265,8 +302,8 @@ class TieringSourceEnumeratorSchedulingTest {
     private static class TestingContext extends FlussMockSplitEnumeratorContext<TieringSplit> {
         private final Queue<Runnable> coordinatorCalls = new ArrayDeque<>();
 
-        private TestingContext() {
-            super(1);
+        private TestingContext(int parallelism) {
+            super(parallelism);
         }
 
         @Override
