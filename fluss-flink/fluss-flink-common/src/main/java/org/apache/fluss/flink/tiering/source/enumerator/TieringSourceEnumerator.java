@@ -100,7 +100,7 @@ public class TieringSourceEnumerator
     private static final Logger LOG = LoggerFactory.getLogger(TieringSourceEnumerator.class);
 
     /** Delay between claims when draining consecutive empty tables, to pace the claim RPC rate. */
-    private static final long EMPTY_TABLE_CONTINUATION_DELAY_MS = 1000L;
+    private static final long EMPTY_TABLE_POLL_DELAY_MS = 1000L;
 
     private final Configuration flussConf;
     private final SplitEnumeratorContext<TieringSplit> context;
@@ -128,8 +128,8 @@ public class TieringSourceEnumerator
 
     private volatile boolean closed = false;
 
-    // Coordinator-thread-confined, so no volatile/atomics needed.
-    private boolean emptyTableContinuationScheduled = false;
+    /** Tracks a pending delayed poll, but not an in-flight request. */
+    private boolean delayedPollScheduled = false;
 
     public TieringSourceEnumerator(
             Configuration flussConf,
@@ -338,8 +338,7 @@ public class TieringSourceEnumerator
         if (!finishedTables.isEmpty() || !failedTableEpochs.isEmpty()) {
             // call one round of heartbeat to notify table has been finished or failed
             LOG.info("Finished tiering table {}.", finishedTables);
-            this.context.callAsync(
-                    this::requestTieringTableSplitsViaHeartBeat, this::generateAndAssignSplits);
+            requestTableAndAssign(0);
         }
     }
 
@@ -355,8 +354,7 @@ public class TieringSourceEnumerator
         pendingSplits.clear();
         if (!failedTableEpochs.isEmpty()) {
             // call one round of heartbeat to notify table has been finished or failed
-            this.context.callAsync(
-                    this::requestTieringTableSplitsViaHeartBeat, this::generateAndAssignSplits);
+            requestTableAndAssign(0);
         }
     }
 
@@ -505,7 +503,7 @@ public class TieringSourceEnumerator
                 tieringTableEpochs.remove(tieringTable.f0);
                 finishedTables.put(tieringTable.f0, TieringFinishInfo.from(tieringTable.f1));
                 // An empty round has no split or completion event to drive the next table.
-                scheduleEmptyTableContinuation();
+                requestTableAndAssign(EMPTY_TABLE_POLL_DELAY_MS);
             } else {
                 pendingSplits.addAll(tieringSplits);
 
@@ -529,24 +527,30 @@ public class TieringSourceEnumerator
         }
     }
 
-    private void scheduleEmptyTableContinuation() {
-        if (closed || emptyTableContinuationScheduled) {
+    /** Requests a tiering table and assigns its splits, immediately or after a delay. */
+    private void requestTableAndAssign(long delayMs) {
+        if (closed) {
             return;
         }
-        emptyTableContinuationScheduled = true;
-        // Falls back to the periodic poll when no table can be claimed.
+        if (delayMs == 0) {
+            context.callAsync(
+                    this::requestTieringTableSplitsViaHeartBeat, this::generateAndAssignSplits);
+            return;
+        }
+        if (delayedPollScheduled) {
+            return;
+        }
+        delayedPollScheduled = true;
         timerService.schedule(
                 () ->
                         context.runInCoordinatorThread(
                                 () -> {
-                                    emptyTableContinuationScheduled = false;
-                                    if (!closed && !isFailOvering) {
-                                        context.callAsync(
-                                                this::requestTieringTableSplitsViaHeartBeat,
-                                                this::generateAndAssignSplits);
+                                    delayedPollScheduled = false;
+                                    if (!isFailOvering) {
+                                        requestTableAndAssign(0);
                                     }
                                 }),
-                EMPTY_TABLE_CONTINUATION_DELAY_MS,
+                delayMs,
                 TimeUnit.MILLISECONDS);
     }
 
