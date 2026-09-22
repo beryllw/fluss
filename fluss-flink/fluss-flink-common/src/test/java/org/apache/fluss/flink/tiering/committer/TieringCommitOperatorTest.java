@@ -18,6 +18,7 @@
 package org.apache.fluss.flink.tiering.committer;
 
 import org.apache.fluss.client.metadata.LakeSnapshot;
+import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.exception.LakeTableSnapshotNotExistException;
 import org.apache.fluss.flink.adapter.StreamOperatorParametersAdapter;
 import org.apache.fluss.flink.tiering.TestingLakeTieringFactory;
@@ -27,6 +28,7 @@ import org.apache.fluss.flink.tiering.event.FinishedTieringEvent;
 import org.apache.fluss.flink.tiering.source.TableBucketWriteResult;
 import org.apache.fluss.flink.utils.FlinkTestBase;
 import org.apache.fluss.lake.committer.CommittedLakeSnapshot;
+import org.apache.fluss.lake.committer.LakeCommitResult;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.testutils.common.MultiVersionTest;
@@ -590,6 +592,64 @@ class TieringCommitOperatorTest extends FlinkTestBase {
         LakeSnapshot lakeSnapshot = admin.getLatestLakeSnapshot(tablePath).get();
         assertThat(lakeSnapshot.getSnapshotId()).isEqualTo(5);
         assertThat(lakeSnapshot.getTableBucketsOffset()).isEqualTo(expectedLogEndOffsets);
+    }
+
+    @Test
+    void testMaintenanceCommitsReadableSnapshots() throws Exception {
+        TablePath tablePath = TablePath.of("fluss", "test_maintenance_readable_snapshots");
+        long tableId = createTable(tablePath, DATA1_PARTITIONED_TABLE_DESCRIPTOR);
+        TableBucket bucket = new TableBucket(tableId, 0);
+        Map<TableBucket, Long> tieredOffsets = Collections.singletonMap(bucket, 100L);
+        TestingLakeTieringFactory.TestingLakeCommitter lakeCommitter =
+                new TestingLakeTieringFactory.TestingLakeCommitter();
+        TestingLakeTieringFactory factory = new TestingLakeTieringFactory(lakeCommitter);
+        factory.enablePartitionMarkDone();
+        org.apache.fluss.config.Configuration tieringConfig =
+                new org.apache.fluss.config.Configuration();
+        tieringConfig.set(ConfigOptions.LAKE_TIERING_PARTITION_MARK_DONE_ENABLED, true);
+        committerOperator.close();
+        committerOperator =
+                new TieringCommitOperator<>(
+                        parameters,
+                        FLUSS_CLUSTER_EXTENSION.getClientConfig(),
+                        tieringConfig,
+                        factory);
+        committerOperator.open();
+        committerOperator.processElement(
+                createTableBucketWriteResultStreamRecord(tablePath, bucket, 1, 100, 1L, 1));
+        assertThat(admin.getReadableLakeSnapshot(tablePath).get().getSnapshotId()).isEqualTo(1);
+
+        // Non-DV maintenance advances the readable snapshot without advancing offsets.
+        lakeCommitter.setMaintenanceCommitResult(LakeCommitResult.committedIsReadable(2));
+        committerOperator.processElement(
+                createTableBucketWriteResultStreamRecord(tablePath, bucket, null, null, -1, -1, 1));
+        LakeSnapshot readable = admin.getReadableLakeSnapshot(tablePath).get();
+        assertThat(readable.getSnapshotId()).isEqualTo(2);
+        assertThat(readable.getTableBucketsOffset()).isEqualTo(tieredOffsets);
+
+        // DV maintenance must use the compacted snapshot's readable offsets, not the
+        // maintenance snapshot's newer tiered offsets.
+        Map<TableBucket, Long> readableOffsets = Collections.singletonMap(bucket, 60L);
+        lakeCommitter.setMaintenanceCommitResult(
+                LakeCommitResult.withReadableSnapshot(
+                        4, 3, tieredOffsets, readableOffsets, LakeCommitResult.KEEP_ALL_PREVIOUS));
+        committerOperator.processElement(
+                createTableBucketWriteResultStreamRecord(tablePath, bucket, null, null, -1, -1, 1));
+        readable = admin.getReadableLakeSnapshot(tablePath).get();
+        assertThat(readable.getSnapshotId()).isEqualTo(3);
+        assertThat(readable.getTableBucketsOffset()).isEqualTo(readableOffsets);
+        LakeSnapshot tiered = admin.getLatestLakeSnapshot(tablePath).get();
+        assertThat(tiered.getSnapshotId()).isEqualTo(4);
+        assertThat(tiered.getTableBucketsOffset()).isEqualTo(tieredOffsets);
+
+        // With no new readable result, preserve the existing readable boundary.
+        lakeCommitter.setMaintenanceCommitResult(LakeCommitResult.unknownReadableSnapshot(5));
+        committerOperator.processElement(
+                createTableBucketWriteResultStreamRecord(tablePath, bucket, null, null, -1, -1, 1));
+        readable = admin.getReadableLakeSnapshot(tablePath).get();
+        assertThat(readable.getSnapshotId()).isEqualTo(3);
+        assertThat(readable.getTableBucketsOffset()).isEqualTo(readableOffsets);
+        assertThat(admin.getLatestLakeSnapshot(tablePath).get().getSnapshotId()).isEqualTo(5);
     }
 
     private CommittedLakeSnapshot mockCommittedLakeSnapshot(

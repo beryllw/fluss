@@ -33,6 +33,7 @@ import org.apache.fluss.lake.writer.WriterInitContext;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.record.LogRecord;
 import org.apache.fluss.utils.function.SupplierWithException;
+import org.apache.fluss.utils.types.Tuple2;
 
 import javax.annotation.Nullable;
 
@@ -167,6 +168,8 @@ public class TestingLakeTieringFactory
 
         private int maintenanceInvocations;
 
+        @Nullable private LakeCommitResult maintenanceCommitResult;
+
         public TestingLakeCommitter() {
             this(null);
         }
@@ -208,10 +211,16 @@ public class TestingLakeTieringFactory
 
         @Nullable
         @Override
-        public CommittedLakeSnapshot commitMarkDoneMaintenance(
+        public Tuple2<LakeCommitResult, String> commitMarkDoneMaintenance(
                 SupplierWithException<String, IOException> offsetsFileProvider) throws IOException {
             maintenanceInvocations++;
-            return null;
+            return maintenanceCommitResult == null
+                    ? null
+                    : Tuple2.of(maintenanceCommitResult, offsetsFileProvider.get());
+        }
+
+        public void setMaintenanceCommitResult(@Nullable LakeCommitResult maintenanceCommitResult) {
+            this.maintenanceCommitResult = maintenanceCommitResult;
         }
 
         public int getMaintenanceInvocations() {

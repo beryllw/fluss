@@ -19,6 +19,7 @@ package org.apache.fluss.lake.committer;
 
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.utils.function.SupplierWithException;
+import org.apache.fluss.utils.types.Tuple2;
 
 import javax.annotation.Nullable;
 
@@ -38,11 +39,11 @@ public interface PartitionMarkDoneMaintainer {
      *     maintenance snapshot; it is only invoked when a snapshot will actually be created. Every
      *     snapshot must carry its own offsets file since offsets files are deleted along with their
      *     snapshot metadata and thus must not be shared across snapshots.
-     * @return the properties-only lake snapshot created to persist the mark-done state, or null if
-     *     no snapshot was created (feature disabled or state unchanged)
+     * @return the lake commit result and its offsets file path, or null if no snapshot was created
+     *     (feature disabled or state unchanged)
      * @throws IOException if an I/O error occurs
      */
     @Nullable
-    CommittedLakeSnapshot commitMarkDoneMaintenance(
+    Tuple2<LakeCommitResult, String> commitMarkDoneMaintenance(
             SupplierWithException<String, IOException> offsetsFileProvider) throws IOException;
 }

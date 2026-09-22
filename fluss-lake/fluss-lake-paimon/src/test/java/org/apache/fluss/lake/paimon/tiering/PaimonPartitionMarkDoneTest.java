@@ -22,6 +22,7 @@ import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.lake.committer.CommittedLakeSnapshot;
 import org.apache.fluss.lake.committer.CommitterInitContext;
+import org.apache.fluss.lake.committer.LakeCommitResult;
 import org.apache.fluss.lake.committer.LakeCommitter;
 import org.apache.fluss.lake.committer.PartitionMarkDoneMaintainer;
 import org.apache.fluss.lake.writer.LakeWriter;
@@ -35,6 +36,7 @@ import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.record.GenericRecord;
 import org.apache.fluss.row.BinaryString;
 import org.apache.fluss.row.GenericRow;
+import org.apache.fluss.utils.types.Tuple2;
 
 import org.apache.paimon.catalog.Catalog;
 import org.apache.paimon.catalog.CatalogContext;
@@ -130,15 +132,14 @@ class PaimonPartitionMarkDoneTest {
         Thread.sleep(50);
         try (LakeCommitter<PaimonWriteResult, PaimonCommittable> lakeCommitter =
                 createLakeCommitter(tablePath, tableInfo)) {
-            CommittedLakeSnapshot maintenanceSnapshot =
+            Tuple2<LakeCommitResult, String> maintenanceSnapshot =
                     commitMarkDoneMaintenance(lakeCommitter, "offsets-2");
             assertThat(maintenanceSnapshot).isNotNull();
-            assertThat(maintenanceSnapshot.getLakeSnapshotId()).isEqualTo(snapshot1 + 1);
-            // the maintenance snapshot carries its own offsets file, not the previous one
-            assertThat(maintenanceSnapshot.getSnapshotProperties())
-                    .containsEntry(FLUSS_LAKE_SNAP_BUCKET_OFFSET_PROPERTY, "offsets-2");
+            assertThat(maintenanceSnapshot.f0.getCommittedSnapshotId()).isEqualTo(snapshot1 + 1);
+            assertThat(maintenanceSnapshot.f0.committedIsReadable()).isTrue();
+            assertThat(maintenanceSnapshot.f1).isEqualTo("offsets-2");
             assertThat(getSnapshotProperties(tablePath, snapshot1 + 1))
-                    .isEqualTo(maintenanceSnapshot.getSnapshotProperties());
+                    .containsEntry(FLUSS_LAKE_SNAP_BUCKET_OFFSET_PROPERTY, maintenanceSnapshot.f1);
         }
         MarkDoneState state2 = getMarkDoneState(tablePath, snapshot1 + 1);
         assertThat(state2.isInitialized()).isTrue();
@@ -483,11 +484,11 @@ class PaimonPartitionMarkDoneTest {
             assertThat(lakeCommitter.getMissingLakeSnapshot(snapshot1)).isNull();
 
             // the mark-done state must still be found instead of restarting from cold start
-            CommittedLakeSnapshot maintenanceSnapshot =
+            Tuple2<LakeCommitResult, String> maintenanceSnapshot =
                     commitMarkDoneMaintenance(lakeCommitter, "offsets-2");
             assertThat(maintenanceSnapshot).isNotNull();
             MarkDoneState state =
-                    getMarkDoneState(tablePath, maintenanceSnapshot.getLakeSnapshotId());
+                    getMarkDoneState(tablePath, maintenanceSnapshot.f0.getCommittedSnapshotId());
             assertThat(state.isInitialized()).isTrue();
             assertThat(state.getPendingPartitions()).containsOnlyKeys("9999-12-31");
             assertThat(successFile(tablePath, "2020-01-01")).exists();
@@ -527,11 +528,11 @@ class PaimonPartitionMarkDoneTest {
                     .containsKey(MARK_DONE_STATE_PROPERTY);
 
             // so is the mark-done state
-            CommittedLakeSnapshot maintenanceSnapshot =
+            Tuple2<LakeCommitResult, String> maintenanceSnapshot =
                     commitMarkDoneMaintenance(lakeCommitter, "offsets-2");
             assertThat(maintenanceSnapshot).isNotNull();
             MarkDoneState state =
-                    getMarkDoneState(tablePath, maintenanceSnapshot.getLakeSnapshotId());
+                    getMarkDoneState(tablePath, maintenanceSnapshot.f0.getCommittedSnapshotId());
             assertThat(state.isInitialized()).isTrue();
             assertThat(state.getPendingPartitions()).containsOnlyKeys("9999-12-31");
         }
@@ -559,11 +560,13 @@ class PaimonPartitionMarkDoneTest {
         Thread.sleep(50);
         try (LakeCommitter<PaimonWriteResult, PaimonCommittable> lakeCommitter =
                 createLakeCommitter(tablePath, tableInfo)) {
-            CommittedLakeSnapshot maintenanceSnapshot =
+            Tuple2<LakeCommitResult, String> maintenanceSnapshot =
                     commitMarkDoneMaintenance(lakeCommitter, "offsets-2");
             assertThat(maintenanceSnapshot).isNotNull();
             assertThat(
-                            getMarkDoneState(tablePath, maintenanceSnapshot.getLakeSnapshotId())
+                            getMarkDoneState(
+                                            tablePath,
+                                            maintenanceSnapshot.f0.getCommittedSnapshotId())
                                     .getPendingPartitions())
                     .isEmpty();
         }
@@ -837,11 +840,13 @@ class PaimonPartitionMarkDoneTest {
         Thread.sleep(50);
         try (LakeCommitter<PaimonWriteResult, PaimonCommittable> lakeCommitter =
                 createLakeCommitter(tablePath, tableInfo)) {
-            CommittedLakeSnapshot maintenanceSnapshot =
+            Tuple2<LakeCommitResult, String> maintenanceSnapshot =
                     commitMarkDoneMaintenance(lakeCommitter, "offsets-3");
             assertThat(maintenanceSnapshot).isNotNull();
             assertThat(
-                            getMarkDoneState(tablePath, maintenanceSnapshot.getLakeSnapshotId())
+                            getMarkDoneState(
+                                            tablePath,
+                                            maintenanceSnapshot.f0.getCommittedSnapshotId())
                                     .getPendingPartitions())
                     .isEmpty();
         }
@@ -927,7 +932,7 @@ class PaimonPartitionMarkDoneTest {
                 .isInstanceOf(IllegalArgumentException.class);
     }
 
-    private static CommittedLakeSnapshot commitMarkDoneMaintenance(
+    private static Tuple2<LakeCommitResult, String> commitMarkDoneMaintenance(
             LakeCommitter<PaimonWriteResult, PaimonCommittable> lakeCommitter, String offsetsPath)
             throws IOException {
         return ((PartitionMarkDoneMaintainer) lakeCommitter)

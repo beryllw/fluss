@@ -17,6 +17,7 @@
 
 package org.apache.fluss.lake.paimon.tiering;
 
+import org.apache.fluss.client.metadata.LakeSnapshot;
 import org.apache.fluss.client.table.getter.PartitionGetter;
 import org.apache.fluss.config.AutoPartitionTimeUnit;
 import org.apache.fluss.config.ConfigOptions;
@@ -689,6 +690,8 @@ class PaimonTieringITCase extends FlinkPaimonTieringTestBase {
         Map<String, String> customProperties = new HashMap<>();
         customProperties.put("paimon.partition.idle-time-to-done", "1 s");
         customProperties.put("paimon.partition.time-interval", "1 d");
+        customProperties.put("paimon.snapshot.num-retained.min", "1");
+        customProperties.put("paimon.snapshot.num-retained.max", "1");
         TableDescriptor descriptor =
                 TableDescriptor.builder()
                         .schema(
@@ -700,6 +703,7 @@ class PaimonTieringITCase extends FlinkPaimonTieringTestBase {
                         .partitionedBy("c")
                         .distributedBy(1, "a")
                         .property(ConfigOptions.TABLE_DATALAKE_ENABLED.key(), "true")
+                        .property(ConfigOptions.TABLE_DATALAKE_AUTO_EXPIRE_SNAPSHOT, true)
                         .property(ConfigOptions.TABLE_DATALAKE_FRESHNESS, Duration.ofMillis(500))
                         .customProperties(customProperties)
                         .build();
@@ -759,6 +763,13 @@ class PaimonTieringITCase extends FlinkPaimonTieringTestBase {
                         // the properties-only snapshot is committed back to Fluss
                         assertThat(admin.getLatestLakeSnapshot(tablePath).get().getSnapshotId())
                                 .isEqualTo(snapshot.id());
+                        LakeSnapshot readable = admin.getReadableLakeSnapshot(tablePath).get();
+                        assertThat(readable.getSnapshotId()).isEqualTo(snapshot.id());
+                        assertThat(readable.getTableBucketsOffset())
+                                .containsEntry(new TableBucket(tableId, partitionId, 0), 3L);
+                        assertThat(snapshot.id()).isGreaterThan(1);
+                        assertThat(table.snapshotManager().snapshotExists(snapshot.id() - 1))
+                                .isFalse();
                     });
 
             // late data: tiering still works after the properties-only snapshot, and the
@@ -784,6 +795,10 @@ class PaimonTieringITCase extends FlinkPaimonTieringTestBase {
                         assertThat(successFile).exists();
                         assertThat(admin.getLatestLakeSnapshot(tablePath).get().getSnapshotId())
                                 .isEqualTo(snapshot.id());
+                        LakeSnapshot readable = admin.getReadableLakeSnapshot(tablePath).get();
+                        assertThat(readable.getSnapshotId()).isEqualTo(snapshot.id());
+                        assertThat(readable.getTableBucketsOffset())
+                                .containsEntry(new TableBucket(tableId, partitionId, 0), 5L);
                     });
         } finally {
             jobClient.cancel().get();

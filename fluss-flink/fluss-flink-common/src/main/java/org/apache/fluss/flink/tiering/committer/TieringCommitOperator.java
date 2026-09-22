@@ -40,6 +40,7 @@ import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.utils.ExceptionUtils;
+import org.apache.fluss.utils.types.Tuple2;
 
 import org.apache.flink.runtime.operators.coordination.OperatorEventGateway;
 import org.apache.flink.runtime.source.event.SourceEventWrapper;
@@ -330,27 +331,21 @@ public class TieringCommitOperator<WriteResult, Committable>
             if (missingCommittedSnapshot != null) {
                 commitMissingLakeSnapshotToFluss(tablePath, tableId, missingCommittedSnapshot);
             }
-            CommittedLakeSnapshot maintenanceSnapshot =
+            Tuple2<LakeCommitResult, String> maintenanceCommit =
                     ((PartitionMarkDoneMaintainer) lakeCommitter)
                             .commitMarkDoneMaintenance(
-                                    // a fresh offsets file for the maintenance snapshot, since
-                                    // offsets files are deleted along with their snapshot
-                                    // metadata and must not be shared across snapshots
                                     () ->
                                             flussTableLakeSnapshotCommitter.prepareLakeSnapshot(
                                                     tableId, tablePath, Collections.emptyMap()));
-            if (maintenanceSnapshot != null) {
+            if (maintenanceCommit != null) {
                 flussTableLakeSnapshotCommitter.commit(
                         tableId,
-                        maintenanceSnapshot.getLakeSnapshotId(),
-                        maintenanceSnapshot
-                                .getSnapshotProperties()
-                                .get(FLUSS_LAKE_SNAP_BUCKET_OFFSET_PROPERTY),
-                        null,
+                        tablePath,
+                        maintenanceCommit.f0,
+                        maintenanceCommit.f1,
                         // no data was written in this round
                         Collections.emptyMap(),
-                        Collections.emptyMap(),
-                        LakeCommitResult.KEEP_ALL_PREVIOUS);
+                        Collections.emptyMap());
             }
         }
     }

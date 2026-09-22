@@ -28,6 +28,7 @@ import org.apache.fluss.lake.committer.TieringStats;
 import org.apache.fluss.lake.paimon.utils.DvTableReadableSnapshotRetriever;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.utils.function.SupplierWithException;
+import org.apache.fluss.utils.types.Tuple2;
 
 import org.apache.paimon.CoreOptions;
 import org.apache.paimon.Snapshot;
@@ -147,41 +148,44 @@ public class PaimonLakeCommitter
             // Collect cumulative table stats from the exact snapshot that was just committed.
             TieringStats stats = computeTableStats();
 
-            // deletion vector is disabled, committed snapshot is readable
-            if (!fileStoreTable.coreOptions().deletionVectorsEnabled()) {
-                return LakeCommitResult.committedIsReadable(committedSnapshotId, stats);
-            } else {
-                // retrieve the readable snapshot during commit
-                try (DvTableReadableSnapshotRetriever retriever =
-                        new DvTableReadableSnapshotRetriever(
-                                tablePath, tableId, fileStoreTable, flussClientConfig)) {
-                    DvTableReadableSnapshotRetriever.ReadableSnapshotResult readableSnapshotResult =
-                            retriever.getReadableSnapshotAndOffsets(committedSnapshotId);
-                    if (readableSnapshotResult == null) {
-                        return LakeCommitResult.unknownReadableSnapshot(committedSnapshotId, stats);
-                    } else {
-                        long earliestSnapshotIdToKeep =
-                                readableSnapshotResult.getEarliestSnapshotIdToKeep();
-                        if (earliestSnapshotIdToKeep >= 0) {
-                            LOG.info(
-                                    "earliest snapshot ID to keep for table {} is {}. "
-                                            + "Snapshots before this ID can be safely deleted from Fluss.",
-                                    tablePath,
-                                    earliestSnapshotIdToKeep);
-                        }
-                        return LakeCommitResult.withReadableSnapshot(
-                                committedSnapshotId,
-                                readableSnapshotResult.getReadableSnapshotId(),
-                                readableSnapshotResult.getTieredOffsets(),
-                                readableSnapshotResult.getReadableOffsets(),
-                                earliestSnapshotIdToKeep,
-                                stats);
-                    }
-                }
-            }
+            return createCommitResult(committedSnapshotId, stats);
 
         } catch (Throwable t) {
             throw new IOException(t);
+        }
+    }
+
+    private LakeCommitResult createCommitResult(
+            long committedSnapshotId, @Nullable TieringStats stats) throws Exception {
+        if (!fileStoreTable.coreOptions().deletionVectorsEnabled()) {
+            return LakeCommitResult.committedIsReadable(committedSnapshotId, stats);
+        } else {
+            try (DvTableReadableSnapshotRetriever retriever =
+                    new DvTableReadableSnapshotRetriever(
+                            tablePath, tableId, fileStoreTable, flussClientConfig)) {
+                DvTableReadableSnapshotRetriever.ReadableSnapshotResult readableSnapshotResult =
+                        retriever.getReadableSnapshotAndOffsets(committedSnapshotId);
+                if (readableSnapshotResult == null) {
+                    return LakeCommitResult.unknownReadableSnapshot(committedSnapshotId, stats);
+                } else {
+                    long earliestSnapshotIdToKeep =
+                            readableSnapshotResult.getEarliestSnapshotIdToKeep();
+                    if (earliestSnapshotIdToKeep >= 0) {
+                        LOG.info(
+                                "earliest snapshot ID to keep for table {} is {}. "
+                                        + "Snapshots before this ID can be safely deleted from Fluss.",
+                                tablePath,
+                                earliestSnapshotIdToKeep);
+                    }
+                    return LakeCommitResult.withReadableSnapshot(
+                            committedSnapshotId,
+                            readableSnapshotResult.getReadableSnapshotId(),
+                            readableSnapshotResult.getTieredOffsets(),
+                            readableSnapshotResult.getReadableOffsets(),
+                            earliestSnapshotIdToKeep,
+                            stats);
+                }
+            }
         }
     }
 
@@ -236,7 +240,7 @@ public class PaimonLakeCommitter
 
     @Nullable
     @Override
-    public CommittedLakeSnapshot commitMarkDoneMaintenance(
+    public Tuple2<LakeCommitResult, String> commitMarkDoneMaintenance(
             SupplierWithException<String, IOException> offsetsFileProvider) throws IOException {
         if (partitionMarkDone == null) {
             return null;
@@ -284,7 +288,7 @@ public class PaimonLakeCommitter
             ManifestCommittable manifestCommittable = new ManifestCommittable(COMMIT_IDENTIFIER);
             snapshotProperties.forEach(manifestCommittable::addProperty);
             long committedSnapshotId = commitManifest(manifestCommittable);
-            return new CommittedLakeSnapshot(committedSnapshotId, snapshotProperties);
+            return Tuple2.of(createCommitResult(committedSnapshotId, null), offsetsFilePath);
         } catch (Throwable t) {
             throw new IOException(t);
         }
