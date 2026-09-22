@@ -191,9 +191,9 @@ public class PaimonLakeCommitter
 
     /**
      * Runs partition mark-done for a data commit and attaches the state (re-attached even if
-     * unchanged) so the latest Fluss-committed snapshot always holds the full state. Known runtime
-     * mark-done failures are only logged and don't fail the data commit: the previous state is
-     * re-attached if readable, otherwise the next round re-initializes via cold start — a lossy
+     * unchanged) so the latest Fluss-committed snapshot always holds the full state. Mark-done
+     * failures, including unsupported state versions, retain the previous state if readable and
+     * don't fail the data commit. Otherwise the next round re-initializes via cold start — a lossy
      * last resort that can't recover zero-file pending partitions.
      */
     private void runPartitionMarkDone(ManifestCommittable manifestCommittable) {

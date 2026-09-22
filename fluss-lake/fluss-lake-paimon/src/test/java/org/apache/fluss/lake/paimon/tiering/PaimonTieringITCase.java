@@ -42,6 +42,8 @@ import org.apache.fluss.utils.types.Tuple2;
 
 import org.apache.flink.core.execution.JobClient;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.table.api.EnvironmentSettings;
+import org.apache.flink.table.api.TableEnvironment;
 import org.apache.paimon.Snapshot;
 import org.apache.paimon.catalog.Catalog;
 import org.apache.paimon.catalog.Identifier;
@@ -71,6 +73,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.stream.Stream;
 
+import static org.apache.fluss.flink.source.testutils.FlinkRowAssertionsUtils.collectRowsUntilEndWithTimeout;
 import static org.apache.fluss.lake.committer.LakeCommitter.FLUSS_LAKE_SNAP_BUCKET_OFFSET_PROPERTY;
 import static org.apache.fluss.lake.paimon.testutils.PaimonTestUtils.adjustToLegacyV1Table;
 import static org.apache.fluss.lake.paimon.tiering.PaimonPartitionMarkDone.MARK_DONE_STATE_PROPERTY;
@@ -803,5 +806,30 @@ class PaimonTieringITCase extends FlinkPaimonTieringTestBase {
         } finally {
             jobClient.cancel().get();
         }
+
+        // Keep these rows in Fluss so the query must combine the maintenance snapshot and log.
+        writeRows(tablePath, Arrays.asList(row(6, "v6", partition), row(7, "v7", partition)), true);
+        TableEnvironment tableEnvironment =
+                TableEnvironment.create(EnvironmentSettings.inBatchMode());
+        tableEnvironment.getConfig().set("parallelism.default", "2");
+        tableEnvironment.executeSql(
+                String.format(
+                        "CREATE CATALOG fluss_catalog WITH ('type' = 'fluss', 'bootstrap.servers' = '%s')",
+                        String.join(",", clientConf.get(ConfigOptions.BOOTSTRAP_SERVERS))));
+        tableEnvironment.useCatalog("fluss_catalog");
+        tableEnvironment.useDatabase(DEFAULT_DB);
+        assertThat(
+                        collectRowsUntilEndWithTimeout(
+                                tableEnvironment
+                                        .executeSql("SELECT * FROM " + tablePath.getTableName())
+                                        .collect()))
+                .containsExactlyInAnyOrder(
+                        "+I[1, v1, 2024-01-01]",
+                        "+I[2, v2, 2024-01-01]",
+                        "+I[3, v3, 2024-01-01]",
+                        "+I[4, v4, 2024-01-01]",
+                        "+I[5, v5, 2024-01-01]",
+                        "+I[6, v6, 2024-01-01]",
+                        "+I[7, v7, 2024-01-01]");
     }
 }

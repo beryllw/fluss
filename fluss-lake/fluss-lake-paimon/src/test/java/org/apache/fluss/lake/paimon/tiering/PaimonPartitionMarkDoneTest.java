@@ -50,6 +50,8 @@ import org.apache.paimon.table.sink.TableCommitImpl;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import javax.annotation.Nullable;
 
@@ -722,42 +724,58 @@ class PaimonPartitionMarkDoneTest {
     }
 
     @Test
-    void testInvalidConfigDisablesMarkDone() throws Exception {
+    void testUnsupportedStateVersionSkipsMarkDone() throws Exception {
+        TablePath tablePath = TablePath.of(DATABASE, "test_mark_done_unsupported_version");
+        createPaimonTable(tablePath, Collections.emptyMap());
+        TableInfo tableInfo = markDoneTableInfo(tablePath, false);
+        String stateJson =
+                "{\"version\":2,\"initialized\":true,\"pending\":{\"2024-01-01\":1},"
+                        + "\"futureState\":{\"epoch\":7}}";
+        FileStoreTable fileStoreTable =
+                (FileStoreTable) paimonCatalog.getTable(toPaimon(tablePath));
+        try (TableCommitImpl stateCommit =
+                fileStoreTable.newCommit(FLUSS_LAKE_TIERING_COMMIT_USER)) {
+            stateCommit.ignoreEmptyCommit(false);
+            ManifestCommittable committable = new ManifestCommittable(COMMIT_IDENTIFIER);
+            committable.addProperty(FLUSS_LAKE_SNAP_BUCKET_OFFSET_PROPERTY, "offsets");
+            committable.addProperty(MARK_DONE_STATE_PROPERTY, stateJson);
+            stateCommit.commit(committable);
+        }
+        long snapshotId = fileStoreTable.snapshotManager().latestSnapshotId();
+
+        try (LakeCommitter<PaimonWriteResult, PaimonCommittable> lakeCommitter =
+                createLakeCommitter(tablePath, tableInfo)) {
+            assertThat(commitMarkDoneMaintenance(lakeCommitter, "offsets-2")).isNull();
+        }
+        assertThat(fileStoreTable.snapshotManager().latestSnapshotId()).isEqualTo(snapshotId);
+
+        long dataSnapshotId = writeAndCommit(tablePath, tableInfo, "2024-01-02");
+        assertThat(dataSnapshotId).isEqualTo(snapshotId + 1);
+        assertThat(fileStoreTable.snapshotManager().snapshot(dataSnapshotId).totalRecordCount())
+                .isEqualTo(1);
+        assertThat(getSnapshotProperties(tablePath, dataSnapshotId))
+                .containsEntry(MARK_DONE_STATE_PROPERTY, stateJson);
+        assertThat(successFile(tablePath, "2024-01-01")).doesNotExist();
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+        "partition.idle-time-to-done, not-a-duration",
+        "partition.mark-done-action, unknown",
+        "partition.mark-done-action, custom"
+    })
+    void testInvalidConfigDisablesMarkDone(String option, String value) throws Exception {
         TablePath tablePath = TablePath.of(DATABASE, "test_mark_done_invalid_config");
         createPaimonTable(tablePath, Collections.emptyMap());
-
-        // an invalid idle duration is rejected by the cheap switch
-        TableInfo invalidDuration =
-                TableInfo.of(
-                        tablePath,
-                        0,
-                        1,
-                        newTableBuilder(false)
-                                .customProperty("paimon." + IDLE_TIME_KEY, "not-a-duration")
-                                .customProperty("paimon." + TIME_INTERVAL_KEY, "1 d")
-                                .build(),
-                        DEFAULT_REMOTE_DATA_DIR,
-                        1L,
-                        1L);
-        assertThat(paimonLakeTieringFactory.isPartitionMarkDoneEnabled(invalidDuration)).isFalse();
-
-        // a custom action without its class passes the switch but only disables mark-done
-        // in the committer instead of failing the committer creation
-        TableInfo invalidAction =
-                TableInfo.of(
-                        tablePath,
-                        0,
-                        1,
-                        newTableBuilder(false)
-                                .customProperty("paimon." + IDLE_TIME_KEY, "1 ms")
-                                .customProperty("paimon." + TIME_INTERVAL_KEY, "1 d")
-                                .customProperty("paimon.partition.mark-done-action", "custom")
-                                .build(),
-                        DEFAULT_REMOTE_DATA_DIR,
-                        1L,
-                        1L);
-        assertThat(paimonLakeTieringFactory.isPartitionMarkDoneEnabled(invalidAction)).isTrue();
-        long snapshot1 = writeAndCommit(tablePath, invalidAction, "2024-01-01");
+        TableDescriptor.Builder builder =
+                newTableBuilder(false)
+                        .customProperty("paimon." + IDLE_TIME_KEY, "1 ms")
+                        .customProperty("paimon." + TIME_INTERVAL_KEY, "1 d")
+                        .customProperty("paimon." + option, value);
+        TableInfo tableInfo =
+                TableInfo.of(tablePath, 0, 1, builder.build(), DEFAULT_REMOTE_DATA_DIR, 1L, 1L);
+        assertThat(paimonLakeTieringFactory.isPartitionMarkDoneEnabled(tableInfo)).isFalse();
+        long snapshot1 = writeAndCommit(tablePath, tableInfo, "2024-01-01");
         assertThat(getSnapshotProperties(tablePath, snapshot1))
                 .doesNotContainKey(MARK_DONE_STATE_PROPERTY);
     }
@@ -909,6 +927,9 @@ class PaimonPartitionMarkDoneTest {
         MarkDoneState state = new MarkDoneState(true, pending);
         int stateHashCode = state.hashCode();
         String stateJson = MarkDoneStateJsonSerde.toJson(state);
+        assertThat(stateJson).contains("\"version\":1");
+        assertThat(MarkDoneStateJsonSerde.fromJson(stateJson.replace("\"version\":1,", "")))
+                .isEqualTo(state);
         pending.clear();
         assertThat(state.getPendingPartitions()).hasSize(2);
         assertThat(state.hashCode()).isEqualTo(stateHashCode);

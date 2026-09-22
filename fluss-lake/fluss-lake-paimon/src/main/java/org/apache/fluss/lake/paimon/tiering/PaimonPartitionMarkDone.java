@@ -18,11 +18,13 @@
 package org.apache.fluss.lake.paimon.tiering;
 
 import org.apache.fluss.config.AutoPartitionTimeUnit;
+import org.apache.fluss.exception.UnsupportedVersionException;
 import org.apache.fluss.metadata.ResolvedPartitionSpec;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.utils.AutoPartitionStrategy;
 import org.apache.fluss.utils.IOUtils;
 import org.apache.fluss.utils.PartitionUtils;
+import org.apache.fluss.utils.StringUtils;
 
 import org.apache.paimon.CoreOptions;
 import org.apache.paimon.data.BinaryRow;
@@ -56,6 +58,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import static org.apache.fluss.utils.Preconditions.checkArgument;
 import static org.apache.fluss.utils.Preconditions.checkNotNull;
 import static org.apache.fluss.utils.Preconditions.checkState;
 
@@ -201,9 +204,19 @@ public class PaimonPartitionMarkDone implements AutoCloseable {
         try {
             options.get(PARTITION_IDLE_TIME_TO_DONE);
             options.get(PARTITION_TIME_INTERVAL);
+            CoreOptions coreOptions = new CoreOptions(options.toMap());
+            if (coreOptions
+                    .partitionMarkDoneActions()
+                    .contains(CoreOptions.PartitionMarkDoneAction.CUSTOM)) {
+                checkArgument(
+                        !StringUtils.isNullOrWhitespaceOnly(
+                                coreOptions.partitionMarkDoneCustomClass()),
+                        "Option %s is required for the custom mark-done action.",
+                        CoreOptions.PARTITION_MARK_DONE_CUSTOM_CLASS.key());
+            }
         } catch (Exception e) {
             LOG.warn(
-                    "Invalid mark-done duration option for table {}, "
+                    "Invalid mark-done configuration for table {}, "
                             + "partition mark-done is disabled.",
                     tableInfo.getTablePath(),
                     e);
@@ -341,6 +354,9 @@ public class PaimonPartitionMarkDone implements AutoCloseable {
         }
         try {
             return MarkDoneStateJsonSerde.fromJson(previousStateJson);
+        } catch (UnsupportedVersionException e) {
+            // Let the committer retain the original state instead of cold-starting.
+            throw e;
         } catch (Exception e) {
             LOG.warn(
                     "Corrupt mark-done state of table {}, re-initializing via cold start.",

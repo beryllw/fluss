@@ -17,6 +17,7 @@
 
 package org.apache.fluss.lake.paimon.tiering;
 
+import org.apache.fluss.exception.UnsupportedVersionException;
 import org.apache.fluss.shaded.jackson2.com.fasterxml.jackson.core.JsonGenerator;
 import org.apache.fluss.shaded.jackson2.com.fasterxml.jackson.databind.JsonNode;
 import org.apache.fluss.utils.json.JsonDeserializer;
@@ -32,22 +33,23 @@ import java.util.Map;
 import static org.apache.fluss.utils.Preconditions.checkArgument;
 
 /**
- * Json serde for {@link MarkDoneState}: {@code {"initialized": true, "pending": {"<partition>":
- * <lastUpdateTimeMs>}}}. Evolves via field-level compatibility (unknown fields ignored, missing
- * fields defaulted), no version gating. Wrongly typed fields are rejected instead of being silently
- * coerced, so a corrupt state is detected and healed by the caller.
+ * JSON serde for {@link MarkDoneState}. Unversioned states are read as version 1. Incompatible
+ * state changes must increment the version so older readers reject the format without rewriting it.
  */
 public class MarkDoneStateJsonSerde
         implements JsonSerializer<MarkDoneState>, JsonDeserializer<MarkDoneState> {
 
     public static final MarkDoneStateJsonSerde INSTANCE = new MarkDoneStateJsonSerde();
 
+    private static final int VERSION = 1;
+    private static final String VERSION_FIELD = "version";
     private static final String INITIALIZED_FIELD = "initialized";
     private static final String PENDING_FIELD = "pending";
 
     @Override
     public void serialize(MarkDoneState state, JsonGenerator generator) throws IOException {
         generator.writeStartObject();
+        generator.writeNumberField(VERSION_FIELD, VERSION);
         generator.writeBooleanField(INITIALIZED_FIELD, state.isInitialized());
         generator.writeObjectFieldStart(PENDING_FIELD);
         for (Map.Entry<String, Long> entry : state.getPendingPartitions().entrySet()) {
@@ -59,6 +61,14 @@ public class MarkDoneStateJsonSerde
 
     @Override
     public MarkDoneState deserialize(JsonNode node) {
+        JsonNode versionNode = node.get(VERSION_FIELD);
+        if (versionNode != null && (!versionNode.isInt() || versionNode.intValue() != VERSION)) {
+            throw new UnsupportedVersionException(
+                    "Unsupported mark-done state version: "
+                            + versionNode
+                            + "; supported version: "
+                            + VERSION);
+        }
         boolean initialized = false;
         JsonNode initializedNode = node.get(INITIALIZED_FIELD);
         if (initializedNode != null) {
