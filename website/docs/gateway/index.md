@@ -12,9 +12,9 @@ configuration may change in later releases.
 
 :::
 
-Fluss Gateway is a stateless REST service for metadata, DDL, and schema-aware
-batch writes. Any Gateway instance can handle any request, so instances can be
-scaled behind a load balancer.
+Fluss Gateway is a stateless REST service for metadata, DDL, schema-aware batch
+writes, and bounded primary-key reads. Any Gateway instance can handle any
+request, so instances can be scaled behind a load balancer.
 
 For an end-to-end walkthrough — ingesting events via the Gateway and querying
  them through a Paimon lakehouse — see 
@@ -31,10 +31,11 @@ To run the Gateway as a binary distribution or container, see
 | Database DDL | Create and drop databases |
 | Table DDL | Create, validate, alter, and drop tables |
 | Partition DDL | Add and drop partitions |
-| Records | Batch append, upsert, partial update, and delete |
+| Records | Batch append, upsert, partial update, delete, primary-key lookup, and bounded prefix lookup |
 
-The 1.0 preview does not support HTTP caller authentication, end-user identity
-propagation, primary-key or prefix lookup, log scans, or other record reads.
+Primary-key and prefix lookup APIs are available starting with Fluss 1.1.
+The Gateway does not support HTTP caller authentication, end-user identity
+propagation, log scans, cursors, or unbounded record reads.
 
 ## Before you start
 
@@ -71,8 +72,8 @@ required permissions and keep its credentials out of images and source control.
 
 `GET /health` reports process liveness. `GET /ready` reports whether the Gateway
 accepts requests; it does not check Fluss connectivity. If Fluss is unavailable,
-`/ready` can return HTTP 200 while a metadata, DDL, or write request returns HTTP
-503 with `Retry-After`.
+`/ready` can return HTTP 200 while a metadata, DDL, write, or lookup request
+returns HTTP 503 with `Retry-After`.
 
 See [Health checks and graceful shutdown](../install-deploy/deploying-gateway.md#health-checks-and-graceful-shutdown)
 for probe and drain behavior in supervised deployments.
@@ -225,6 +226,80 @@ The defaults are 10,000 rows and 32 MiB per request. The Gateway returns HTTP
 413 when either limit is exceeded and HTTP 429 with `Retry-After` when write
 admission or rate limits are exhausted.
 
+## Look up primary-key records
+
+Point lookup accepts a batch of complete logical primary keys. Results remain
+positionally aligned with inputs. A missing key is successful and returns an
+empty `rows` array; an error isolated to one key is reported only on that
+result:
+
+```bash
+curl -sS --fail-with-body -X POST \
+  -H 'Content-Type: application/json' \
+  "$GATEWAY_URL/v1/clusters/$CLUSTER/databases/$DATABASE/tables/users/lookup" \
+  -d '{
+    "keys": [{"user_id": 1}, {"user_id": 404}],
+    "columns": ["user_id", "name"]
+  }'
+```
+
+By default, one point request accepts at most 128 keys and approximately 1 MiB
+of typed key values. Configure these bounds with
+`gateway.rest.lookup.max-keys` and `gateway.rest.lookup.max-key-bytes`.
+Exceeding either bound returns HTTP 400 before lookup execution.
+
+Prefix lookup is available when the table has bucket keys that are a strict
+prefix of its physical primary key. Each prefix object supplies the partition
+columns, if any, and the bucket-key columns; JSON field order does not matter.
+`limit` is applied to each
+prefix independently and is clamped to
+`gateway.rest.prefix-lookup.max-rows-per-prefix`:
+
+```bash
+curl -sS --fail-with-body -X POST \
+  -H 'Content-Type: application/json' \
+  "$GATEWAY_URL/v1/clusters/$CLUSTER/databases/$DATABASE/tables" \
+  -d '{
+    "table_name": "user_items",
+    "columns": [
+      {"name": "user_id", "data_type": {"type": "INTEGER"}, "nullable": false},
+      {"name": "item_id", "data_type": {"type": "INTEGER"}, "nullable": false},
+      {"name": "label", "data_type": {"type": "STRING"}, "nullable": true}
+    ],
+    "primary_key": ["user_id", "item_id"],
+    "distribution": {"bucket_count": 1, "bucket_keys": ["user_id"]}
+  }'
+```
+
+```bash
+curl -sS --fail-with-body -X POST \
+  -H 'Content-Type: application/json' \
+  "$GATEWAY_URL/v1/clusters/$CLUSTER/databases/$DATABASE/tables/user_items/prefix-lookup" \
+  -d '{
+    "prefixes": [{"user_id": 1}, {"user_id": 2}],
+    "limit": 100,
+    "columns": ["item_id", "label"]
+  }'
+```
+
+Every successful prefix result carries `truncated`; an empty range returns
+`rows: []`. One request accepts at most
+`gateway.rest.prefix-lookup.max-prefixes` prefixes (16 by default); exceeding
+the bound returns HTTP 400. Point and prefix requests have separate
+non-queueing concurrency gates, defaulting to 64 and 32 admitted requests
+respectively. An exhausted gate returns HTTP 429 with `Retry-After`.
+
+The shared request body limit and deadline also apply to both lookup endpoints.
+Keys must contain exactly the required columns, including partition columns;
+invalid keys or projections reject the whole batch before any lookup executes.
+Lookup rows encode `BIGINT` and `DECIMAL` as strings, binary values as base64,
+and temporal values as ISO strings. Non-string-keyed maps use arrays of
+`{"key": ..., "value": ...}` entries.
+
+The prefix row cap bounds the returned rows. The native client currently fetches
+all matching rows before the Gateway applies that cap, so it does not bound the
+Fluss RPC response size or server-side scan work.
+
 ## Inspect metadata and clean up
 
 Describe the `users` table:
@@ -234,8 +309,8 @@ curl -sS --fail-with-body \
   "$GATEWAY_URL/v1/clusters/$CLUSTER/databases/$DATABASE/tables/users"
 ```
 
-Gateway metadata APIs return schemas, not table records. Use a native Fluss
-client to read records in this release.
+Gateway metadata APIs return schemas, not table records. Use lookup APIs for
+primary-key reads and a native Fluss client for scans.
 
 Drop the tables before the database:
 
@@ -244,6 +319,8 @@ curl -sS --fail-with-body -X DELETE \
   "$GATEWAY_URL/v1/clusters/$CLUSTER/databases/$DATABASE/tables/users"
 curl -sS --fail-with-body -X DELETE \
   "$GATEWAY_URL/v1/clusters/$CLUSTER/databases/$DATABASE/tables/events"
+curl -sS --fail-with-body -X DELETE \
+  "$GATEWAY_URL/v1/clusters/$CLUSTER/databases/$DATABASE/tables/user_items"
 curl -sS --fail-with-body -X DELETE \
   "$GATEWAY_URL/v1/clusters/$CLUSTER/databases/$DATABASE"
 ```

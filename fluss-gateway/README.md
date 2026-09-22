@@ -19,16 +19,16 @@
 
 # Apache Fluss Gateway
 
-A stateless REST gateway for Apache Fluss. It exposes REST APIs for writing to
-Fluss tables and performing DDL operations, while keeping no session, cursor,
-or replay state: any instance can serve any request behind a plain load
-balancer.
+A stateless REST gateway for Apache Fluss. It exposes REST APIs for DDL,
+schema-aware batch writes, and bounded primary-key reads, while keeping no
+session, cursor, or replay state: any instance can serve any request behind a
+plain load balancer.
 
 The gateway is an executable, not a library on crates.io, and it is its own
 Cargo workspace so its dependencies never touch the `fluss-rust` workspace's
 lock file or its generated dependency inventories.
 
-For the 1.0 preview scope and known limitations, see the
+For the supported APIs and known limitations, see the
 [Fluss Gateway documentation](../website/docs/gateway/index.md).
 
 ## Status
@@ -41,10 +41,13 @@ currently supports:
 - paginated metadata reads for databases, tables, table definitions, and
   partitions;
 - DDL operations to create and drop databases, create, alter, and drop tables,
-  and add and drop partitions; and
+  and add and drop partitions;
 - schema-aware batched append, upsert, and delete records through
   `POST /v1/clusters/{cluster}/databases/{database}/tables/{table}/records`,
-  with per-entry outcomes.
+  with per-entry outcomes; and
+- bounded batched primary-key and bucket-key-prefix lookups, with projection,
+  per-entry failures, deterministic truncation, and independent concurrency
+  admission gates.
 
 The backend runtime owns one shared service connection per configured cluster. A
 connection is opened lazily on the first request that needs it, shared by every
@@ -58,8 +61,8 @@ Connections use Fluss's default plaintext protocol unless
 broken transport is left to the native client, which reconnects the affected
 server on its own.
 `connection.identity-mode: user` is refused at startup until Fluss supports
-act-as. Lookup and prefix-lookup APIs, HTTP caller authentication, and user
-identity propagation remain follow-up work.
+act-as. HTTP caller authentication and user identity propagation remain
+follow-up work.
 
 ## Distribution and container
 

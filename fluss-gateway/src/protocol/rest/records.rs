@@ -22,16 +22,14 @@ use crate::backend::context::RequestContext;
 use crate::backend::types::ClusterId;
 use crate::backend::unknown_cluster;
 use crate::backend::{FlussBackend, WriteRequest, WriteResult};
-use crate::error::{ErrorEnvelope, ErrorKind, GatewayError, GatewayResult};
+use crate::error::{ErrorEnvelope, GatewayError, GatewayResult};
 use crate::observability;
 use crate::protocol::rest::codec::{RowDecodeError, RowShape, SchemaDecoder};
 use crate::protocol::rest::{
-    RestState, error_response, json_response, request_context, request_id,
-    validate_json_content_type,
+    RestState, collect_body, ensure_json_acceptable, error_response, json_response,
+    request_context, request_id, validate_json_content_type,
 };
-use axum::body::Bytes;
-use axum::extract::{FromRequest, Path, Request, State};
-use axum::http::StatusCode;
+use axum::extract::{Path, Request, State};
 use axum::response::Response;
 use fluss::TableId;
 use fluss::metadata::{TableInfo, TablePath};
@@ -367,27 +365,6 @@ fn preflight(
     WriteRequest::new(table, rows, change_types, targets).map_err(RowDecodeError::from)
 }
 
-fn ensure_json_acceptable(headers: &axum::http::HeaderMap) -> GatewayResult<()> {
-    let Some(accept) = headers
-        .get(axum::http::header::ACCEPT)
-        .and_then(|value| value.to_str().ok())
-    else {
-        return Ok(());
-    };
-    if accept.split(',').any(|entry| {
-        matches!(
-            entry.split(';').next().unwrap_or_default().trim(),
-            "application/json" | "application/*" | "*/*"
-        )
-    }) {
-        return Ok(());
-    }
-    Err(GatewayError::new(
-        ErrorKind::NotAcceptable,
-        "this operation answers `application/json` only",
-    ))
-}
-
 /// The write request body.
 ///
 /// The row objects stay as raw JSON so that number lexemes survive to schema-aware decoding: a
@@ -573,17 +550,6 @@ async fn run_write(
     json_response(&shape_response(&entries, result))
 }
 
-/// Applies the router's byte cap while reading, including bodies without Content-Length.
-async fn collect_body(request: Request) -> Result<Bytes, GatewayError> {
-    Bytes::from_request(request, &()).await.map_err(|error| {
-        if error.status() == StatusCode::PAYLOAD_TOO_LARGE {
-            GatewayError::limit_exceeded("the request body exceeds the byte limit")
-        } else {
-            GatewayError::invalid_argument(format!("the request body is unreadable: {error}"))
-        }
-    })
-}
-
 /// Validates the entry envelope and lifts each row object out as raw bytes.
 fn prepared_entries(body: &WriteBody<&RawValue>) -> Result<Vec<PreparedEntry>, GatewayError> {
     if body.entries.is_empty() {
@@ -660,7 +626,7 @@ mod tests {
     use crate::backend::fake::FakeFlussBackend;
     use crate::backend::fake::{log_table_info, users_table_info};
     use crate::protocol::rest::{RestOptions, test_support};
-    use axum::body::Body;
+    use axum::body::{Body, Bytes};
     use axum::http::{Request as HttpRequest, StatusCode};
     use fluss::metadata::{DataType, JsonSerde, Schema, TableDescriptor};
     use http_body_util::BodyExt;

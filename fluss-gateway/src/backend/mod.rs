@@ -21,6 +21,7 @@ pub mod client;
 pub mod connection;
 pub mod context;
 pub mod errors;
+mod lookup;
 pub mod types;
 
 #[cfg(test)]
@@ -29,6 +30,7 @@ pub mod fake;
 use crate::backend::context::RequestContext;
 use crate::backend::types::ClusterId;
 use crate::error::{GatewayError, GatewayResult, Resource};
+use arrow::array::RecordBatch;
 use async_trait::async_trait;
 use fluss::metadata::{
     AlterTableChanges, PartitionInfo, PartitionSpec, TableDescriptor, TableInfo, TablePath,
@@ -149,6 +151,113 @@ pub struct RowWriteError {
     pub error: GatewayError,
 }
 
+/// One batch of primary-key lookups decoded against one table metadata snapshot.
+#[derive(Debug)]
+pub struct LookupRequest {
+    table: TableInfo,
+    keys: Vec<GenericRow<'static>>,
+}
+
+impl LookupRequest {
+    /// Creates a nonempty batch of keys decoded against the supplied primary-key table.
+    pub fn new(table: TableInfo, keys: Vec<GenericRow<'static>>) -> GatewayResult<Self> {
+        if keys.is_empty() {
+            return Err(GatewayError::invalid_argument(
+                "a lookup request needs at least one key",
+            ));
+        }
+        if !table.has_primary_key() {
+            return Err(GatewayError::invalid_argument(
+                "lookup requires a primary-key table",
+            ));
+        }
+        Ok(Self { table, keys })
+    }
+
+    pub(crate) fn into_parts(self) -> (TableInfo, Vec<GenericRow<'static>>) {
+        (self.table, self.keys)
+    }
+}
+
+/// One positionally aligned primary-key lookup result.
+#[derive(Debug)]
+pub struct LookupOutcome {
+    pub input_index: usize,
+    pub kind: LookupOutcomeKind,
+}
+
+/// A point hit, a regular miss, or a failure isolated to one key.
+#[derive(Debug)]
+pub enum LookupOutcomeKind {
+    Found(RecordBatch),
+    NotFound,
+    Error(GatewayError),
+}
+
+/// One bounded batch of prefix lookups decoded against one table metadata snapshot.
+#[derive(Debug)]
+pub struct PrefixLookupRequest {
+    table: TableInfo,
+    prefix_columns: Vec<String>,
+    prefixes: Vec<GenericRow<'static>>,
+    max_rows_per_prefix: usize,
+}
+
+impl PrefixLookupRequest {
+    /// Creates a nonempty batch of decoded prefixes with a positive response row cap.
+    pub fn new(
+        table: TableInfo,
+        prefix_columns: Vec<String>,
+        prefixes: Vec<GenericRow<'static>>,
+        max_rows_per_prefix: usize,
+    ) -> GatewayResult<Self> {
+        if prefixes.is_empty() {
+            return Err(GatewayError::invalid_argument(
+                "a prefix lookup request needs at least one prefix",
+            ));
+        }
+        if prefix_columns.is_empty() || max_rows_per_prefix == 0 {
+            return Err(GatewayError::invalid_argument(
+                "a prefix lookup needs columns and a positive row limit",
+            ));
+        }
+        if !table.has_primary_key() {
+            return Err(GatewayError::invalid_argument(
+                "prefix lookup requires a primary-key table",
+            ));
+        }
+        Ok(Self {
+            table,
+            prefix_columns,
+            prefixes,
+            max_rows_per_prefix,
+        })
+    }
+
+    pub(crate) fn into_parts(self) -> (TableInfo, Vec<String>, Vec<GenericRow<'static>>, usize) {
+        (
+            self.table,
+            self.prefix_columns,
+            self.prefixes,
+            self.max_rows_per_prefix,
+        )
+    }
+}
+
+/// One positionally aligned prefix lookup result.
+#[derive(Debug)]
+pub struct PrefixLookupOutcome {
+    pub input_index: usize,
+    pub kind: PrefixLookupOutcomeKind,
+}
+
+/// Bounded rows for one prefix, or a failure isolated to that prefix.
+#[derive(Debug)]
+pub enum PrefixLookupOutcomeKind {
+    Rows { batch: RecordBatch, truncated: bool },
+    Error(GatewayError),
+}
+
 /// The backend capabilities the protocol adapters depend on.
 ///
 /// Native metadata crosses this boundary unchanged; protocol adapters own wire shapes.
@@ -231,6 +340,20 @@ pub trait FlussBackend: Send + Sync + 'static {
         ctx: &RequestContext,
         request: WriteRequest,
     ) -> GatewayResult<WriteResult>;
+
+    /// Resolves every primary key independently and returns one ordered outcome per input.
+    async fn lookup(
+        &self,
+        ctx: &RequestContext,
+        request: LookupRequest,
+    ) -> GatewayResult<Vec<LookupOutcome>>;
+
+    /// Resolves every prefix independently, applying the row cap inside the backend.
+    async fn prefix_lookup(
+        &self,
+        ctx: &RequestContext,
+        request: PrefixLookupRequest,
+    ) -> GatewayResult<Vec<PrefixLookupOutcome>>;
 }
 
 /// Returns the error for an unconfigured cluster.

@@ -33,6 +33,7 @@ const DATABASE: &str = "gateway_e2e";
 const TABLE: &str = "events";
 const LOG_TABLE: &str = "applog";
 const KV_TABLE: &str = "profiles";
+const PREFIX_TABLE: &str = "user_items";
 const JOURNEY_DATABASE: &str = "gateway_e2e_journey";
 const SERVICE_ACCOUNT: &str = "admin";
 const SERVICE_SECRET: &str = "admin-secret";
@@ -230,7 +231,7 @@ async fn assert_metadata_apis(
     assert_eq!(
         api.get_ok(&format!("/v1/clusters/default/databases/{DATABASE}/tables"))
             .await,
-        serde_json::json!({"tables": [LOG_TABLE, TABLE, KV_TABLE]})
+        serde_json::json!({"tables": [LOG_TABLE, TABLE, KV_TABLE, PREFIX_TABLE]})
     );
     if catalog_journey {
         assert_catalog_journey(&api).await;
@@ -480,6 +481,8 @@ async fn assert_write_apis(
         .await;
     assert_eq!(updated["success_count"], 3, "{updated}");
 
+    assert_lookup_apis(&api).await;
+
     let rejected = api
         .post_json_text(
             &records,
@@ -501,6 +504,124 @@ async fn assert_write_apis(
 
     assert_log_rows_reached_fluss(connection).await;
     assert_kv_rows_reached_fluss(connection).await;
+}
+
+async fn assert_lookup_apis(api: &Api) {
+    let point = format!("/v1/clusters/default/databases/{DATABASE}/tables/{KV_TABLE}/lookup");
+    let looked_up = api
+        .post_json_text_ok(
+            &point,
+            r#"{"keys":[{"id":1},{"id":2},{"id":3},{"id":99}],"columns":["id","name","note"]}"#,
+        )
+        .await;
+    assert_eq!(looked_up["results"][0]["rows"][0]["name"], "ada");
+    assert_eq!(looked_up["results"][1]["rows"][0]["note"], "amended");
+    assert_eq!(looked_up["results"][2]["rows"], serde_json::json!([]));
+    assert_eq!(looked_up["results"][3]["rows"], serde_json::json!([]));
+
+    let records =
+        format!("/v1/clusters/default/databases/{DATABASE}/tables/{PREFIX_TABLE}/records");
+    let written = api
+        .post_json_text_ok(
+            &records,
+            r#"{"entries":[
+                {"id":"i1","upsert":{"user_id":10,"item_id":1,"label":"one"}},
+                {"id":"i2","upsert":{"user_id":10,"item_id":2,"label":"two"}},
+                {"id":"i3","upsert":{"user_id":10,"item_id":3,"label":"three"}},
+                {"id":"i4","upsert":{"user_id":20,"item_id":1,"label":"other"}}
+            ]}"#,
+        )
+        .await;
+    assert_eq!(written["success_count"], 4, "{written}");
+
+    let prefix =
+        format!("/v1/clusters/default/databases/{DATABASE}/tables/{PREFIX_TABLE}/prefix-lookup");
+    let prefixed = api
+        .post_json_text_ok(
+            &prefix,
+            r#"{"prefixes":[{"user_id":10},{"user_id":30}],"limit":2,
+                "columns":["item_id","label"]}"#,
+        )
+        .await;
+    assert_eq!(prefixed["max_rows_per_prefix"], 2);
+    assert_eq!(
+        prefixed["results"][0]["rows"].as_array().unwrap().len(),
+        2,
+        "{prefixed}"
+    );
+    assert_eq!(prefixed["results"][0]["truncated"], true);
+    assert_eq!(prefixed["results"][1]["rows"], serde_json::json!([]));
+    assert_eq!(prefixed["results"][1]["truncated"], false);
+    for row in prefixed["results"][0]["rows"].as_array().unwrap() {
+        assert_eq!(row.as_object().unwrap().keys().len(), 2);
+        assert!(row.get("item_id").is_some());
+        assert!(row.get("label").is_some());
+    }
+
+    // Partition columns need not lead the logical PK. REST objects are unordered, while
+    // the native lookuper requires keys in metadata order and prefixes in lookup_by order.
+    let tables = format!("/v1/clusters/default/databases/{DATABASE}/tables");
+    let response = api
+        .post_json_text(
+            &tables,
+            r#"{
+        "table_name":"partitioned_items",
+        "columns":[
+            {"name":"user_id","data_type":{"type":"INTEGER"},"nullable":false},
+            {"name":"day","data_type":{"type":"STRING"},"nullable":false},
+            {"name":"item_id","data_type":{"type":"INTEGER"},"nullable":false}
+        ],
+        "primary_key":["user_id","day","item_id"],
+        "partitioned_by":["day"],
+        "distribution":{"bucket_count":1,"bucket_keys":["user_id"]}
+    }"#,
+        )
+        .await;
+    assert_eq!(response.status(), 201);
+    let table = format!("{tables}/partitioned_items");
+    assert_eq!(
+        api.post_json_text(
+            &format!("{table}/partitions"),
+            r#"{"partition":{"day":"2026-09-21"}}"#
+        )
+        .await
+        .status(),
+        201
+    );
+    let written = api
+        .post_json_text_ok(
+            &format!("{table}/records"),
+            r#"{"entries":[
+        {"id":"p1","upsert":{"day":"2026-09-21","user_id":1,"item_id":2}},
+        {"id":"p2","upsert":{"day":"2026-09-21","user_id":1,"item_id":3}}
+    ]}"#,
+        )
+        .await;
+    assert_eq!(written["success_count"], 2, "{written}");
+    let found = api
+        .post_json_text_ok(
+            &format!("{table}/lookup"),
+            r#"{
+        "keys":[{"item_id":2,"day":"2026-09-21","user_id":1}]
+    }"#,
+        )
+        .await;
+    assert_eq!(
+        found["results"][0]["rows"],
+        serde_json::json!([
+            {"user_id":1,"day":"2026-09-21","item_id":2}
+        ])
+    );
+    let found = api
+        .post_json_text_ok(
+            &format!("{table}/prefix-lookup"),
+            r#"{
+        "prefixes":[{"user_id":1,"day":"2026-09-21"}],"limit":2
+    }"#,
+        )
+        .await;
+    assert_eq!(found["results"][0]["rows"].as_array().unwrap().len(), 2);
+    assert_eq!(found["results"][0]["truncated"], false);
 }
 
 async fn assert_schema_recreation(api: &Api, connection: &FlussConnection) {
@@ -738,6 +859,29 @@ async fn metadata_apis_support_plaintext_and_sasl_fluss_clusters() {
         .create_table(&TablePath::new(DATABASE, KV_TABLE), &kv_descriptor, false)
         .await
         .expect("create the KV table");
+
+    let prefix_descriptor = TableDescriptor::builder()
+        .schema(
+            Schema::builder()
+                .column("user_id", DataTypes::int())
+                .column("item_id", DataTypes::int())
+                .column("label", DataTypes::string())
+                .primary_key(["user_id", "item_id"])
+                .expect("set the prefix-lookup primary key")
+                .build()
+                .expect("build the prefix-lookup schema"),
+        )
+        .distributed_by(Some(1), vec!["user_id".to_string()])
+        .build()
+        .expect("build the prefix-lookup descriptor");
+    admin
+        .create_table(
+            &TablePath::new(DATABASE, PREFIX_TABLE),
+            &prefix_descriptor,
+            false,
+        )
+        .await
+        .expect("create the prefix-lookup table");
 
     assert_metadata_apis(&cluster.plaintext_bootstrap_servers, "plaintext", false).await;
     assert_metadata_apis(&cluster.sasl_bootstrap_servers, "sasl", true).await;

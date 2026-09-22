@@ -19,15 +19,22 @@
 
 use crate::backend::context::RequestContext;
 use crate::backend::types::ClusterId;
-use crate::backend::{FlussBackend, RowWriteError, WriteRequest, WriteResult, unknown_cluster};
+use crate::backend::{
+    FlussBackend, LookupOutcome, LookupOutcomeKind, LookupRequest, PrefixLookupOutcome,
+    PrefixLookupOutcomeKind, PrefixLookupRequest, RowWriteError, WriteRequest, WriteResult,
+    unknown_cluster,
+};
 use crate::error::{GatewayError, GatewayResult, Resource};
 use async_trait::async_trait;
 use fluss::metadata::{
     AlterTableChanges, DataType, PartitionInfo, PartitionSpec, Schema, TableDescriptor, TableInfo,
     TablePath,
 };
+use fluss::record::RowAppendRecordBatchBuilder;
+use fluss::row::{Date, Datum, Decimal, GenericRow, Time, TimestampLtz, TimestampNtz};
 use std::collections::{BTreeMap, HashMap, btree_map::Entry};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 const FIXTURE_TIME: i64 = 1_700_000_000_000;
 
@@ -39,10 +46,13 @@ struct FakeTable {
 #[derive(Default)]
 struct FakeState {
     databases: BTreeMap<String, BTreeMap<String, FakeTable>>,
+    cached_tables: HashMap<TablePath, TableInfo>,
     calls: Vec<FakeCall>,
     failures: HashMap<Operation, GatewayError>,
     writes: Vec<Option<Vec<String>>>,
     write_failures: Vec<(usize, GatewayError)>,
+    lookup_delay: Option<Duration>,
+    prefix_lookup_delay: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -59,6 +69,8 @@ pub enum Operation {
     CreatePartition,
     DropPartition,
     Write,
+    Lookup,
+    PrefixLookup,
 }
 
 #[derive(Debug, Clone)]
@@ -137,12 +149,24 @@ impl FakeFlussBackend {
         self
     }
 
+    pub fn cache_table(&self, info: TableInfo) {
+        self.state()
+            .cached_tables
+            .insert(info.table_path.clone(), info);
+    }
+
     pub fn fail_rows(&self, failures: Vec<(usize, GatewayError)>) {
         self.state().write_failures = failures;
     }
 
     pub fn writes(&self) -> Vec<Option<Vec<String>>> {
         self.state().writes.clone()
+    }
+
+    pub fn delay_lookups(&self, point: Option<Duration>, prefix: Option<Duration>) {
+        let mut state = self.state();
+        state.lookup_delay = point;
+        state.prefix_lookup_delay = prefix;
     }
 
     pub fn define_partition(&self, table: &TablePath, info: PartitionInfo) {
@@ -271,6 +295,39 @@ pub(crate) fn log_table_info(schema_id: i32) -> TableInfo {
     )
 }
 
+pub(crate) fn prefix_table_info(schema_id: i32) -> TableInfo {
+    let schema = Schema::builder()
+        .column(
+            "user_id",
+            DataType::Int(fluss::metadata::IntType::with_nullable(false)),
+        )
+        .column(
+            "item_id",
+            DataType::Int(fluss::metadata::IntType::with_nullable(false)),
+        )
+        .column(
+            "note",
+            DataType::String(fluss::metadata::StringType::with_nullable(true)),
+        )
+        .primary_key(["user_id", "item_id"])
+        .unwrap()
+        .build()
+        .expect("valid prefix fixture schema");
+    let descriptor = TableDescriptor::builder()
+        .schema(schema)
+        .distributed_by(Some(3), vec!["user_id".to_string()])
+        .build()
+        .expect("valid prefix fixture table");
+    TableInfo::of(
+        TablePath::new("fluss", "items"),
+        1,
+        schema_id,
+        descriptor,
+        0,
+        0,
+    )
+}
+
 fn database_of<'state>(
     state: &'state FakeState,
     database: &str,
@@ -343,6 +400,9 @@ impl FlussBackend for FakeFlussBackend {
         table: &TablePath,
     ) -> GatewayResult<TableInfo> {
         self.call(ctx, Operation::DescribeTable, None, |state| {
+            if let Some(info) = state.cached_tables.get(table) {
+                return Ok(info.clone());
+            }
             Ok(table_of(state, table)?.info.clone())
         })
     }
@@ -455,5 +515,153 @@ impl FlussBackend for FakeFlussBackend {
                 failures,
             })
         })
+    }
+
+    async fn lookup(
+        &self,
+        ctx: &RequestContext,
+        request: LookupRequest,
+    ) -> GatewayResult<Vec<LookupOutcome>> {
+        let delay = self.state().lookup_delay;
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+        let (table, keys) = request.into_parts();
+        self.call(ctx, Operation::Lookup, None, |state| {
+            let table = &table_of(state, &table.table_path)?.info;
+            keys.iter()
+                .enumerate()
+                .map(|(input_index, key)| {
+                    let kind = match key_number(key) {
+                        500 => LookupOutcomeKind::Error(GatewayError::unavailable(
+                            "the tablet server holding this key is unavailable",
+                        )),
+                        value if value >= 100 => LookupOutcomeKind::NotFound,
+                        _ => LookupOutcomeKind::Found(synthesise(
+                            table,
+                            table.get_primary_keys(),
+                            key,
+                            1,
+                        )?),
+                    };
+                    Ok(LookupOutcome { input_index, kind })
+                })
+                .collect()
+        })
+    }
+
+    async fn prefix_lookup(
+        &self,
+        ctx: &RequestContext,
+        request: PrefixLookupRequest,
+    ) -> GatewayResult<Vec<PrefixLookupOutcome>> {
+        let delay = self.state().prefix_lookup_delay;
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+        let (table, prefix_columns, prefixes, max_rows_per_prefix) = request.into_parts();
+        self.call(ctx, Operation::PrefixLookup, None, |state| {
+            let table = &table_of(state, &table.table_path)?.info;
+            prefixes
+                .iter()
+                .enumerate()
+                .map(|(input_index, prefix)| {
+                    let kind = match key_number(prefix) {
+                        500 => PrefixLookupOutcomeKind::Error(GatewayError::unavailable(
+                            "the tablet server holding this prefix is unavailable",
+                        )),
+                        value => {
+                            let rows = value.clamp(0, 250) as usize;
+                            let truncated = rows > max_rows_per_prefix;
+                            PrefixLookupOutcomeKind::Rows {
+                                batch: synthesise(
+                                    table,
+                                    &prefix_columns,
+                                    prefix,
+                                    rows.min(max_rows_per_prefix),
+                                )?,
+                                truncated,
+                            }
+                        }
+                    };
+                    Ok(PrefixLookupOutcome { input_index, kind })
+                })
+                .collect()
+        })
+    }
+}
+
+fn key_number(key: &GenericRow<'_>) -> i64 {
+    match key.values.last() {
+        Some(Datum::Int8(value)) => i64::from(*value),
+        Some(Datum::Int16(value)) => i64::from(*value),
+        Some(Datum::Int32(value)) => i64::from(*value),
+        Some(Datum::Int64(value)) => *value,
+        _ => 1,
+    }
+}
+
+fn synthesise(
+    table: &TableInfo,
+    key_columns: &[String],
+    key: &GenericRow<'_>,
+    rows: usize,
+) -> GatewayResult<arrow::array::RecordBatch> {
+    let mut builder = RowAppendRecordBatchBuilder::new(table.row_type()).map_err(|error| {
+        GatewayError::internal(format!("failed to build the fake lookup schema: {error}"))
+    })?;
+    for row_index in 0..rows {
+        let mut row = GenericRow::new(table.row_type().fields().len());
+        for (column_index, field) in table.row_type().fields().iter().enumerate() {
+            let value = key_columns
+                .iter()
+                .position(|name| name == field.name())
+                .and_then(|key_index| key.values.get(key_index))
+                .cloned()
+                .unwrap_or_else(|| fixture_value(field.data_type(), row_index));
+            row.set_field(column_index, value);
+        }
+        builder.append(&row).map_err(|error| {
+            GatewayError::internal(format!("failed to append a fake lookup row: {error}"))
+        })?;
+    }
+    builder
+        .build_arrow_record_batch()
+        .map(Arc::unwrap_or_clone)
+        .map_err(|error| {
+            GatewayError::internal(format!("failed to finish a fake lookup batch: {error}"))
+        })
+}
+
+fn fixture_value(data_type: &DataType, row: usize) -> Datum<'static> {
+    if data_type.is_nullable() {
+        return Datum::Null;
+    }
+    match data_type {
+        DataType::Boolean(_) => Datum::Bool(row.is_multiple_of(2)),
+        DataType::TinyInt(_) => Datum::Int8(row as i8),
+        DataType::SmallInt(_) => Datum::Int16(row as i16),
+        DataType::Int(_) => Datum::Int32(row as i32),
+        DataType::BigInt(_) => Datum::Int64(row as i64),
+        DataType::Float(_) => Datum::from(row as f32 + 0.5),
+        DataType::Double(_) => Datum::from(row as f64 + 0.5),
+        DataType::Char(_) | DataType::String(_) => Datum::from(format!("value-{row}")),
+        DataType::Bytes(_) | DataType::Binary(_) => Datum::from(vec![row as u8]),
+        DataType::Decimal(decimal) => Decimal::from_unscaled_bytes(
+            &(row as i128).to_be_bytes(),
+            decimal.precision(),
+            decimal.scale(),
+        )
+        .map(Datum::Decimal)
+        .unwrap_or(Datum::Null),
+        DataType::Date(_) => Datum::Date(Date::new(row as i32)),
+        DataType::Time(_) => Datum::Time(Time::new(row as i32)),
+        DataType::Timestamp(_) => TimestampNtz::from_millis_nanos(row as i64, 0)
+            .map(Datum::TimestampNtz)
+            .unwrap_or(Datum::Null),
+        DataType::TimestampLTz(_) => TimestampLtz::from_millis_nanos(row as i64, 0)
+            .map(Datum::TimestampLtz)
+            .unwrap_or(Datum::Null),
+        DataType::Array(_) | DataType::Map(_) | DataType::Row(_) => Datum::Null,
     }
 }

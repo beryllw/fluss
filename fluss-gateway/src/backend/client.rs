@@ -20,9 +20,13 @@
 use crate::backend::connection::{ConnectionCache, NativeConnector};
 use crate::backend::context::RequestContext;
 use crate::backend::errors::{classify_fluss_error, map_fluss_error};
+use crate::backend::lookup;
 use crate::backend::types::ClusterId;
 use crate::backend::unknown_cluster;
-use crate::backend::{FlussBackend, RowWriteError, WriteRequest, WriteResult};
+use crate::backend::{
+    FlussBackend, LookupOutcome, LookupRequest, PrefixLookupOutcome, PrefixLookupRequest,
+    RowWriteError, WriteRequest, WriteResult,
+};
 use crate::config::GatewayConfig;
 use crate::error::{ErrorKind, GatewayError, GatewayResult, Resource};
 use crate::observability;
@@ -346,6 +350,25 @@ impl FlussBackend for NativeFlussBackend {
         let result = result?;
         observability::write_rows(ctx.cluster_id().as_str(), row_count);
         Ok(result)
+    }
+
+    async fn lookup(
+        &self,
+        ctx: &RequestContext,
+        request: LookupRequest,
+    ) -> GatewayResult<Vec<LookupOutcome>> {
+        let connection = ctx.run(self.cache_for(ctx)?.connection(ctx)).await?;
+        ctx.run(lookup::lookup(&connection, ctx, request)).await
+    }
+
+    async fn prefix_lookup(
+        &self,
+        ctx: &RequestContext,
+        request: PrefixLookupRequest,
+    ) -> GatewayResult<Vec<PrefixLookupOutcome>> {
+        let connection = ctx.run(self.cache_for(ctx)?.connection(ctx)).await?;
+        ctx.run(lookup::prefix_lookup(&connection, ctx, request))
+            .await
     }
 }
 

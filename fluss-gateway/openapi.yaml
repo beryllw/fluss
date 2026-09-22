@@ -484,6 +484,59 @@ components:
       - status
       - uptime_ms
       type: object
+    LookupBody_Value:
+      additionalProperties: false
+      properties:
+        columns:
+          description: Columns returned in each row, in caller order. Omitted means all columns.
+          items:
+            type: string
+          type:
+          - array
+          - 'null'
+        keys:
+          description: Complete logical primary keys, one JSON object per input.
+          items:
+            type: object
+          minItems: 1
+          type: array
+      required:
+      - keys
+      type: object
+    LookupEntryResponse:
+      properties:
+        error_code:
+          type:
+          - string
+          - 'null'
+        key:
+          type: object
+        message:
+          type:
+          - string
+          - 'null'
+        rows:
+          items:
+            type: object
+          type:
+          - array
+          - 'null'
+      required:
+      - key
+      type: object
+    LookupResponse:
+      properties:
+        results:
+          items:
+            $ref: '#/components/schemas/LookupEntryResponse'
+          type: array
+        schema_id:
+          format: int32
+          type: integer
+      required:
+      - schema_id
+      - results
+      type: object
     PartitionEntry:
       description: One partition in a listing.
       properties:
@@ -530,6 +583,75 @@ components:
           type: array
       required:
       - partitions
+      type: object
+    PrefixLookupBody_Value:
+      additionalProperties: false
+      properties:
+        columns:
+          description: Columns returned in each row, in caller order. Omitted means all columns.
+          items:
+            type: string
+          type:
+          - array
+          - 'null'
+        limit:
+          description: Per-prefix row cap. Values above the server maximum are clamped.
+          format: int32
+          minimum: 1
+          type:
+          - integer
+          - 'null'
+        prefixes:
+          description: Prefix objects containing partition columns followed by bucket-key columns.
+          items:
+            type: object
+          minItems: 1
+          type: array
+      required:
+      - prefixes
+      type: object
+    PrefixLookupEntryResponse:
+      properties:
+        error_code:
+          type:
+          - string
+          - 'null'
+        message:
+          type:
+          - string
+          - 'null'
+        prefix:
+          type: object
+        rows:
+          items:
+            type: object
+          type:
+          - array
+          - 'null'
+        truncated:
+          type:
+          - boolean
+          - 'null'
+      required:
+      - prefix
+      type: object
+    PrefixLookupResponse:
+      properties:
+        max_rows_per_prefix:
+          format: int32
+          minimum: 1
+          type: integer
+        results:
+          items:
+            $ref: '#/components/schemas/PrefixLookupEntryResponse'
+          type: array
+        schema_id:
+          format: int32
+          type: integer
+      required:
+      - schema_id
+      - max_rows_per_prefix
+      - results
       type: object
     ReadyResponse:
       description: 'Response of `GET /ready`: the gateway accepts application traffic.'
@@ -1847,6 +1969,105 @@ paths:
       summary: Applies one group of schema or config changes to a table.
       tags:
       - ddl
+  /v1/clusters/{cluster}/databases/{database}/tables/{table}/lookup:
+    post:
+      description: 'Returns one ordered outcome per input key. A missing key is a successful entry with `rows: []`; a failure isolated to one key is reported on that entry.'
+      operationId: lookupRecords
+      parameters:
+      - description: Configured cluster ID
+        in: path
+        name: cluster
+        required: true
+        schema:
+          type: string
+      - description: Exact database name
+        in: path
+        name: database
+        required: true
+        schema:
+          type: string
+      - description: Exact table name
+        in: path
+        name: table
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LookupBody_Value'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LookupResponse'
+          description: Positionally aligned primary-key lookup outcomes
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Malformed key, invalid projection, unsupported table shape, or key-count/byte limit exceeded
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Unknown cluster or table
+        '406':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: A JSON response is not acceptable
+        '413':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Request body above the configured byte limit
+        '415':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Unsupported request media type
+        '429':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: The point-lookup concurrency gate is exhausted
+        '500':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Backend or backend-contract failure
+        '501':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Fluss does not support the operation or table format
+        '503':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Fluss is unavailable or the gateway is starting or shutting down
+        '504':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Request deadline exceeded
+      summary: Looks up a batch of primary keys
+      tags:
+      - records
   /v1/clusters/{cluster}/databases/{database}/tables/{table}/partitions:
     get:
       operationId: listPartitions
@@ -2125,6 +2346,105 @@ paths:
       summary: Drops one partition by its Fluss name.
       tags:
       - ddl
+  /v1/clusters/{cluster}/databases/{database}/tables/{table}/prefix-lookup:
+    post:
+      description: 'Derives the prefix columns from table metadata: partition columns followed by bucket-key columns. Every prefix has an explicit effective row cap and one ordered outcome; an empty range returns `rows: []`, and truncation is reported deterministically.'
+      operationId: prefixLookupRecords
+      parameters:
+      - description: Configured cluster ID
+        in: path
+        name: cluster
+        required: true
+        schema:
+          type: string
+      - description: Exact database name
+        in: path
+        name: database
+        required: true
+        schema:
+          type: string
+      - description: Exact table name
+        in: path
+        name: table
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PrefixLookupBody_Value'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PrefixLookupResponse'
+          description: Positionally aligned bounded prefix lookup outcomes
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Malformed prefix, invalid projection or limit, unsupported table shape, or prefix-count/key-byte limit exceeded
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Unknown cluster or table
+        '406':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: A JSON response is not acceptable
+        '413':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Request body above the configured byte limit
+        '415':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Unsupported request media type
+        '429':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: The prefix-lookup concurrency gate is exhausted
+        '500':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Backend or backend-contract failure
+        '501':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Fluss does not support the operation or table format
+        '503':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Fluss is unavailable or the gateway is starting or shutting down
+        '504':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+          description: Request deadline exceeded
+      summary: Looks up bounded bucket-key prefixes
+      tags:
+      - records
   /v1/clusters/{cluster}/databases/{database}/tables/{table}/records:
     post:
       description: 'Writes a batch in input order after validating every row against the table schema. A validation failure rejects the whole batch with 400 before anything is submitted. Delivery is at least once from the caller''s perspective: the gateway never resubmits after submission, but client retries and caller retries can duplicate log appends. An entry whose code is `timeout` may have been applied, and entries sharing one accumulator batch can share a verdict.'

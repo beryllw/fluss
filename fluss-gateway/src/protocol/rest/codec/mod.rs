@@ -15,14 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Schema-aware conversion from JSON values to Fluss rows.
+//! Schema-aware conversion between FIP-49 JSON values and Fluss rows.
 //!
 //! The decoder streams one raw JSON object through the table schema. Serde traverses containers
 //! once, numeric leaves retain their exact lexemes, and map visitors observe duplicate fields.
-//! String-keyed maps additionally accept JSON objects on input.
+//! String-keyed maps additionally accept JSON objects on input. The encoder renders Arrow lookup
+//! results with lossless integer/decimal spellings and deterministic top-level column order.
 
 mod decoder;
+mod encoder;
 mod temporal;
 
 #[allow(unused_imports)]
 pub(crate) use decoder::{RowDecodeError, RowShape, SchemaDecoder};
+pub(crate) use encoder::{EncodedRow, record_batch_to_json_rows};
