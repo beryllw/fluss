@@ -30,7 +30,6 @@ import org.apache.fluss.flink.tiering.source.split.TieringSnapshotSplit;
 import org.apache.fluss.flink.tiering.source.split.TieringSplit;
 import org.apache.fluss.flink.tiering.source.split.TieringSplitGenerator;
 import org.apache.fluss.lake.writer.LakeTieringFactory;
-import org.apache.fluss.lake.writer.SupportsPartitionMarkDone;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableChange;
 import org.apache.fluss.metadata.TableDescriptor;
@@ -70,7 +69,9 @@ import static org.apache.fluss.testutils.common.CommonTestUtils.retry;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
+import static org.mockito.Mockito.when;
 
 /** Unit tests for {@link TieringSourceEnumerator} and {@link TieringSplitGenerator}. */
 class TieringSourceEnumeratorTest extends TieringTestBase {
@@ -351,7 +352,8 @@ class TieringSourceEnumeratorTest extends TieringTestBase {
         int numSubtasks = 6;
         int expectNumberOfSplits = 6;
         Configuration tieringConfig = new Configuration();
-        LakeTieringFactory<?, ?> factory = mock(SupportsPartitionMarkDone.class);
+        LakeTieringFactory<?, ?> factory = mock(LakeTieringFactory.class);
+        when(factory.supportsPartitionMarkDone()).thenReturn(true);
         // test get snapshot split assignment
         try (FlussMockSplitEnumeratorContext<TieringSplit> context =
                         new FlussMockSplitEnumeratorContext<>(numSubtasks);
@@ -389,7 +391,8 @@ class TieringSourceEnumeratorTest extends TieringTestBase {
                                 assertThat(split.shouldSkipCurrentRound()).isTrue();
                             });
             assertValidTieringRound(maintenanceSplits);
-            verifyNoInteractions(factory);
+            verify(factory).supportsPartitionMarkDone();
+            verifyNoMoreInteractions(factory);
             tieringConfig.set(ConfigOptions.LAKE_TIERING_PARTITION_MARK_DONE_ENABLED, false);
 
             // mock finished tiered this round, check second round

@@ -19,17 +19,17 @@ package org.apache.fluss.lake.paimon.tiering;
 
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.lake.committer.CommitterInitContext;
+import org.apache.fluss.lake.committer.PartitionMarkDoneCommitter;
 import org.apache.fluss.lake.serializer.SimpleVersionedSerializer;
 import org.apache.fluss.lake.writer.LakeTieringFactory;
 import org.apache.fluss.lake.writer.LakeWriter;
-import org.apache.fluss.lake.writer.SupportsPartitionMarkDone;
 import org.apache.fluss.lake.writer.WriterInitContext;
 
 import java.io.IOException;
 
 /** Implementation of {@link LakeTieringFactory} for Paimon . */
 public class PaimonLakeTieringFactory
-        implements SupportsPartitionMarkDone<PaimonWriteResult, PaimonCommittable> {
+        implements LakeTieringFactory<PaimonWriteResult, PaimonCommittable> {
 
     private static final long serialVersionUID = 1L;
 
@@ -51,9 +51,14 @@ public class PaimonLakeTieringFactory
     }
 
     @Override
-    public SupportsPartitionMarkDone.Committer<PaimonWriteResult, PaimonCommittable>
-            createLakeCommitter(CommitterInitContext committerInitContext) throws IOException {
+    public PartitionMarkDoneCommitter<PaimonWriteResult, PaimonCommittable> createLakeCommitter(
+            CommitterInitContext committerInitContext) throws IOException {
         return new PaimonLakeCommitter(paimonCatalogProvider, committerInitContext);
+    }
+
+    @Override
+    public boolean supportsPartitionMarkDone() {
+        return true;
     }
 
     @Override

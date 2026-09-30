@@ -33,14 +33,9 @@ import org.apache.fluss.types.DataTypeRoot;
 import org.apache.fluss.types.RowType;
 
 import java.time.Instant;
-import java.time.LocalDateTime;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
-import java.time.format.DateTimeFormatterBuilder;
 import java.time.format.DateTimeParseException;
-import java.time.temporal.ChronoField;
-import java.time.temporal.IsoFields;
-import java.time.temporal.TemporalAccessor;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -48,7 +43,6 @@ import java.util.Map;
 
 import static org.apache.fluss.metadata.TablePath.detectInvalidName;
 import static org.apache.fluss.metadata.TablePath.validatePrefix;
-import static org.apache.fluss.utils.Preconditions.checkState;
 
 /** Utils for partition. */
 public class PartitionUtils {
@@ -78,91 +72,6 @@ public class PartitionUtils {
     private static final String MONTH_FORMAT = "yyyyMM";
     private static final String DAY_FORMAT = "yyyyMMdd";
     private static final String HOUR_FORMAT = "yyyyMMddHH";
-
-    /** Returns the index of the time key used by the automatic partition strategy. */
-    public static int getAutoPartitionKeyIndex(
-            List<String> partitionKeys, AutoPartitionStrategy strategy) {
-        if (partitionKeys.size() == 1) {
-            return 0;
-        }
-        int index = partitionKeys.indexOf(strategy.key());
-        checkState(
-                index >= 0,
-                "Auto partition time key %s is not found in partition keys %s.",
-                strategy.key(),
-                partitionKeys);
-        return index;
-    }
-
-    /** Returns the partition end time in epoch milliseconds in the auto-partition time zone. */
-    public static long getAutoPartitionEndTime(String timeValue, AutoPartitionStrategy strategy) {
-        LocalDateTime startTime = parseAutoPartitionTime(timeValue, strategy);
-        return plusOneTimeUnit(startTime, strategy)
-                .atZone(strategy.timeZone().toZoneId())
-                .toInstant()
-                .toEpochMilli();
-    }
-
-    private static LocalDateTime parseAutoPartitionTime(
-            String timeValue, AutoPartitionStrategy strategy) {
-        AutoPartitionTimeUnit timeUnit = strategy.timeUnit();
-        if (timeUnit == AutoPartitionTimeUnit.QUARTER) {
-            return parseQuarterPartitionTime(timeValue, strategy);
-        }
-        String format = getPartitionTimeFormat(timeUnit, strategy);
-        DateTimeFormatter formatter =
-                new DateTimeFormatterBuilder()
-                        .appendPattern(format)
-                        .parseDefaulting(ChronoField.MONTH_OF_YEAR, 1)
-                        .parseDefaulting(ChronoField.DAY_OF_MONTH, 1)
-                        .parseDefaulting(ChronoField.HOUR_OF_DAY, 0)
-                        .parseDefaulting(ChronoField.MINUTE_OF_HOUR, 0)
-                        .parseDefaulting(ChronoField.SECOND_OF_MINUTE, 0)
-                        .toFormatter();
-        return LocalDateTime.parse(timeValue, formatter);
-    }
-
-    private static LocalDateTime parseQuarterPartitionTime(
-            String timeValue, AutoPartitionStrategy strategy) {
-        int year;
-        int quarter;
-        if (strategy.timeFormat() == null) {
-            // default quarter format is 'yyyyQ' which can't be parsed field by field
-            year = Integer.parseInt(timeValue.substring(0, 4));
-            quarter = Integer.parseInt(timeValue.substring(4));
-        } else {
-            // resolving a custom quarter format (e.g. yyyy-'Q'Q) into a date would conflict
-            // with month/day defaults for Q2-Q4, so extract the year and quarter directly
-            // (via getLong since TemporalAccessor#get can't range-check the quarter field)
-            TemporalAccessor accessor =
-                    DateTimeFormatter.ofPattern(strategy.timeFormat()).parse(timeValue);
-            year =
-                    (int)
-                            (accessor.isSupported(ChronoField.YEAR)
-                                    ? accessor.getLong(ChronoField.YEAR)
-                                    : accessor.getLong(ChronoField.YEAR_OF_ERA));
-            quarter = (int) accessor.getLong(IsoFields.QUARTER_OF_YEAR);
-        }
-        return LocalDateTime.of(year, (quarter - 1) * 3 + 1, 1, 0, 0);
-    }
-
-    private static LocalDateTime plusOneTimeUnit(
-            LocalDateTime startTime, AutoPartitionStrategy strategy) {
-        switch (strategy.timeUnit()) {
-            case YEAR:
-                return startTime.plusYears(1);
-            case QUARTER:
-                return startTime.plusMonths(3);
-            case MONTH:
-                return startTime.plusMonths(1);
-            case DAY:
-                return startTime.plusDays(1);
-            case HOUR:
-                return startTime.plusHours(1);
-            default:
-                throw new IllegalArgumentException("Unsupported time unit: " + strategy.timeUnit());
-        }
-    }
 
     public static void validatePartitionSpec(
             TablePath tablePath,

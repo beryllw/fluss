@@ -39,9 +39,7 @@ import java.util.Map;
  * <ul>
  *   <li>the restored state carries the last update time per partition instead of resetting it to
  *       the current time, since the tiering service recreates the trigger for every round;
- *   <li>the partition end time is extracted by an injected {@link PartitionEndTimeExtractor} to
- *       also support Fluss auto-partitioned tables besides Paimon's timestamp-pattern/formatter
- *       plus time-interval rule;
+ *   <li>the caller provides partition end times through {@link PartitionEndTimeExtractor};
  *   <li>Flink operator state, end-input and watermark related code is removed.
  * </ul>
  */
@@ -52,10 +50,10 @@ class PartitionMarkDoneTrigger {
     private final Map<String, Long> trackedPartitionLastUpdateTimes;
 
     public PartitionMarkDoneTrigger(
-            Map<String, Long> restoredPendingPartitions,
+            Map<String, Long> restoredPartitionLastUpdateTimes,
             PartitionEndTimeExtractor endTimeExtractor,
             long idleTime) {
-        this.trackedPartitionLastUpdateTimes = new HashMap<>(restoredPendingPartitions);
+        this.trackedPartitionLastUpdateTimes = new HashMap<>(restoredPartitionLastUpdateTimes);
         this.endTimeExtractor = endTimeExtractor;
         this.idleTime = idleTime;
     }

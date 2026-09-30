@@ -33,16 +33,10 @@ import org.apache.paimon.schema.Schema;
 import org.apache.paimon.table.FileStoreTable;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
-import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.ValueSource;
-
-import javax.annotation.Nullable;
 
 import java.io.File;
-import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
-import java.time.ZoneOffset;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
@@ -52,35 +46,13 @@ import static org.apache.fluss.lake.paimon.utils.PaimonConversions.toPaimon;
 import static org.apache.fluss.record.TestData.DEFAULT_REMOTE_DATA_DIR;
 import static org.assertj.core.api.Assertions.assertThat;
 
-/** Tests Paimon time rules and the Fluss auto-partition fallback with a fixed clock. */
+/** Tests Paimon partition time rules with a fixed clock. */
 class PartitionMarkDoneTimeTest {
 
     @TempDir private File warehouse;
 
     @Test
-    void testAutoPartitionFallbackUsesDayEnd() throws Exception {
-        ManualClock clock =
-                new ManualClock(
-                        LocalDateTime.of(2024, 6, 15, 12, 0)
-                                .toInstant(ZoneOffset.UTC)
-                                .toEpochMilli());
-        try (PaimonPartitionMarkDone markDone =
-                createMarkDone(Collections.emptyMap(), "UTC", clock)) {
-            PartitionMarkDoneState previous = trackedHours();
-            assertThat(markDone.markIdlePartitionsDone(previous, Collections.emptySet()))
-                    .isEqualTo(previous);
-            clock.advanceTime(Duration.ofDays(1));
-            assertThat(
-                            markDone.markIdlePartitionsDone(previous, Collections.emptySet())
-                                    .getTrackedPartitionLastUpdateTimes())
-                    .isEmpty();
-            assertThat(previous.getTrackedPartitionLastUpdateTimes()).hasSize(2);
-        }
-    }
-
-    @ParameterizedTest
-    @ValueSource(booleans = {false, true})
-    void testExplicitTimeRule(boolean autoPartitioned) throws Exception {
+    void testPaimonTimeRuleOnAutoPartitionedTable() throws Exception {
         ManualClock clock =
                 new ManualClock(
                         LocalDateTime.of(2024, 6, 15, 12, 0)
@@ -95,32 +67,11 @@ class PartitionMarkDoneTimeTest {
                 ZoneId.systemDefault().getRules().getOffset(clock.instant()).getTotalSeconds() >= 0
                         ? "GMT-12:00"
                         : "GMT+14:00";
-        try (PaimonPartitionMarkDone markDone =
-                createMarkDone(options, autoPartitioned ? oppositeZone : null, clock)) {
+        try (PaimonPartitionMarkDone markDone = createMarkDone(options, oppositeZone, clock)) {
             assertThat(
                             markDone.markIdlePartitionsDone(trackedHours(), Collections.emptySet())
                                     .getTrackedPartitionLastUpdateTimes())
                     .containsOnlyKeys("20240615$15");
-        }
-    }
-
-    @Test
-    void testDayOnlyPatternRemainsAuthoritative() throws Exception {
-        ManualClock clock =
-                new ManualClock(
-                        LocalDateTime.of(2024, 6, 15, 12, 0)
-                                .atZone(ZoneId.systemDefault())
-                                .toInstant()
-                                .toEpochMilli());
-        Map<String, String> options = new HashMap<>();
-        options.put("partition.timestamp-pattern", "$day");
-        options.put("partition.timestamp-formatter", "yyyyMMdd");
-        options.put("partition.time-interval", "1 h");
-        try (PaimonPartitionMarkDone markDone = createMarkDone(options, "UTC", clock)) {
-            assertThat(
-                            markDone.markIdlePartitionsDone(trackedHours(), Collections.emptySet())
-                                    .getTrackedPartitionLastUpdateTimes())
-                    .isEmpty();
         }
     }
 
@@ -132,7 +83,7 @@ class PartitionMarkDoneTimeTest {
     }
 
     private PaimonPartitionMarkDone createMarkDone(
-            Map<String, String> timeOptions, @Nullable String autoTimeZone, ManualClock clock)
+            Map<String, String> timeOptions, String autoTimeZone, ManualClock clock)
             throws Exception {
         Map<String, String> options = new HashMap<>(timeOptions);
         options.put("partition.idle-time-to-done", "1 ms");
@@ -146,14 +97,11 @@ class PartitionMarkDoneTimeTest {
                                         .build())
                         .partitionedBy("day", "hour")
                         .distributedBy(1);
-        if (autoTimeZone != null) {
-            descriptor
-                    .property(ConfigOptions.TABLE_AUTO_PARTITION_ENABLED, true)
-                    .property(ConfigOptions.TABLE_AUTO_PARTITION_KEY, "day")
-                    .property(
-                            ConfigOptions.TABLE_AUTO_PARTITION_TIME_UNIT, AutoPartitionTimeUnit.DAY)
-                    .property(ConfigOptions.TABLE_AUTO_PARTITION_TIMEZONE, autoTimeZone);
-        }
+        descriptor
+                .property(ConfigOptions.TABLE_AUTO_PARTITION_ENABLED, true)
+                .property(ConfigOptions.TABLE_AUTO_PARTITION_KEY, "day")
+                .property(ConfigOptions.TABLE_AUTO_PARTITION_TIME_UNIT, AutoPartitionTimeUnit.DAY)
+                .property(ConfigOptions.TABLE_AUTO_PARTITION_TIMEZONE, autoTimeZone);
         TableInfo tableInfo =
                 TableInfo.of(path, 0, 1, descriptor.build(), DEFAULT_REMOTE_DATA_DIR, 1L, 1L);
         try (Catalog catalog =

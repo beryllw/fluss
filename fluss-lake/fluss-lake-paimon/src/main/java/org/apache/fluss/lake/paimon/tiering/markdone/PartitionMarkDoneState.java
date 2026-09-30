@@ -23,11 +23,9 @@ import java.util.Map;
 import java.util.Objects;
 
 /**
- * The partition mark-done state persisted as JSON in the lake snapshot properties committed by the
- * tiering service. It only keeps a table-level {@code initialized} cold-start flag and the pending
- * (not yet done) partitions mapped to their last update time. The done fact itself is not stored:
- * done partitions are removed (done-is-delete), it lives in the lake via the idempotent mark-done
- * actions.
+ * Mark-done state persisted in Fluss-committed lake snapshots: historical backfill status and the
+ * last update time of tracked partitions. Completed partitions are removed; completion is
+ * represented by the idempotent lake actions.
  */
 public class PartitionMarkDoneState {
 

@@ -101,34 +101,16 @@ The Tiering Service supports marking idle partitions of Paimon tables done. Enab
 
 Only `partition.mark-done-action.mode=process-time` is supported. Other modes, including `watermark`, log a warning and disable mark-done for the table. A partition becomes eligible when both its last update and its end time are older than the configured idle duration. The default action creates a `_SUCCESS` file. Actions can be retried after failures, so custom actions must be idempotent. Late data starts tracking the partition again.
 
-Partition end times are selected as follows:
+Configure `partition.time-interval` on every Paimon table using mark-done, including Fluss auto-partitioned tables. Partition end times use Paimon's timestamp extraction rules and the JVM time zone; Fluss auto-partition rules are not used. If no timestamp pattern or formatter is configured, Paimon uses its defaults.
 
-- A timestamp pattern or formatter together with `partition.time-interval` selects the explicit Paimon rule. It uses the JVM time zone, as Paimon does.
-- Otherwise, an auto-partitioned Fluss table uses its auto-partition key, format, calendar unit, and time zone. This supports existing yearly, quarterly, and monthly partitions whose boundaries cannot be expressed as one fixed duration. If other keys represent finer time units, such as `(day, hour)`, this fallback may delay mark-done until the larger interval ends.
-- Without Fluss auto-partitioning, `partition.time-interval` is required and can use Paimon's default timestamp extraction. Without either auto-partitioning or an interval, mark-done is disabled.
-
-For a Paimon table partitioned by `day` and `hour`, configure an explicit hourly rule in the Paimon catalog:
+For a `dt` partition such as `20260928`, configure the Paimon table:
 
 ```sql
 ALTER TABLE events SET (
   'partition.idle-time-to-done' = '10 min',
-  'partition.timestamp-pattern' = '$day $hour',
-  'partition.timestamp-formatter' = 'yyyyMMdd HH',
-  'partition.time-interval' = '1 h'
-);
-```
-
-For the Fluss auto-partition fallback, the following Fluss table uses month boundaries in `Asia/Shanghai`. No Paimon timestamp rule or interval is needed:
-
-```sql
-CREATE TABLE monthly_events (id BIGINT, `month` STRING)
-PARTITIONED BY (`month`)
-WITH (
-  'table.datalake.enabled' = 'true',
-  'table.auto-partition.enabled' = 'true',
-  'table.auto-partition.time-unit' = 'MONTH',
-  'table.auto-partition.time-zone' = 'Asia/Shanghai',
-  'paimon.partition.idle-time-to-done' = '10 min'
+  'partition.timestamp-pattern' = '$dt',
+  'partition.timestamp-formatter' = 'yyyyMMdd',
+  'partition.time-interval' = '1 d'
 );
 ```
 

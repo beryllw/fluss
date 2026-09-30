@@ -65,6 +65,11 @@ public interface LakeTieringFactory<WriteResult, CommittableT> extends Serializa
     LakeCommitter<WriteResult, CommittableT> createLakeCommitter(
             CommitterInitContext committerInitContext) throws IOException;
 
+    /** Returns whether this factory can create committers supporting partition mark-done. */
+    default boolean supportsPartitionMarkDone() {
+        return false;
+    }
+
     /**
      * Returns the serializer for committable objects.
      *

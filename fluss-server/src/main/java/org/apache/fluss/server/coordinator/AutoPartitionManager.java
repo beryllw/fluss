@@ -71,7 +71,6 @@ import static org.apache.fluss.server.utils.TableAssignmentUtils.generateAssignm
 import static org.apache.fluss.utils.PartitionUtils.HISTORICAL_PARTITION_VALUE;
 import static org.apache.fluss.utils.PartitionUtils.generateAutoPartition;
 import static org.apache.fluss.utils.PartitionUtils.generateAutoPartitionTime;
-import static org.apache.fluss.utils.PartitionUtils.getAutoPartitionKeyIndex;
 import static org.apache.fluss.utils.Preconditions.checkNotNull;
 import static org.apache.fluss.utils.concurrent.LockUtils.inLock;
 
@@ -382,10 +381,8 @@ public class AutoPartitionManager implements AutoCloseable {
             return partitionName;
         }
 
-        int autoPartitionKeyIndex =
-                getAutoPartitionKeyIndex(
-                        tableInfo.getPartitionKeys(),
-                        tableInfo.getTableConfig().getAutoPartitionStrategy());
+        String autoPartitionKey = tableInfo.getTableConfig().getAutoPartitionStrategy().key();
+        int autoPartitionKeyIndex = tableInfo.getPartitionKeys().indexOf(autoPartitionKey);
         return partitionName.split("\\$")[autoPartitionKeyIndex];
     }
 

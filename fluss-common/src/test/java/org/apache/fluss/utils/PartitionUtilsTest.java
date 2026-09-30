@@ -31,8 +31,6 @@ import org.apache.fluss.row.TimestampNtz;
 import org.apache.fluss.types.DataTypeRoot;
 
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.CsvSource;
 
 import java.time.Instant;
 import java.time.LocalDate;
@@ -59,54 +57,6 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Test for {@link PartitionUtils}. */
 class PartitionUtilsTest {
-
-    @ParameterizedTest
-    @CsvSource({
-        "YEAR, 2024, , UTC, 2025-01-01T00:00:00Z",
-        "QUARTER, 20244, , UTC, 2025-01-01T00:00:00Z",
-        "QUARTER, 2024-Q3, yyyy-'Q'Q, Asia/Shanghai, 2024-09-30T16:00:00Z",
-        "MONTH, 202402, , UTC, 2024-03-01T00:00:00Z",
-        "DAY, 20240310, , America/New_York, 2024-03-11T04:00:00Z",
-        "HOUR, 2024022923, , UTC, 2024-03-01T00:00:00Z"
-    })
-    void testAutoPartitionEndTime(
-            AutoPartitionTimeUnit unit,
-            String value,
-            String format,
-            String zone,
-            String expectedEndTime) {
-        Configuration config = new Configuration();
-        config.set(ConfigOptions.TABLE_AUTO_PARTITION_TIME_UNIT, unit);
-        config.set(ConfigOptions.TABLE_AUTO_PARTITION_TIMEZONE, zone);
-        if (format != null) {
-            config.set(ConfigOptions.TABLE_AUTO_PARTITION_TIME_FORMAT, format);
-        }
-        assertThat(
-                        PartitionUtils.getAutoPartitionEndTime(
-                                value, AutoPartitionStrategy.from(config)))
-                .isEqualTo(Instant.parse(expectedEndTime).toEpochMilli());
-    }
-
-    @Test
-    void testAutoPartitionKeyIndex() {
-        Configuration config = new Configuration();
-        config.set(ConfigOptions.TABLE_AUTO_PARTITION_KEY, "day");
-        AutoPartitionStrategy strategy = AutoPartitionStrategy.from(config);
-        assertThat(
-                        PartitionUtils.getAutoPartitionKeyIndex(
-                                Collections.singletonList("date"), strategy))
-                .isZero();
-        assertThat(
-                        PartitionUtils.getAutoPartitionKeyIndex(
-                                Arrays.asList("region", "day"), strategy))
-                .isEqualTo(1);
-        assertThatThrownBy(
-                        () ->
-                                PartitionUtils.getAutoPartitionKeyIndex(
-                                        Arrays.asList("region", "hour"), strategy))
-                .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("day");
-    }
 
     @Test
     void testValidatePartitionValues() {

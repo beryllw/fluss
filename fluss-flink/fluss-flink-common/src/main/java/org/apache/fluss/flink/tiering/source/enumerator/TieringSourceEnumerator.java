@@ -34,7 +34,6 @@ import org.apache.fluss.flink.tiering.source.split.TieringSplitGenerator;
 import org.apache.fluss.flink.tiering.source.state.TieringSourceEnumeratorState;
 import org.apache.fluss.lake.committer.TieringStats;
 import org.apache.fluss.lake.writer.LakeTieringFactory;
-import org.apache.fluss.lake.writer.SupportsPartitionMarkDone;
 import org.apache.fluss.lake.writer.TieringTableValidator;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
@@ -514,7 +513,7 @@ public class TieringSourceEnumerator
             List<TieringSplit> tieringSplits = splitGenerator.generateTableSplits(tableInfo);
             if (tieringSplits.isEmpty()
                     && lakeTieringConfig.get(ConfigOptions.LAKE_TIERING_PARTITION_MARK_DONE_ENABLED)
-                    && lakeTieringFactory instanceof SupportsPartitionMarkDone
+                    && lakeTieringFactory.supportsPartitionMarkDone()
                     && tableInfo.isPartitioned()) {
                 // Let the committer check the lake table options without lake I/O here.
                 tieringSplits = new ArrayList<>();
