@@ -244,9 +244,6 @@ public class TieringCommitOperator<WriteResult, Committable>
         // to avoid dirty commit to a newly created table.
         TableInfo currentTableInfo = admin.getTableInfo(tablePath).get();
         if (currentTableInfo.getTableId() != tableId) {
-            if (!hasTieringProgress) {
-                return new CommitResult(null, null);
-            }
             throw new IllegalStateException(
                     String.format(
                             "The current table id %s for table path %s is different from the table id %s in the committable. "
@@ -275,7 +272,9 @@ public class TieringCommitOperator<WriteResult, Committable>
                     nonEmptyResults.stream()
                             .map(TableBucketWriteResult::writeResult)
                             .collect(Collectors.toList());
+            // to committable
             Committable committable = lakeCommitter.toCommittable(writeResults);
+            // before commit to lake, check fluss not missing any lake snapshot committed by fluss
             LakeSnapshot flussCurrentLakeSnapshot = getLatestLakeSnapshot(tablePath);
             Long knownSnapshotId =
                     flussCurrentLakeSnapshot == null
@@ -284,7 +283,12 @@ public class TieringCommitOperator<WriteResult, Committable>
             CommittedLakeSnapshot recoveredSnapshot =
                     recoverMissingLakeSnapshot(tablePath, tableId, lakeCommitter, knownSnapshotId);
             if (hasTieringProgress && recoveredSnapshot != null) {
-                // Results produced using stale Fluss offsets must be retried before actions run.
+                // fluss's known snapshot is less than lake snapshot committed by fluss
+                // fail this commit since the data is read from the log end-offset of a invalid
+                // fluss
+                // known lake snapshot, which means the data already has been committed to lake,
+                // not to commit to lake to avoid data duplicated
+                // abort this committable to delete the written files
                 lakeCommitter.abort(committable);
                 throw new IllegalStateException(
                         String.format(
@@ -311,11 +315,13 @@ public class TieringCommitOperator<WriteResult, Committable>
             String lakeBucketTieredOffsetsFile =
                     flussTableLakeSnapshotCommitter.prepareLakeSnapshot(
                             tableId, tablePath, logEndOffsets);
+            // record the lake snapshot bucket offsets file to snapshot property
             Map<String, String> snapshotProperties =
                     Collections.singletonMap(
                             FLUSS_LAKE_SNAP_BUCKET_OFFSET_PROPERTY, lakeBucketTieredOffsetsFile);
             LakeCommitResult lakeCommitResult =
                     lakeCommitter.commit(committable, snapshotProperties);
+            // commit to fluss
             flussTableLakeSnapshotCommitter.commit(
                     tableId,
                     tablePath,
@@ -353,6 +359,7 @@ public class TieringCommitOperator<WriteResult, Committable>
             LakeCommitter<WriteResult, Committable> lakeCommitter,
             @Nullable Long knownSnapshotId)
             throws Exception {
+        // get Fluss missing lake snapshot in Lake
         CommittedLakeSnapshot missingCommittedSnapshot =
                 lakeCommitter.getMissingLakeSnapshot(knownSnapshotId);
         if (missingCommittedSnapshot == null) {
@@ -387,6 +394,7 @@ public class TieringCommitOperator<WriteResult, Committable>
                             tableId));
         }
 
+        // commit this missing snapshot to fluss
         flussTableLakeSnapshotCommitter.commit(
                 tableId,
                 missingCommittedSnapshot.getLakeSnapshotId(),

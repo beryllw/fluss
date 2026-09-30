@@ -50,6 +50,8 @@ import org.apache.flink.streaming.util.MockStreamConfig;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import javax.annotation.Nullable;
 
@@ -575,21 +577,50 @@ class TieringCommitOperatorTest extends FlinkTestBase {
         assertThat(failedTieringEvent.failReason()).contains(failedReason);
     }
 
-    @Test
-    void testCommitFailsWhenTableRecreated() throws Exception {
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void testCommitFailsWhenTableRecreated(boolean hasTieringProgress) throws Exception {
+        if (!hasTieringProgress) {
+            org.apache.fluss.config.Configuration tieringConfig =
+                    new org.apache.fluss.config.Configuration();
+            tieringConfig.set(ConfigOptions.LAKE_TIERING_PARTITION_MARK_DONE_ENABLED, true);
+            committerOperator.close();
+            committerOperator =
+                    new TieringCommitOperator<>(
+                            parameters,
+                            FLUSS_CLUSTER_EXTENSION.getClientConfig(),
+                            tieringConfig,
+                            new TestingLakeTieringFactory());
+            committerOperator.open();
+        }
         TablePath tablePath = TablePath.of("fluss", "test_commit_fails_when_table_recreated");
-        long originalTableId = createTable(tablePath, DEFAULT_PK_TABLE_DESCRIPTOR);
+        long originalTableId =
+                createTable(
+                        tablePath,
+                        hasTieringProgress
+                                ? DEFAULT_PK_TABLE_DESCRIPTOR
+                                : DATA1_PARTITIONED_TABLE_DESCRIPTOR);
         int numberOfWriteResults = 3;
 
         // Send write results for the first bucket
         TableBucket tableBucket = new TableBucket(originalTableId, 0);
         committerOperator.processElement(
                 createTableBucketWriteResultStreamRecord(
-                        tablePath, tableBucket, 1, 1, 1L, numberOfWriteResults));
+                        tablePath,
+                        tableBucket,
+                        hasTieringProgress ? 1 : null,
+                        hasTieringProgress ? 1 : -1,
+                        hasTieringProgress ? 1L : -1L,
+                        numberOfWriteResults));
 
         // Drop and recreate the table with the same path
         admin.dropTable(tablePath, true).get();
-        long newTableId = createTable(tablePath, DEFAULT_PK_TABLE_DESCRIPTOR);
+        long newTableId =
+                createTable(
+                        tablePath,
+                        hasTieringProgress
+                                ? DEFAULT_PK_TABLE_DESCRIPTOR
+                                : DATA1_PARTITIONED_TABLE_DESCRIPTOR);
 
         // Verify that the table id has changed
         assertThat(newTableId).isNotEqualTo(originalTableId);
@@ -601,9 +632,9 @@ class TieringCommitOperatorTest extends FlinkTestBase {
                     createTableBucketWriteResultStreamRecord(
                             tablePath,
                             tableBucket,
-                            bucket,
-                            bucket,
-                            (long) bucket,
+                            hasTieringProgress ? bucket : null,
+                            hasTieringProgress ? bucket : -1,
+                            hasTieringProgress ? (long) bucket : -1L,
                             numberOfWriteResults));
         }
 
@@ -617,6 +648,8 @@ class TieringCommitOperatorTest extends FlinkTestBase {
         assertThat(failedTieringEvent.failReason())
                 .contains("different from the table id")
                 .contains("dropped and recreated during tiering");
+        assertThat(output).isEmpty();
+        verifyNoLakeSnapshot(tablePath);
     }
 
     @Test

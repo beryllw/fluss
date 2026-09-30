@@ -130,9 +130,11 @@ public class PaimonLakeCommitter
             // Collect cumulative table stats from the exact snapshot that was just committed.
             TieringStats stats = computeTableStats();
 
+            // deletion vector is disabled, committed snapshot is readable
             if (!fileStoreTable.coreOptions().deletionVectorsEnabled()) {
                 return LakeCommitResult.committedIsReadable(committedSnapshotId, stats);
             } else {
+                // retrieve the readable snapshot during commit
                 try (DvTableReadableSnapshotRetriever retriever =
                         new DvTableReadableSnapshotRetriever(
                                 tablePath, tableId, fileStoreTable, flussClientConfig)) {
@@ -294,6 +296,9 @@ public class PaimonLakeCommitter
     private CommittedLakeSnapshot loadLatestFlussCommit(@Nullable Long knownSnapshotId)
             throws IOException {
         Snapshot latestSnapshot = getCommittedLatestSnapshotOfLake();
+        // we get the latest snapshot committed by fluss,
+        // but the latest snapshot is not greater than knownSnapshotId, no any missing
+        // snapshot, return directly
         if (latestSnapshot == null
                 || (knownSnapshotId != null && latestSnapshot.id() <= knownSnapshotId)) {
             return null;
