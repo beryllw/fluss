@@ -49,6 +49,7 @@ import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 
 import javax.annotation.Nullable;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -189,7 +190,6 @@ public class TieringCommitOperator<WriteResult, Committable>
      * advanced their tiered offsets without writing any data (e.g. splits only covering empty WAL
      * batches), an empty lake snapshot is committed to persist the tiering progress.
      */
-    @SuppressWarnings("unchecked")
     private CommitResult commitWriteResults(
             long tableId,
             TablePath tablePath,
@@ -218,17 +218,11 @@ public class TieringCommitOperator<WriteResult, Committable>
         }
 
         boolean hasTieringProgress = !nonEmptyResults.isEmpty() || !logEndOffsets.isEmpty();
-        boolean markDoneSupported =
-                lakeTieringConfig.get(ConfigOptions.LAKE_TIERING_PARTITION_MARK_DONE_ENABLED)
-                        && lakeTieringFactory.supportsPartitionMarkDone();
         if (!hasTieringProgress) {
             LOG.info(
                     "Commit tiering write results is empty for table {}, table path {}",
                     tableId,
                     tablePath);
-            if (!markDoneSupported) {
-                return new CommitResult(null, null);
-            }
         } else if (nonEmptyResults.isEmpty()) {
             LOG.info(
                     "No data was written for table {} (table path {}) but buckets {} advanced "
@@ -239,35 +233,11 @@ public class TieringCommitOperator<WriteResult, Committable>
                     logEndOffsets.keySet());
         }
 
-        // Check if the table was dropped and recreated during tiering.
-        // If the current table id differs from the committable's table id, fail this commit
-        // to avoid dirty commit to a newly created table.
-        TableInfo currentTableInfo = admin.getTableInfo(tablePath).get();
-        if (currentTableInfo.getTableId() != tableId) {
-            throw new IllegalStateException(
-                    String.format(
-                            "The current table id %s for table path %s is different from the table id %s in the committable. "
-                                    + "This usually happens when a table was dropped and recreated during tiering. "
-                                    + "Aborting commit to prevent dirty commit.",
-                            currentTableInfo.getTableId(), tablePath, tableId));
-        }
-        if (!hasTieringProgress && !currentTableInfo.isPartitioned()) {
-            return new CommitResult(null, null);
-        }
-
+        TableInfo currentTableInfo = getAndValidateTableInfo(tablePath, tableId);
         try (LakeCommitter<WriteResult, Committable> lakeCommitter =
                 lakeTieringFactory.createLakeCommitter(
                         new TieringCommitterInitContext(
                                 tablePath, currentTableInfo, lakeTieringConfig, flussConfig))) {
-            PartitionMarkDoneCommitter<WriteResult, Committable> markDoneCommitter = null;
-            if (markDoneSupported) {
-                checkState(
-                        lakeCommitter instanceof PartitionMarkDoneCommitter,
-                        "Lake tiering factory %s declares partition mark-done support but its committer does not.",
-                        lakeTieringFactory.getClass().getName());
-                markDoneCommitter =
-                        (PartitionMarkDoneCommitter<WriteResult, Committable>) lakeCommitter;
-            }
             List<WriteResult> writeResults =
                     nonEmptyResults.stream()
                             .map(TableBucketWriteResult::writeResult)
@@ -281,33 +251,24 @@ public class TieringCommitOperator<WriteResult, Committable>
                             ? null
                             : flussCurrentLakeSnapshot.getSnapshotId();
             CommittedLakeSnapshot recoveredSnapshot =
-                    recoverMissingLakeSnapshot(tablePath, tableId, lakeCommitter, knownSnapshotId);
-            if (hasTieringProgress && recoveredSnapshot != null) {
-                // fluss's known snapshot is less than lake snapshot committed by fluss
-                // fail this commit since the data is read from the log end-offset of a invalid
-                // fluss
-                // known lake snapshot, which means the data already has been committed to lake,
-                // not to commit to lake to avoid data duplicated
-                // abort this committable to delete the written files
-                lakeCommitter.abort(committable);
-                throw new IllegalStateException(
-                        String.format(
-                                "The current Fluss's lake snapshot %d is less than"
-                                        + " lake actual snapshot %d committed by Fluss for table: {tablePath=%s, tableId=%d},"
-                                        + " missing snapshot: %s.",
-                                knownSnapshotId,
-                                recoveredSnapshot.getLakeSnapshotId(),
-                                tablePath,
-                                tableId,
-                                recoveredSnapshot));
-            }
-            if (!hasTieringProgress && knownSnapshotId == null && recoveredSnapshot == null) {
-                return new CommitResult(null, null);
-            }
-            boolean stateChanged =
-                    markDoneCommitter != null
-                            && markDoneCommitter.preparePartitionMarkDone(committable);
-            if (!hasTieringProgress && !stateChanged) {
+                    checkMissingLakeSnapshotAndRecover(
+                            tablePath,
+                            tableId,
+                            lakeCommitter,
+                            committable,
+                            knownSnapshotId,
+                            hasTieringProgress);
+            boolean hasLakeSnapshot = knownSnapshotId != null || recoveredSnapshot != null;
+            boolean markDoneSupported =
+                    lakeTieringConfig.get(ConfigOptions.LAKE_TIERING_PARTITION_MARK_DONE_ENABLED)
+                            && lakeTieringFactory.supportsPartitionMarkDone();
+            // Empty rounds only prepare mark-done after a lake snapshot exists, so initialization
+            // alone does not create the first snapshot.
+            boolean markDoneStateChanged =
+                    markDoneSupported
+                            && (hasTieringProgress || hasLakeSnapshot)
+                            && preparePartitionMarkDone(lakeCommitter, committable);
+            if (!hasTieringProgress && !markDoneStateChanged) {
                 return new CommitResult(null, null);
             }
 
@@ -335,6 +296,34 @@ public class TieringCommitOperator<WriteResult, Committable>
         }
     }
 
+    private TableInfo getAndValidateTableInfo(TablePath tablePath, long tableId) throws Exception {
+        // Check if the table was dropped and recreated during tiering.
+        // If the current table id differs from the committable's table id, fail this commit
+        // to avoid dirty commit to a newly created table.
+        TableInfo currentTableInfo = admin.getTableInfo(tablePath).get();
+        if (currentTableInfo.getTableId() != tableId) {
+            throw new IllegalStateException(
+                    String.format(
+                            "The current table id %s for table path %s is different from the table id %s in the committable. "
+                                    + "This usually happens when a table was dropped and recreated during tiering. "
+                                    + "Aborting commit to prevent dirty commit.",
+                            currentTableInfo.getTableId(), tablePath, tableId));
+        }
+        return currentTableInfo;
+    }
+
+    @SuppressWarnings("unchecked")
+    private boolean preparePartitionMarkDone(
+            LakeCommitter<WriteResult, Committable> lakeCommitter, Committable committable)
+            throws IOException {
+        checkState(
+                lakeCommitter instanceof PartitionMarkDoneCommitter,
+                "Lake tiering factory %s declares partition mark-done support but its committer does not.",
+                lakeTieringFactory.getClass().getName());
+        return ((PartitionMarkDoneCommitter<WriteResult, Committable>) lakeCommitter)
+                .preparePartitionMarkDone(committable);
+    }
+
     @Nullable
     private LakeSnapshot getLatestLakeSnapshot(TablePath tablePath) throws Exception {
         LakeSnapshot flussCurrentLakeSnapshot;
@@ -353,11 +342,13 @@ public class TieringCommitOperator<WriteResult, Committable>
     }
 
     @Nullable
-    private CommittedLakeSnapshot recoverMissingLakeSnapshot(
+    private CommittedLakeSnapshot checkMissingLakeSnapshotAndRecover(
             TablePath tablePath,
             long tableId,
             LakeCommitter<WriteResult, Committable> lakeCommitter,
-            @Nullable Long knownSnapshotId)
+            Committable committable,
+            @Nullable Long knownSnapshotId,
+            boolean hasTieringProgress)
             throws Exception {
         // get Fluss missing lake snapshot in Lake
         CommittedLakeSnapshot missingCommittedSnapshot =
@@ -407,6 +398,21 @@ public class TieringCommitOperator<WriteResult, Committable>
                 Collections.emptyMap(),
                 Collections.emptyMap(),
                 LakeCommitResult.KEEP_ALL_PREVIOUS);
+        if (hasTieringProgress) {
+            // This round read stale offsets. Delete its files and retry from the recovered
+            // snapshot to avoid committing duplicate data.
+            lakeCommitter.abort(committable);
+            throw new IllegalStateException(
+                    String.format(
+                            "The current Fluss's lake snapshot %d is less than"
+                                    + " lake actual snapshot %d committed by Fluss for table: {tablePath=%s, tableId=%d},"
+                                    + " missing snapshot: %s.",
+                            knownSnapshotId,
+                            missingCommittedSnapshot.getLakeSnapshotId(),
+                            tablePath,
+                            tableId,
+                            missingCommittedSnapshot));
+        }
         return missingCommittedSnapshot;
     }
 

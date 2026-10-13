@@ -39,7 +39,7 @@ public interface PartitionMarkDoneCommitter<WriteResult, CommittableT>
      * value; an idle round commits only when the state changed. Actions may be retried after a
      * failure.
      *
-     * @param committable the data or empty maintenance committable
+     * @param committable the data or empty partition mark-done committable
      * @return whether the state was successfully prepared and changed
      */
     boolean preparePartitionMarkDone(CommittableT committable) throws IOException;

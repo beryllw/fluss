@@ -157,7 +157,7 @@ public class TestingLakeTieringFactory
 
         private boolean partitionMarkDoneEnabled;
 
-        @Nullable private LakeCommitResult maintenanceCommitResult;
+        @Nullable private LakeCommitResult commitResult;
 
         public TestingLakeCommitter() {
             this(null);
@@ -174,7 +174,7 @@ public class TestingLakeTieringFactory
         @Override
         public boolean preparePartitionMarkDone(TestingCommittable committable) {
             markDonePreparations++;
-            return partitionMarkDoneEnabled && maintenanceCommitResult != null;
+            return partitionMarkDoneEnabled && commitResult != null;
         }
 
         @Override
@@ -191,8 +191,8 @@ public class TestingLakeTieringFactory
         public LakeCommitResult commit(
                 TestingCommittable committable, Map<String, String> snapshotProperties)
                 throws IOException {
-            return maintenanceCommitResult != null
-                    ? maintenanceCommitResult
+            return commitResult != null
+                    ? commitResult
                     : LakeCommitResult.committedIsReadable(++currentSnapshot);
         }
 
@@ -210,8 +210,9 @@ public class TestingLakeTieringFactory
             return null;
         }
 
-        public void setMaintenanceCommitResult(@Nullable LakeCommitResult maintenanceCommitResult) {
-            this.maintenanceCommitResult = maintenanceCommitResult;
+        /** Overrides the commit result, or restores the default when null. */
+        public void setCommitResult(@Nullable LakeCommitResult commitResult) {
+            this.commitResult = commitResult;
         }
 
         public int getMarkDonePreparations() {

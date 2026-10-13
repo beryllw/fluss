@@ -230,7 +230,7 @@ public class PaimonLakeCommitter
         try {
             tableCommit = fileStoreTable.newCommit(commitUser);
             // don't skip empty commits: tiering relies on empty snapshots to persist bucket
-            // offsets when only empty WAL batches were consumed, and mark-done maintenance
+            // offsets when only empty WAL batches were consumed, and partition mark-done
             // commits properties-only snapshots
             tableCommit.ignoreEmptyCommit(false);
             tableCommit.commit(manifestCommittable);
@@ -283,7 +283,17 @@ public class PaimonLakeCommitter
                 && !latestCommit
                         .getSnapshotProperties()
                         .containsKey(FLUSS_LAKE_SNAP_BUCKET_OFFSET_PROPERTY)) {
-            throw new IOException("Failed to load committed lake snapshot properties from Paimon.");
+            throw new IOException(
+                    String.format(
+                            "Cannot recover tiering offsets for Paimon table %s (Fluss table %s, tableId=%s): "
+                                    + "no recoverable snapshot containing required property '%s' was found. "
+                                    + "Latest Fluss-committed Paimon snapshot ID: %s; Fluss-known snapshot ID: %s.",
+                            lakeTablePath,
+                            tablePath,
+                            tableId,
+                            FLUSS_LAKE_SNAP_BUCKET_OFFSET_PROPERTY,
+                            latestCommit.getLakeSnapshotId(),
+                            latestLakeSnapshotIdOfFluss));
         }
         return latestCommit;
     }

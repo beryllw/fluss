@@ -652,8 +652,9 @@ class TieringCommitOperatorTest extends FlinkTestBase {
         verifyNoLakeSnapshot(tablePath);
     }
 
-    @Test
-    void testEmptyRoundRecoversMissingLakeSnapshot() throws Exception {
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void testEmptyRoundRecoversMissingLakeSnapshot(boolean jobMarkDoneEnabled) throws Exception {
         TablePath tablePath =
                 TablePath.of("fluss", "test_empty_round_recovers_missing_lake_snapshot");
         long tableId = createTable(tablePath, DATA1_PARTITIONED_TABLE_DESCRIPTOR);
@@ -669,9 +670,11 @@ class TieringCommitOperatorTest extends FlinkTestBase {
                         mockMissingCommittedLakeSnapshot);
         TestingLakeTieringFactory lakeTieringFactory =
                 new TestingLakeTieringFactory(testingLakeCommitter);
-        // mark-done must also be enabled at the job level (disabled by default)
+        // Recover the missing snapshot even when mark-done is disabled at the job or table level.
         org.apache.fluss.config.Configuration lakeTieringConfig =
                 new org.apache.fluss.config.Configuration();
+        lakeTieringConfig.set(
+                ConfigOptions.LAKE_TIERING_PARTITION_MARK_DONE_ENABLED, jobMarkDoneEnabled);
         committerOperator.close();
         committerOperator =
                 new TieringCommitOperator<>(
@@ -684,21 +687,24 @@ class TieringCommitOperatorTest extends FlinkTestBase {
         committerOperator.processElement(
                 createTableBucketWriteResultStreamRecord(
                         tablePath, new TableBucket(tableId, 0), null, null, -1, -1, 1));
-        assertThat(testingLakeCommitter.getMarkDonePreparations()).isZero();
-        verifyNoLakeSnapshot(tablePath);
+        int expectedPreparations = jobMarkDoneEnabled ? 1 : 0;
+        assertThat(testingLakeCommitter.getMarkDonePreparations()).isEqualTo(expectedPreparations);
+        verifyLakeSnapshot(tablePath, tableId, 5, expectedLogEndOffsets);
 
         lakeTieringConfig.set(ConfigOptions.LAKE_TIERING_PARTITION_MARK_DONE_ENABLED, true);
         committerOperator.processElement(
                 createTableBucketWriteResultStreamRecord(
                         tablePath, new TableBucket(tableId, 0), null, null, -1, -1, 1));
-        assertThat(testingLakeCommitter.getMarkDonePreparations()).isEqualTo(1);
+        assertThat(testingLakeCommitter.getMarkDonePreparations())
+                .isEqualTo(expectedPreparations + 1);
         verifyLakeSnapshot(tablePath, tableId, 5, expectedLogEndOffsets);
 
         testingLakeCommitter.enablePartitionMarkDone();
         committerOperator.processElement(
                 createTableBucketWriteResultStreamRecord(
                         tablePath, new TableBucket(tableId, 0), null, null, -1, -1, 1));
-        assertThat(testingLakeCommitter.getMarkDonePreparations()).isEqualTo(2);
+        assertThat(testingLakeCommitter.getMarkDonePreparations())
+                .isEqualTo(expectedPreparations + 2);
         LakeSnapshot lakeSnapshot = admin.getLatestLakeSnapshot(tablePath).get();
         assertThat(lakeSnapshot.getSnapshotId()).isEqualTo(5);
         assertThat(lakeSnapshot.getTableBucketsOffset()).isEqualTo(expectedLogEndOffsets);
@@ -712,8 +718,8 @@ class TieringCommitOperatorTest extends FlinkTestBase {
     }
 
     @Test
-    void testMaintenanceCommitsReadableSnapshots() throws Exception {
-        TablePath tablePath = TablePath.of("fluss", "test_maintenance_readable_snapshots");
+    void testReadableSnapshotsAfterPartitionMarkDone() throws Exception {
+        TablePath tablePath = TablePath.of("fluss", "test_readable_snapshots_after_mark_done");
         long tableId = createTable(tablePath, DATA1_PARTITIONED_TABLE_DESCRIPTOR);
         TableBucket bucket = new TableBucket(tableId, 0);
         Map<TableBucket, Long> tieredOffsets = Collections.singletonMap(bucket, 100L);
@@ -744,18 +750,18 @@ class TieringCommitOperatorTest extends FlinkTestBase {
         assertThat(admin.getReadableLakeSnapshot(tablePath).get().getSnapshotId()).isEqualTo(2);
         assertThat(lakeCommitter.getMarkDonePreparations()).isEqualTo(2);
 
-        // Non-DV maintenance advances the readable snapshot without advancing offsets.
-        lakeCommitter.setMaintenanceCommitResult(LakeCommitResult.committedIsReadable(3));
+        // Non-DV partition mark-done advances the readable snapshot without advancing offsets.
+        lakeCommitter.setCommitResult(LakeCommitResult.committedIsReadable(3));
         committerOperator.processElement(
                 createTableBucketWriteResultStreamRecord(tablePath, bucket, null, null, -1, -1, 1));
         LakeSnapshot readable = admin.getReadableLakeSnapshot(tablePath).get();
         assertThat(readable.getSnapshotId()).isEqualTo(3);
         assertThat(readable.getTableBucketsOffset()).isEqualTo(tieredOffsets);
 
-        // DV maintenance must use the compacted snapshot's readable offsets, not the
-        // maintenance snapshot's newer tiered offsets.
+        // DV partition mark-done must use the compacted snapshot's readable offsets, not the
+        // mark-done snapshot's newer tiered offsets.
         Map<TableBucket, Long> readableOffsets = Collections.singletonMap(bucket, 60L);
-        lakeCommitter.setMaintenanceCommitResult(
+        lakeCommitter.setCommitResult(
                 LakeCommitResult.withReadableSnapshot(
                         5, 4, tieredOffsets, readableOffsets, LakeCommitResult.KEEP_ALL_PREVIOUS));
         committerOperator.processElement(
@@ -768,7 +774,7 @@ class TieringCommitOperatorTest extends FlinkTestBase {
         assertThat(tiered.getTableBucketsOffset()).isEqualTo(tieredOffsets);
 
         // With no new readable result, preserve the existing readable boundary.
-        lakeCommitter.setMaintenanceCommitResult(LakeCommitResult.unknownReadableSnapshot(6));
+        lakeCommitter.setCommitResult(LakeCommitResult.unknownReadableSnapshot(6));
         committerOperator.processElement(
                 createTableBucketWriteResultStreamRecord(tablePath, bucket, null, null, -1, -1, 1));
         readable = admin.getReadableLakeSnapshot(tablePath).get();
