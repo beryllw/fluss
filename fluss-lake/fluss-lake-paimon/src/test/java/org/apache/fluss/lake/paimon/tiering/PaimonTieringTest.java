@@ -52,12 +52,16 @@ import org.apache.paimon.catalog.CatalogContext;
 import org.apache.paimon.catalog.CatalogFactory;
 import org.apache.paimon.catalog.Identifier;
 import org.apache.paimon.data.InternalRow;
+import org.apache.paimon.fs.FileIO;
 import org.apache.paimon.manifest.ManifestCommittable;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.partition.Partition;
 import org.apache.paimon.schema.Schema;
 import org.apache.paimon.table.FileStoreTable;
+import org.apache.paimon.table.FileStoreTableFactory;
+import org.apache.paimon.table.sink.CommitMessageImpl;
 import org.apache.paimon.table.sink.TableCommitImpl;
+import org.apache.paimon.table.sink.TableWriteImpl;
 import org.apache.paimon.table.source.DataSplit;
 import org.apache.paimon.table.source.ReadBuilder;
 import org.apache.paimon.table.source.Split;
@@ -69,6 +73,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.MethodSource;
 
 import javax.annotation.Nullable;
@@ -88,6 +93,7 @@ import java.util.stream.Stream;
 
 import static org.apache.fluss.lake.committer.LakeCommitter.FLUSS_LAKE_SNAP_BUCKET_OFFSET_PROPERTY;
 import static org.apache.fluss.lake.paimon.utils.PaimonConversions.toPaimon;
+import static org.apache.fluss.lake.paimon.utils.PaimonConversions.toPaimonSchema;
 import static org.apache.fluss.lake.writer.LakeTieringFactory.FLUSS_LAKE_TIERING_COMMIT_USER;
 import static org.apache.fluss.metadata.TableDescriptor.BUCKET_COLUMN_NAME;
 import static org.apache.fluss.metadata.TableDescriptor.OFFSET_COLUMN_NAME;
@@ -99,8 +105,17 @@ import static org.apache.fluss.record.ChangeType.UPDATE_AFTER;
 import static org.apache.fluss.record.ChangeType.UPDATE_BEFORE;
 import static org.apache.fluss.record.TestData.DEFAULT_REMOTE_DATA_DIR;
 import static org.apache.fluss.utils.PartitionUtils.HISTORICAL_PARTITION_VALUE;
+import static org.apache.paimon.CoreOptions.WRITE_SEQUENCE_NUMBER_INIT_MODE;
 import static org.apache.paimon.table.sink.BatchWriteBuilder.COMMIT_IDENTIFIER;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.argThat;
+import static org.mockito.Mockito.atLeastOnce;
+import static org.mockito.Mockito.clearInvocations;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 /** The UT for tiering to Paimon via {@link PaimonLakeTieringFactory}. */
 class PaimonTieringTest {
@@ -230,15 +245,24 @@ class PaimonTieringTest {
         }
     }
 
-    @Test
-    void testHistoricalPrimaryKeyTiering() throws Exception {
+    @ParameterizedTest
+    @CsvSource({"false,", "true,", "false,scan"})
+    void testHistoricalPrimaryKeyTiering(boolean autoCompaction, @Nullable String sequenceMode)
+            throws Exception {
         TablePath tablePath = TablePath.of("paimon", "test_historical_primary_key");
-        TableInfo tableInfo = createHistoricalTable(tablePath, true);
+        Configuration properties = new Configuration();
+        properties.set(ConfigOptions.TABLE_DATALAKE_AUTO_COMPACTION, autoCompaction);
+        if (sequenceMode != null) {
+            properties.setString("paimon." + WRITE_SEQUENCE_NUMBER_INIT_MODE.key(), sequenceMode);
+        }
+        TableInfo tableInfo = createHistoricalTable(tablePath, true, properties.toMap());
         long timestamp = 1_000L;
         List<LogRecord> records =
                 Arrays.asList(
                         historicalRecord(0L, timestamp, 1, "20240101", INSERT),
-                        historicalRecord(1L, timestamp, 1, "20240102", INSERT));
+                        historicalRecord(1L, timestamp, 1, "20240101", INSERT),
+                        historicalRecord(2L, timestamp, 1, "20240101", INSERT),
+                        historicalRecord(3L, timestamp, 1, "20240102", INSERT));
 
         PaimonWriteResult writeResult;
         try (LakeWriter<PaimonWriteResult> lakeWriter =
@@ -255,21 +279,77 @@ class PaimonTieringTest {
                 serializer.deserialize(serializer.getVersion(), serializer.serialize(writeResult));
         assertHistoricalPartitions(writeResult);
 
-        try (LakeCommitter<PaimonWriteResult, PaimonCommittable> committer =
-                createLakeCommitter(tablePath, tableInfo, new Configuration())) {
-            committer.commit(
-                    committer.toCommittable(Collections.singletonList(writeResult)),
-                    new CommitContext(Collections.emptyMap(), Collections.emptyMap()));
-        }
+        commitWriteResult(tablePath, tableInfo, writeResult);
         assertThat(paimonCatalog.listPartitions(toPaimon(tablePath)))
                 .extracting(partition -> partition.spec().get("c3"))
                 .containsExactlyInAnyOrder("20240101", "20240102");
+        boolean snapshotSequence = !autoCompaction && sequenceMode == null;
+        assertMaxSequenceNumber(tablePath, 1L, snapshotSequence ? 2L : null);
+        FileStoreTable table = (FileStoreTable) paimonCatalog.getTable(toPaimon(tablePath));
+        FileIO fileIO = spy(table.fileIO());
+        FileStoreTable uncachedTable = FileStoreTableFactory.create(fileIO, table.location());
+        Catalog catalog = mock(Catalog.class);
+        when(catalog.getTable(toPaimon(tablePath))).thenReturn(uncachedTable);
+        PaimonCatalogProvider provider = mock(PaimonCatalogProvider.class);
+        when(provider.get()).thenReturn(catalog);
+        WriterInitContext context = mock(WriterInitContext.class);
+        when(context.tableInfo()).thenReturn(tableInfo);
+        when(context.tableBucket()).thenReturn(new TableBucket(0, 1L, 0));
+        when(context.bucketCount()).thenReturn(1);
+
+        long snapshotId = 1;
+        // The persisted option applies to both historical and normal partition writers.
+        for (String partition : Arrays.asList("20240102", "20240101")) {
+            when(context.partition())
+                    .thenReturn(snapshotId == 1 ? HISTORICAL_PARTITION_VALUE : partition);
+            clearInvocations(fileIO);
+            try (PaimonLakeWriter writer = new PaimonLakeWriter(provider, context)) {
+                writer.write(historicalRecord(4L, timestamp + 1_000L, 1, partition, INSERT));
+                verify(fileIO, snapshotSequence ? never() : atLeastOnce())
+                        .newInputStream(argThat(path -> path.getName().startsWith("manifest-")));
+                writeResult = writer.complete();
+            }
+            commitWriteResult(tablePath, tableInfo, writeResult);
+            snapshotId++;
+            assertMaxSequenceNumber(
+                    tablePath, snapshotId, snapshotSequence ? snapshotId + 1 : null);
+        }
+
+        // An external compactor inherits the option without Fluss runtime overrides.
+        try (TableWriteImpl<?> compactor = table.newWrite("external-compactor");
+                TableCommitImpl commit = table.newCommit("external-compactor")) {
+            compactor.compact(
+                    ((CommitMessageImpl) writeResult.commitMessages().get(0)).partition(), 0, true);
+            commit.commit(compactor.prepareCommit());
+        }
+        Snapshot compactSnapshot = table.snapshotManager().latestSnapshot();
+        assertThat(compactSnapshot.commitKind()).isEqualTo(Snapshot.CommitKind.COMPACT);
+        assertMaxSequenceNumber(tablePath, compactSnapshot.id(), snapshotSequence ? 4L : null);
+
+        LogRecord updated = historicalRecord(6L, timestamp + 2_000L, 1, "20240102", INSERT);
+        when(context.partition()).thenReturn(HISTORICAL_PARTITION_VALUE);
+        clearInvocations(fileIO);
+        try (PaimonLakeWriter writer = new PaimonLakeWriter(provider, context)) {
+            writer.write(historicalRecord(5L, timestamp + 2_000L, 1, "20240101", DELETE));
+            writer.write(updated);
+            verify(fileIO, snapshotSequence ? never() : atLeastOnce())
+                    .newInputStream(argThat(path -> path.getName().startsWith("manifest-")));
+            writeResult = writer.complete();
+        }
+        commitWriteResult(tablePath, tableInfo, writeResult);
+        try (CloseableIterator<InternalRow> deleted =
+                        getPaimonRows(tablePath, "20240101", true, 0);
+                CloseableIterator<InternalRow> remaining =
+                        getPaimonRows(tablePath, "20240102", true, 0)) {
+            assertThat(deleted.hasNext()).isFalse();
+            verifyTableRecords(remaining, Collections.singletonList(updated), 0, "20240102");
+        }
     }
 
     @Test
     void testHistoricalArrowBatchTiering() throws Exception {
         TablePath tablePath = TablePath.of("paimon", "test_historical_arrow");
-        TableInfo tableInfo = createHistoricalTable(tablePath, false);
+        TableInfo tableInfo = createHistoricalTable(tablePath, false, Collections.emptyMap());
         long baseOffset = 10L;
         long timestamp = 1_000L;
         List<LogRecord> records =
@@ -1181,6 +1261,16 @@ class PaimonTieringTest {
                 });
     }
 
+    private void commitWriteResult(
+            TablePath tablePath, TableInfo tableInfo, PaimonWriteResult result) throws Exception {
+        try (LakeCommitter<PaimonWriteResult, PaimonCommittable> committer =
+                createLakeCommitter(tablePath, tableInfo, new Configuration())) {
+            committer.commit(
+                    committer.toCommittable(Collections.singletonList(result)),
+                    new CommitContext(Collections.emptyMap(), Collections.emptyMap()));
+        }
+    }
+
     private long commitEmptySnapshot(TablePath tablePath, TableInfo tableInfo, String offsets)
             throws Exception {
         try (LakeCommitter<PaimonWriteResult, PaimonCommittable> lakeCommitter =
@@ -1194,6 +1284,16 @@ class PaimonTieringTest {
                                     Collections.emptyMap()))
                     .getCommittedSnapshotId();
         }
+    }
+
+    private void assertMaxSequenceNumber(
+            TablePath tablePath, long snapshotId, @Nullable Long expected) throws Exception {
+        Map<String, String> properties = getSnapshotProperties(tablePath, snapshotId);
+        assertThat(
+                        properties == null
+                                ? null
+                                : properties.get("sequence.generation.max-sequence-number"))
+                .isEqualTo(expected == null ? null : expected.toString());
     }
 
     private void createTable(
@@ -1244,15 +1344,9 @@ class PaimonTieringTest {
         return TableInfo.of(tablePath, 0, 1, descriptor, DEFAULT_REMOTE_DATA_DIR, 1L, 1L);
     }
 
-    private TableInfo createHistoricalTable(TablePath tablePath, boolean isPrimaryKeyTable)
+    private TableInfo createHistoricalTable(
+            TablePath tablePath, boolean isPrimaryKeyTable, Map<String, String> properties)
             throws Exception {
-        createTable(
-                tablePath,
-                isPrimaryKeyTable,
-                true,
-                isPrimaryKeyTable ? 1 : null,
-                Collections.emptyMap());
-
         org.apache.fluss.metadata.Schema.Builder schemaBuilder =
                 org.apache.fluss.metadata.Schema.newBuilder()
                         .column("c1", org.apache.fluss.types.DataTypes.INT())
@@ -1267,7 +1361,15 @@ class PaimonTieringTest {
                         .partitionedBy("c3")
                         .distributedBy(1)
                         .property(ConfigOptions.TABLE_DATALAKE_ENABLED, true)
+                        .property(ConfigOptions.TABLE_DATALAKE_HISTORICAL_PARTITION_ENABLED, true)
+                        .properties(properties)
                         .build();
+        createTable(
+                tablePath,
+                isPrimaryKeyTable,
+                true,
+                isPrimaryKeyTable ? 1 : null,
+                toPaimonSchema(descriptor).options());
         return TableInfo.of(tablePath, 0, 1, descriptor, DEFAULT_REMOTE_DATA_DIR, 1L, 1L);
     }
 
