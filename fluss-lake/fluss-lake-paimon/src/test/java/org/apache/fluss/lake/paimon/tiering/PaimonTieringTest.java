@@ -73,7 +73,6 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
-import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.MethodSource;
 
 import javax.annotation.Nullable;
@@ -152,6 +151,19 @@ class PaimonTieringTest {
                 Arguments.of(false, true, false),
                 Arguments.of(false, false, true),
                 Arguments.of(false, false, false));
+    }
+
+    private static Stream<Arguments> historicalWriterOptions() {
+        return Stream.of(
+                Arguments.of(Collections.emptyMap(), true),
+                Arguments.of(
+                        Collections.singletonMap(
+                                ConfigOptions.TABLE_DATALAKE_AUTO_COMPACTION.key(), "true"),
+                        false),
+                Arguments.of(
+                        Collections.singletonMap(
+                                "paimon." + WRITE_SEQUENCE_NUMBER_INIT_MODE.key(), "scan"),
+                        false));
     }
 
     private static Stream<Arguments> partitionExpireArgs() {
@@ -245,34 +257,15 @@ class PaimonTieringTest {
         }
     }
 
-    @ParameterizedTest
-    @CsvSource({"false,", "true,", "false,scan"})
-    void testHistoricalPrimaryKeyTiering(boolean autoCompaction, @Nullable String sequenceMode)
-            throws Exception {
+    @Test
+    void testHistoricalPrimaryKeyTiering() throws Exception {
         TablePath tablePath = TablePath.of("paimon", "test_historical_primary_key");
-        Configuration properties = new Configuration();
-        properties.set(ConfigOptions.TABLE_DATALAKE_AUTO_COMPACTION, autoCompaction);
-        if (sequenceMode != null) {
-            properties.setString("paimon." + WRITE_SEQUENCE_NUMBER_INIT_MODE.key(), sequenceMode);
-        }
-        TableInfo tableInfo = createHistoricalTable(tablePath, true, properties.toMap());
-        long timestamp = 1_000L;
-        List<LogRecord> records =
-                Arrays.asList(
-                        historicalRecord(0L, timestamp, 1, "20240101", INSERT),
-                        historicalRecord(1L, timestamp, 1, "20240101", INSERT),
-                        historicalRecord(2L, timestamp, 1, "20240101", INSERT),
-                        historicalRecord(3L, timestamp, 1, "20240102", INSERT));
-
-        PaimonWriteResult writeResult;
-        try (LakeWriter<PaimonWriteResult> lakeWriter =
-                createLakeWriter(tablePath, 0, HISTORICAL_PARTITION_VALUE, 1L, tableInfo)) {
-            for (LogRecord record : records) {
-                lakeWriter.write(record);
-            }
-            writeResult = lakeWriter.complete();
-        }
-
+        TableInfo tableInfo = createHistoricalTable(tablePath, true, Collections.emptyMap());
+        PaimonWriteResult writeResult =
+                writeHistoricalRecords(
+                        tableInfo,
+                        historicalRecord(0L, 1_000L, 1, "20240101", INSERT),
+                        historicalRecord(1L, 1_000L, 1, "20240102", INSERT));
         SimpleVersionedSerializer<PaimonWriteResult> serializer =
                 paimonLakeTieringFactory.getWriteResultSerializer();
         writeResult =
@@ -283,28 +276,33 @@ class PaimonTieringTest {
         assertThat(paimonCatalog.listPartitions(toPaimon(tablePath)))
                 .extracting(partition -> partition.spec().get("c3"))
                 .containsExactlyInAnyOrder("20240101", "20240102");
-        boolean snapshotSequence = !autoCompaction && sequenceMode == null;
+    }
+
+    @ParameterizedTest
+    @MethodSource("historicalWriterOptions")
+    void testHistoricalWriterInitialization(
+            Map<String, String> properties, boolean snapshotSequence) throws Exception {
+        TablePath tablePath = TablePath.of("paimon", "test_historical_writer_initialization");
+        TableInfo tableInfo = createHistoricalTable(tablePath, true, properties);
+        PaimonWriteResult writeResult =
+                writeHistoricalRecords(
+                        tableInfo,
+                        historicalRecord(0L, 1_000L, 1, "20240101", INSERT),
+                        historicalRecord(1L, 1_000L, 1, "20240101", INSERT),
+                        historicalRecord(2L, 1_000L, 1, "20240101", INSERT),
+                        historicalRecord(3L, 1_000L, 1, "20240102", INSERT));
+        commitWriteResult(tablePath, tableInfo, writeResult);
         assertMaxSequenceNumber(tablePath, 1L, snapshotSequence ? 2L : null);
+
         FileStoreTable table = (FileStoreTable) paimonCatalog.getTable(toPaimon(tablePath));
         FileIO fileIO = spy(table.fileIO());
-        FileStoreTable uncachedTable = FileStoreTableFactory.create(fileIO, table.location());
-        Catalog catalog = mock(Catalog.class);
-        when(catalog.getTable(toPaimon(tablePath))).thenReturn(uncachedTable);
-        PaimonCatalogProvider provider = mock(PaimonCatalogProvider.class);
-        when(provider.get()).thenReturn(catalog);
-        WriterInitContext context = mock(WriterInitContext.class);
-        when(context.tableInfo()).thenReturn(tableInfo);
-        when(context.tableBucket()).thenReturn(new TableBucket(0, 1L, 0));
-        when(context.bucketCount()).thenReturn(1);
-
         long snapshotId = 1;
-        // The persisted option applies to both historical and normal partition writers.
         for (String partition : Arrays.asList("20240102", "20240101")) {
-            when(context.partition())
-                    .thenReturn(snapshotId == 1 ? HISTORICAL_PARTITION_VALUE : partition);
+            String writerPartition = snapshotId == 1 ? HISTORICAL_PARTITION_VALUE : partition;
             clearInvocations(fileIO);
-            try (PaimonLakeWriter writer = new PaimonLakeWriter(provider, context)) {
-                writer.write(historicalRecord(4L, timestamp + 1_000L, 1, partition, INSERT));
+            try (PaimonLakeWriter writer =
+                    createLakeWriter(tableInfo, table, writerPartition, fileIO)) {
+                writer.write(historicalRecord(4L, 2_000L, 1, partition, INSERT));
                 verify(fileIO, snapshotSequence ? never() : atLeastOnce())
                         .newInputStream(argThat(path -> path.getName().startsWith("manifest-")));
                 writeResult = writer.complete();
@@ -314,8 +312,28 @@ class PaimonTieringTest {
             assertMaxSequenceNumber(
                     tablePath, snapshotId, snapshotSequence ? snapshotId + 1 : null);
         }
+    }
+
+    @ParameterizedTest
+    @MethodSource("historicalWriterOptions")
+    void testHistoricalTieringAfterExternalCompaction(
+            Map<String, String> properties, boolean snapshotSequence) throws Exception {
+        TablePath tablePath = TablePath.of("paimon", "test_historical_external_compaction");
+        TableInfo tableInfo = createHistoricalTable(tablePath, true, properties);
+        commitWriteResult(
+                tablePath,
+                tableInfo,
+                writeHistoricalRecords(
+                        tableInfo,
+                        historicalRecord(0L, 1_000L, 1, "20240101", INSERT),
+                        historicalRecord(1L, 1_000L, 1, "20240102", INSERT)));
+        PaimonWriteResult writeResult =
+                writeHistoricalRecords(
+                        tableInfo, historicalRecord(2L, 1_000L, 1, "20240101", INSERT));
+        commitWriteResult(tablePath, tableInfo, writeResult);
 
         // An external compactor inherits the option without Fluss runtime overrides.
+        FileStoreTable table = (FileStoreTable) paimonCatalog.getTable(toPaimon(tablePath));
         try (TableWriteImpl<?> compactor = table.newWrite("external-compactor");
                 TableCommitImpl commit = table.newCommit("external-compactor")) {
             compactor.compact(
@@ -324,13 +342,13 @@ class PaimonTieringTest {
         }
         Snapshot compactSnapshot = table.snapshotManager().latestSnapshot();
         assertThat(compactSnapshot.commitKind()).isEqualTo(Snapshot.CommitKind.COMPACT);
-        assertMaxSequenceNumber(tablePath, compactSnapshot.id(), snapshotSequence ? 4L : null);
+        assertMaxSequenceNumber(tablePath, compactSnapshot.id(), snapshotSequence ? 1L : null);
 
-        LogRecord updated = historicalRecord(6L, timestamp + 2_000L, 1, "20240102", INSERT);
-        when(context.partition()).thenReturn(HISTORICAL_PARTITION_VALUE);
-        clearInvocations(fileIO);
-        try (PaimonLakeWriter writer = new PaimonLakeWriter(provider, context)) {
-            writer.write(historicalRecord(5L, timestamp + 2_000L, 1, "20240101", DELETE));
+        FileIO fileIO = spy(table.fileIO());
+        LogRecord updated = historicalRecord(4L, 2_000L, 1, "20240102", INSERT);
+        try (PaimonLakeWriter writer =
+                createLakeWriter(tableInfo, table, HISTORICAL_PARTITION_VALUE, fileIO)) {
+            writer.write(historicalRecord(3L, 2_000L, 1, "20240101", DELETE));
             writer.write(updated);
             verify(fileIO, snapshotSequence ? never() : atLeastOnce())
                     .newInputStream(argThat(path -> path.getName().startsWith("manifest-")));
@@ -1180,6 +1198,34 @@ class PaimonTieringTest {
 
         List<Split> splits = readBuilder.newScan().plan().splits();
         return readBuilder.newRead().createReader(splits).toCloseableIterator();
+    }
+
+    private PaimonWriteResult writeHistoricalRecords(TableInfo tableInfo, LogRecord... records)
+            throws Exception {
+        try (LakeWriter<PaimonWriteResult> writer =
+                createLakeWriter(
+                        tableInfo.getTablePath(), 0, HISTORICAL_PARTITION_VALUE, 1L, tableInfo)) {
+            for (LogRecord record : records) {
+                writer.write(record);
+            }
+            return writer.complete();
+        }
+    }
+
+    private PaimonLakeWriter createLakeWriter(
+            TableInfo tableInfo, FileStoreTable table, String partition, FileIO fileIO)
+            throws Exception {
+        FileStoreTable uncachedTable = FileStoreTableFactory.create(fileIO, table.location());
+        Catalog catalog = mock(Catalog.class);
+        when(catalog.getTable(toPaimon(tableInfo.getLakeTablePath()))).thenReturn(uncachedTable);
+        PaimonCatalogProvider provider = mock(PaimonCatalogProvider.class);
+        when(provider.get()).thenReturn(catalog);
+        WriterInitContext context = mock(WriterInitContext.class);
+        when(context.tableInfo()).thenReturn(tableInfo);
+        when(context.tableBucket()).thenReturn(new TableBucket(0, 1L, 0));
+        when(context.bucketCount()).thenReturn(tableInfo.getNumBuckets());
+        when(context.partition()).thenReturn(partition);
+        return new PaimonLakeWriter(provider, context);
     }
 
     private LakeWriter<PaimonWriteResult> createLakeWriter(
