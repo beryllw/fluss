@@ -45,6 +45,7 @@ import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.flink.testutils.logging.LoggerAuditingExtension;
 import org.apache.paimon.CoreOptions;
 import org.apache.paimon.Snapshot;
 import org.apache.paimon.catalog.Catalog;
@@ -52,13 +53,12 @@ import org.apache.paimon.catalog.CatalogContext;
 import org.apache.paimon.catalog.CatalogFactory;
 import org.apache.paimon.catalog.Identifier;
 import org.apache.paimon.data.InternalRow;
-import org.apache.paimon.fs.FileIO;
 import org.apache.paimon.manifest.ManifestCommittable;
+import org.apache.paimon.operation.AbstractFileStoreScan;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.partition.Partition;
 import org.apache.paimon.schema.Schema;
 import org.apache.paimon.table.FileStoreTable;
-import org.apache.paimon.table.FileStoreTableFactory;
 import org.apache.paimon.table.sink.CommitMessageImpl;
 import org.apache.paimon.table.sink.TableCommitImpl;
 import org.apache.paimon.table.sink.TableWriteImpl;
@@ -70,10 +70,12 @@ import org.apache.paimon.utils.CloseableIterator;
 import org.apache.paimon.utils.SnapshotManager;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.slf4j.event.Level;
 
 import javax.annotation.Nullable;
 
@@ -107,17 +109,13 @@ import static org.apache.fluss.utils.PartitionUtils.HISTORICAL_PARTITION_VALUE;
 import static org.apache.paimon.CoreOptions.WRITE_SEQUENCE_NUMBER_INIT_MODE;
 import static org.apache.paimon.table.sink.BatchWriteBuilder.COMMIT_IDENTIFIER;
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mockito.ArgumentMatchers.argThat;
-import static org.mockito.Mockito.atLeastOnce;
-import static org.mockito.Mockito.clearInvocations;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.never;
-import static org.mockito.Mockito.spy;
-import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.when;
 
 /** The UT for tiering to Paimon via {@link PaimonLakeTieringFactory}. */
 class PaimonTieringTest {
+
+    @RegisterExtension
+    final LoggerAuditingExtension scanLogs =
+            new LoggerAuditingExtension(AbstractFileStoreScan.class, Level.INFO);
 
     private @TempDir File tempWarehouseDir;
     private PaimonLakeTieringFactory paimonLakeTieringFactory;
@@ -294,17 +292,14 @@ class PaimonTieringTest {
         commitWriteResult(tablePath, tableInfo, writeResult);
         assertMaxSequenceNumber(tablePath, 1L, snapshotSequence ? 2L : null);
 
-        FileStoreTable table = (FileStoreTable) paimonCatalog.getTable(toPaimon(tablePath));
-        FileIO fileIO = spy(table.fileIO());
         long snapshotId = 1;
         for (String partition : Arrays.asList("20240102", "20240101")) {
             String writerPartition = snapshotId == 1 ? HISTORICAL_PARTITION_VALUE : partition;
-            clearInvocations(fileIO);
-            try (PaimonLakeWriter writer =
-                    createLakeWriter(tableInfo, table, writerPartition, fileIO)) {
+            long scansBefore = scanCount();
+            try (LakeWriter<PaimonWriteResult> writer =
+                    createLakeWriter(tablePath, 0, writerPartition, 1L, tableInfo)) {
                 writer.write(historicalRecord(4L, 2_000L, 1, partition, INSERT));
-                verify(fileIO, snapshotSequence ? never() : atLeastOnce())
-                        .newInputStream(argThat(path -> path.getName().startsWith("manifest-")));
+                assertThat(scanCount() - scansBefore).isEqualTo(snapshotSequence ? 0 : 1);
                 writeResult = writer.complete();
             }
             commitWriteResult(tablePath, tableInfo, writeResult);
@@ -344,14 +339,14 @@ class PaimonTieringTest {
         assertThat(compactSnapshot.commitKind()).isEqualTo(Snapshot.CommitKind.COMPACT);
         assertMaxSequenceNumber(tablePath, compactSnapshot.id(), snapshotSequence ? 1L : null);
 
-        FileIO fileIO = spy(table.fileIO());
+        long scansBefore = scanCount();
         LogRecord updated = historicalRecord(4L, 2_000L, 1, "20240102", INSERT);
-        try (PaimonLakeWriter writer =
-                createLakeWriter(tableInfo, table, HISTORICAL_PARTITION_VALUE, fileIO)) {
+        try (LakeWriter<PaimonWriteResult> writer =
+                createLakeWriter(tablePath, 0, HISTORICAL_PARTITION_VALUE, 1L, tableInfo)) {
             writer.write(historicalRecord(3L, 2_000L, 1, "20240101", DELETE));
+            assertThat(scanCount() - scansBefore).isEqualTo(snapshotSequence ? 0 : 1);
             writer.write(updated);
-            verify(fileIO, snapshotSequence ? never() : atLeastOnce())
-                    .newInputStream(argThat(path -> path.getName().startsWith("manifest-")));
+            assertThat(scanCount() - scansBefore).isEqualTo(snapshotSequence ? 0 : 2);
             writeResult = writer.complete();
         }
         commitWriteResult(tablePath, tableInfo, writeResult);
@@ -1212,20 +1207,10 @@ class PaimonTieringTest {
         }
     }
 
-    private PaimonLakeWriter createLakeWriter(
-            TableInfo tableInfo, FileStoreTable table, String partition, FileIO fileIO)
-            throws Exception {
-        FileStoreTable uncachedTable = FileStoreTableFactory.create(fileIO, table.location());
-        Catalog catalog = mock(Catalog.class);
-        when(catalog.getTable(toPaimon(tableInfo.getLakeTablePath()))).thenReturn(uncachedTable);
-        PaimonCatalogProvider provider = mock(PaimonCatalogProvider.class);
-        when(provider.get()).thenReturn(catalog);
-        WriterInitContext context = mock(WriterInitContext.class);
-        when(context.tableInfo()).thenReturn(tableInfo);
-        when(context.tableBucket()).thenReturn(new TableBucket(0, 1L, 0));
-        when(context.bucketCount()).thenReturn(tableInfo.getNumBuckets());
-        when(context.partition()).thenReturn(partition);
-        return new PaimonLakeWriter(provider, context);
+    private long scanCount() {
+        return scanLogs.getMessages().stream()
+                .filter(message -> message.startsWith("File store scan plan completed"))
+                .count();
     }
 
     private LakeWriter<PaimonWriteResult> createLakeWriter(
