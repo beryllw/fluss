@@ -106,7 +106,7 @@ For primary-key tables with historical partition access enabled and
 `table.datalake.auto-compaction=false` (the default), Fluss defaults
 `write.sequence-number-init-mode` to `snapshot` when creating the Paimon table. This uses the
 snapshot's maximum sequence number to avoid repeated file-metadata scans during write-only
-writer initialization (requires Paimon 2.1 or later). Explicit
+writer initialization (requires Paimon 2.0 or later). Explicit
 `paimon.write.sequence-number-init-mode` settings take precedence; set it to `scan` in
 `CREATE TABLE` or `ALTER TABLE ... SET` to disable this optimization.
 Existing Paimon tables are not changed automatically.

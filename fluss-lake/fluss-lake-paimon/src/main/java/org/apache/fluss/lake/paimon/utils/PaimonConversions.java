@@ -405,7 +405,7 @@ public class PaimonConversions {
                     && !tableConfig.isDataLakeAutoCompaction()) {
                 // Use the snapshot's maximum sequence number to avoid repeated manifest scans
                 // when historical splits write to multiple partitions and buckets.
-                // Use the literal key for compatibility with Paimon 1.4.
+                // Use a literal key because Paimon 1.4 does not define this option.
                 options.set("write.sequence-number-init-mode", "snapshot");
             }
         }
