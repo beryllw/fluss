@@ -1,0 +1,77 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements. See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership. The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+replicaCount: 1
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  registry: ""
+  repository: apache/fluss-gateway
+  # Defaults to Chart.appVersion. Override repository/tag for a development image.
+  tag: ""
+  pullPolicy: IfNotPresent
+  # Existing registry Secret names, using the same format as the Fluss chart.
+  pullSecrets: []
+  # pullSecrets: [my-registry-secret]
+
+# Must use client-listener addresses reachable from Gateway pods. The existing
+# Fluss server chart exposes its client listener on port 9124 by default.
+clusters:
+  default:
+    bootstrapServers: coordinator-server-hs:9124
+    securityProtocol: plaintext
+    sasl:
+      # For securityProtocol: sasl, reference a Secret in this namespace.
+      existingSecret: {}
+      # existingSecret:
+      #   name: fluss-gateway-backend
+      #   usernameKey: username
+      #   passwordKey: password
+
+server:
+  restPort: 8080
+  requestTimeout: 30s
+  shutdownDrainTimeoutSeconds: 30
+
+# Includes a five-second preStop delay for Service endpoint propagation.
+# Must be greater than server.shutdownDrainTimeoutSeconds + 5.
+terminationGracePeriodSeconds: 45
+
+service:
+  type: ClusterIP
+  port: 8080
+  annotations: {}
+
+metrics:
+  enabled: true
+  port: 9095
+  service:
+    labels: {}
+    annotations: {}
+
+# Additional flat gateway.yaml options, such as request admission limits.
+# Listeners, shutdown, and gateway.cluster.* options are managed above.
+# Credentials should be supplied through existing Secrets instead of values.
+configurationOverrides: {}
+
+resources: {}
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
