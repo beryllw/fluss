@@ -21,21 +21,19 @@ fullnameOverride: ""
 image:
   registry: ""
   repository: apache/fluss-gateway
-  # Defaults to Chart.appVersion. Override repository/tag for a development image.
+  # Defaults to Chart.appVersion.
   tag: ""
   pullPolicy: IfNotPresent
-  # Existing registry Secret names, using the same format as the Fluss chart.
   pullSecrets: []
   # pullSecrets: [my-registry-secret]
 
-# Must use client-listener addresses reachable from Gateway pods. The existing
-# Fluss server chart exposes its client listener on port 9124 by default.
+# Use Fluss client listeners reachable from Gateway pods.
 clusters:
   default:
     bootstrapServers: coordinator-server-hs:9124
     securityProtocol: plaintext
     sasl:
-      # For securityProtocol: sasl, reference a Secret in this namespace.
+      # Required for securityProtocol: sasl; the Secret must be in this namespace.
       existingSecret: {}
       # existingSecret:
       #   name: fluss-gateway-backend
@@ -47,8 +45,7 @@ server:
   requestTimeout: 30s
   shutdownDrainTimeoutSeconds: 30
 
-# Includes a five-second preStop delay for Service endpoint propagation.
-# Must be greater than server.shutdownDrainTimeoutSeconds + 5.
+# Must exceed server.shutdownDrainTimeoutSeconds + 5 (preStop delay).
 terminationGracePeriodSeconds: 45
 
 service:
@@ -63,9 +60,8 @@ metrics:
     labels: {}
     annotations: {}
 
-# Additional flat gateway.yaml options, such as request admission limits.
-# Listeners, shutdown, and gateway.cluster.* options are managed above.
-# Credentials should be supplied through existing Secrets instead of values.
+# Additional flat Gateway options; chart-managed settings cannot be overridden.
+# Supply credentials through existing Secrets.
 configurationOverrides: {}
 
 resources: {}

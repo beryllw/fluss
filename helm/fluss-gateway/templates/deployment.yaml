@@ -64,8 +64,7 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args: ["--config", "/opt/fluss/conf/gateway.yaml"]
           env:
-            # The image also defines these variables. Override them explicitly
-            # so changing a chart port cannot leave the image default in effect.
+            # Image ENV defaults override the config file; keep listener overrides in sync.
             - name: FLUSS_GATEWAY__REST__LISTEN
               value: {{ printf "0.0.0.0:%v" .Values.server.restPort | quote }}
             - name: FLUSS_GATEWAY__METRICS__EXPORTER__PROMETHEUS__LISTEN

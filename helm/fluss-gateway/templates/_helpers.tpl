@@ -46,7 +46,6 @@ app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 app.kubernetes.io/managed-by: {{ .Release.Service | quote }}
 {{- end -}}
 
-{{/* Image registry, repository, and tag follow the Fluss chart conventions. */}}
 {{- define "fluss-gateway.image" -}}
 {{- $repository := .Values.image.repository -}}
 {{- if .Values.image.registry -}}

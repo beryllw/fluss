@@ -64,8 +64,7 @@ mkdir -p ${HELM_RELEASE_DIR}
 
 cd ${HELM_RELEASE_DIR}
 
-# Package both charts with the release version, independently of the versions
-# in the source checkout (e.g. when preparing a release candidate).
+# Package both charts with the requested release version.
 for chart_name in fluss fluss-gateway; do
     helm package "${FLUSS_DIR}/helm/${chart_name}" \
         --version "${RELEASE_VERSION}" --app-version "${RELEASE_VERSION}"

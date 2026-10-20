@@ -19,32 +19,38 @@ templates:
   - templates/deployment.yaml
   - templates/configmap.yaml
 tests:
-  - it: injects credentials through existing Secrets without writing them to configuration
+  - it: uses default Secret keys without copying credentials into configuration
     set:
-      clusters.default.securityProtocol: sasl
-      clusters.default.sasl.existingSecret.name: gateway-backend
+      clusters:
+        default: null
+        warehouse:
+          bootstrapServers: warehouse.example.com:9124
+          securityProtocol: sasl
+          sasl:
+            existingSecret:
+              name: warehouse-account
     asserts:
       - contains:
           path: spec.template.spec.containers[0].env
           content:
-            name: FLUSS_GATEWAY__CLUSTER__DEFAULT__CONNECTION__SERVICE__ACCOUNT
+            name: FLUSS_GATEWAY__CLUSTER__WAREHOUSE__CONNECTION__SERVICE__ACCOUNT
             valueFrom:
               secretKeyRef:
-                name: gateway-backend
+                name: warehouse-account
                 key: username
         template: templates/deployment.yaml
       - contains:
           path: spec.template.spec.containers[0].env
           content:
-            name: FLUSS_GATEWAY__CLUSTER__DEFAULT__CONNECTION__SERVICE__SECRET
+            name: FLUSS_GATEWAY__CLUSTER__WAREHOUSE__CONNECTION__SERVICE__SECRET
             valueFrom:
               secretKeyRef:
-                name: gateway-backend
+                name: warehouse-account
                 key: password
         template: templates/deployment.yaml
       - matchRegex:
           path: data["gateway.yaml"]
-          pattern: 'gateway\.cluster\.default\.connection\.security\.protocol: "sasl"'
+          pattern: 'gateway\.cluster\.warehouse\.connection\.security\.protocol: "sasl"'
         template: templates/configmap.yaml
       - notMatchRegex:
           path: data["gateway.yaml"]
@@ -73,26 +79,14 @@ tests:
                 name: prod-account
                 key: credential
         template: templates/deployment.yaml
-
-  - it: defaults Secret keys for a newly added cluster
-    set:
-      clusters:
-        default: null
-        warehouse:
-          bootstrapServers: warehouse.example.com:9124
-          securityProtocol: sasl
-          sasl:
-            existingSecret:
-              name: warehouse-account
-    asserts:
       - contains:
           path: spec.template.spec.containers[0].env
           content:
-            name: FLUSS_GATEWAY__CLUSTER__WAREHOUSE__CONNECTION__SERVICE__ACCOUNT
+            name: FLUSS_GATEWAY__CLUSTER__PROD_EU__CONNECTION__SERVICE__ACCOUNT
             valueFrom:
               secretKeyRef:
-                name: warehouse-account
-                key: username
+                name: prod-account
+                key: account
         template: templates/deployment.yaml
 
   - it: fails when a SASL cluster has no Secret reference
