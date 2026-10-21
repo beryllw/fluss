@@ -24,12 +24,14 @@ import org.apache.fluss.client.tiering.TieringSplit;
 import org.apache.fluss.client.tiering.TieringSplitGenerator;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.flink.tiering.TestingLakeTieringFactory;
+import org.apache.fluss.flink.tiering.source.metrics.TieringMetrics;
 import org.apache.fluss.flink.tiering.source.split.FlinkTieringSplit;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.metrics.MetricNames;
 import org.apache.fluss.rpc.RpcClient;
 import org.apache.fluss.rpc.gateway.CoordinatorGateway;
 import org.apache.fluss.rpc.messages.LakeTieringHeartbeatRequest;
@@ -37,6 +39,9 @@ import org.apache.fluss.rpc.messages.LakeTieringHeartbeatResponse;
 import org.apache.fluss.testutils.common.ManuallyTriggeredScheduledExecutorService;
 import org.apache.fluss.types.DataTypes;
 
+import org.apache.flink.metrics.groups.SplitEnumeratorMetricGroup;
+import org.apache.flink.metrics.testutils.MetricListener;
+import org.apache.flink.runtime.metrics.groups.InternalSplitEnumeratorMetricGroup;
 import org.apache.flink.util.FlinkRuntimeException;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -68,6 +73,7 @@ class TieringSourceEnumeratorSchedulingTest {
     @Test
     void testPendingSplitsAssignedInOrder() throws Exception {
         try (Fixture fixture = new Fixture()) {
+            assertThat(fixture.readersAwaitingSplitRatio()).isEqualTo(1.0);
             List<FlinkTieringSplit> splits = new ArrayList<>();
             for (int bucket = 0; bucket < 4; bucket++) {
                 splits.add(
@@ -92,11 +98,13 @@ class TieringSourceEnumeratorSchedulingTest {
                             .collect(Collectors.toList());
             assertThat(assignedSplits).containsExactlyElementsOf(splits);
             assertThat(fixture.claims()).isEmpty();
+            assertThat(fixture.readersAwaitingSplitRatio()).isZero();
 
             // Once drained, another request polls for a new table without reassigning old splits.
             fixture.requestTable();
             assertThat(fixture.claims()).hasSize(1);
             assertThat(fixture.context.getSplitsAssignmentSequence()).hasSize(splits.size());
+            assertThat(fixture.readersAwaitingSplitRatio()).isEqualTo(1.0);
         }
     }
 
@@ -185,6 +193,7 @@ class TieringSourceEnumeratorSchedulingTest {
                     .thenThrow(new IOException("metadata unavailable"));
 
             fixture.requestTable();
+            assertThat(fixture.readersAwaitingSplitRatio()).isEqualTo(1.0);
 
             // Failures must not drive immediate retries of a table re-queued by the coordinator.
             assertThat(fixture.timer.getActiveNonPeriodicScheduledTask()).isEmpty();
@@ -202,12 +211,15 @@ class TieringSourceEnumeratorSchedulingTest {
     @Test
     void testFailOverPreventsContinuationClaim() throws Throwable {
         try (Fixture fixture = new Fixture(2)) {
+            assertThat(fixture.readersAwaitingSplitRatio()).isEqualTo(0.5);
             fixture.registerReader(1, 0);
+            assertThat(fixture.readersAwaitingSplitRatio()).isEqualTo(1.0);
             fixture.addTable(1, true);
             fixture.requestTable();
 
             // Reader 0 restarts while reader 1 is still on attempt 0, so failover is in progress.
             fixture.registerReader(0, 1);
+            assertThat(fixture.readersAwaitingSplitRatio()).isEqualTo(1.0);
 
             // The failover guard must leave the next table to the periodic poll.
             fixture.fireContinuation();
@@ -299,11 +311,13 @@ class TieringSourceEnumeratorSchedulingTest {
         }
     }
 
-    @Test
-    void testCloseReleasesResourcesWhenHeartbeatFails() throws Exception {
+    @ParameterizedTest(name = "heartbeatFails={0}")
+    @ValueSource(booleans = {false, true})
+    void testCloseReleasesResources(boolean heartbeatFails) throws Exception {
         try (Fixture fixture = new Fixture()) {
             fixture.addTable(1, true);
             fixture.requestTable();
+            assertThat(fixture.readersAwaitingSplitRatio()).isEqualTo(1.0);
             RpcClient rpcClient = mock(RpcClient.class);
             Connection connection = mock(Connection.class);
             Field rpcClientField = TieringSourceEnumerator.class.getDeclaredField("rpcClient");
@@ -312,14 +326,19 @@ class TieringSourceEnumeratorSchedulingTest {
             Field connectionField = TieringSourceEnumerator.class.getDeclaredField("connection");
             connectionField.setAccessible(true);
             connectionField.set(fixture.enumerator, connection);
-            IOException failure = new IOException("coordinator unavailable");
-            CompletableFuture<LakeTieringHeartbeatResponse> response = new CompletableFuture<>();
-            response.completeExceptionally(failure);
-            fixture.respondWith(response);
+            if (heartbeatFails) {
+                IOException failure = new IOException("coordinator unavailable");
+                CompletableFuture<LakeTieringHeartbeatResponse> response =
+                        new CompletableFuture<>();
+                response.completeExceptionally(failure);
+                fixture.respondWith(response);
 
-            assertThatThrownBy(fixture::closeEnumerator)
-                    .isInstanceOf(FlinkRuntimeException.class)
-                    .hasRootCause(failure);
+                assertThatThrownBy(fixture::closeEnumerator)
+                        .isInstanceOf(FlinkRuntimeException.class)
+                        .hasRootCause(failure);
+            } else {
+                fixture.closeEnumerator();
+            }
 
             // A repeated close is a no-op: no further heartbeat, and the resources are released
             // once (the verifications below use the default times(1)).
@@ -329,6 +348,13 @@ class TieringSourceEnumeratorSchedulingTest {
             verify(rpcClient).close();
             verify(fixture.admin).close();
             verify(connection).close();
+
+            // Recovery reuses the parent metric group, but must report the new enumerator's state.
+            try (Fixture restored = new Fixture(1, fixture.context.metricListener)) {
+                restored.addTable(2, false);
+                restored.requestTable();
+                assertThat(restored.readersAwaitingSplitRatio()).isZero();
+            }
         }
     }
 
@@ -353,7 +379,11 @@ class TieringSourceEnumeratorSchedulingTest {
         }
 
         private Fixture(int parallelism) {
-            this.context = new TestingContext(parallelism);
+            this(parallelism, new MetricListener());
+        }
+
+        private Fixture(int parallelism, MetricListener metricListener) {
+            this.context = new TestingContext(parallelism, metricListener);
             when(gateway.lakeTieringHeartbeat(any()))
                     .thenAnswer(invocation -> respondToHeartbeat(invocation.getArgument(0)));
             enumerator =
@@ -371,6 +401,17 @@ class TieringSourceEnumeratorSchedulingTest {
         private void registerReader(int subtaskId, int attemptNumber) {
             context.registerSourceReader(subtaskId, attemptNumber, "localhost-" + subtaskId);
             enumerator.addReader(subtaskId);
+        }
+
+        private double readersAwaitingSplitRatio() {
+            return context.metricListener
+                    .<Double>getGauge(
+                            "enumerator",
+                            TieringMetrics.FLUSS_METRIC_GROUP,
+                            TieringMetrics.TIERING_SERVICE_GROUP,
+                            MetricNames.TIERING_SERVICE_READERS_AWAITING_SPLIT_RATIO)
+                    .get()
+                    .getValue();
         }
 
         private CompletableFuture<LakeTieringHeartbeatResponse> respondToHeartbeat(
@@ -470,9 +511,16 @@ class TieringSourceEnumeratorSchedulingTest {
 
     private static class TestingContext extends FlussMockSplitEnumeratorContext<FlinkTieringSplit> {
         private final Queue<Runnable> coordinatorCalls = new ArrayDeque<>();
+        private final MetricListener metricListener;
 
-        private TestingContext(int parallelism) {
+        private TestingContext(int parallelism, MetricListener metricListener) {
             super(parallelism);
+            this.metricListener = metricListener;
+        }
+
+        @Override
+        public SplitEnumeratorMetricGroup metricGroup() {
+            return new InternalSplitEnumeratorMetricGroup(metricListener.getMetricGroup());
         }
 
         @Override

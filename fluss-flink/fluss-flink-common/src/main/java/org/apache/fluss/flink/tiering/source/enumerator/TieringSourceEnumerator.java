@@ -31,6 +31,7 @@ import org.apache.fluss.flink.metrics.FlinkMetricRegistry;
 import org.apache.fluss.flink.tiering.event.FailedTieringEvent;
 import org.apache.fluss.flink.tiering.event.FinishedTieringEvent;
 import org.apache.fluss.flink.tiering.event.TieringReachMaxDurationEvent;
+import org.apache.fluss.flink.tiering.source.metrics.TieringMetrics;
 import org.apache.fluss.flink.tiering.source.split.FlinkTieringSplit;
 import org.apache.fluss.flink.tiering.source.state.TieringSourceEnumeratorState;
 import org.apache.fluss.lake.committer.TieringStats;
@@ -114,6 +115,7 @@ public class TieringSourceEnumerator
     private final LakeTieringFactory<?, ?> lakeTieringFactory;
     private final ScheduledExecutorService timerService;
     private final SplitEnumeratorMetricGroup enumeratorMetricGroup;
+    private final AutoCloseable tieringMetrics;
     private final long pollTieringTableIntervalMs;
     // Also inspected by asynchronous heartbeat requests.
     private final Deque<TieringSplit> pendingSplits;
@@ -189,6 +191,10 @@ public class TieringSourceEnumerator
         this.finishedTables = new ConcurrentHashMap<>();
         this.failedTableEpochs = new ConcurrentHashMap<>();
         this.tieringReachMaxDurationsTables = Collections.synchronizedSet(new TreeSet<>());
+        this.tieringMetrics =
+                TieringMetrics.registerReadersAwaitingSplitRatio(
+                        enumeratorMetricGroup,
+                        () -> (double) readersAwaitingSplit.size() / context.currentParallelism());
     }
 
     @Override
@@ -650,6 +656,7 @@ public class TieringSourceEnumerator
                 }
             }
         } finally {
+            IOUtils.closeQuietly(tieringMetrics, "tiering metrics");
             IOUtils.closeQuietly(rpcClient, "tiering RPC client");
             IOUtils.closeQuietly(flussAdmin, "Fluss admin client");
             IOUtils.closeQuietly(connection, "Fluss connection");
