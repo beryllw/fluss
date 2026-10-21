@@ -191,14 +191,22 @@ REST 写入语义是 **at-least-once**：
 
 ## Internal docs / 内部设计文档
 
-User-facing usage lives in this `README.md`. For internal design and implementation details, see:
+User-facing usage lives in this `README.md`. The normative design is now organized as FIPs under `design/fip/`:
 
-面向用户的说明以本 `README.md` 为准。内部设计与实现约束见：
+面向用户的说明以本 `README.md` 为准。当前规范性设计已整理为 `design/fip/` 下的 FIP：
 
-- [`DESIGN.md`](./DESIGN.md) — design overview / 设计总览
-- [`design/core-session.md`](./design/core-session.md) — core contract, session, operation
-- [`design/sql-path.md`](./design/sql-path.md) — SQL environment and PostgreSQL path
-- [`design/direct-path.md`](./design/direct-path.md) — direct path and REST API design
+- [`DESIGN.md`](./DESIGN.md) — design entry / 设计入口
+- [`design/fip/0001-gateway-framework.md`](./design/fip/0001-gateway-framework.md) — gateway framework / 总体框架
+- [`design/fip/0002-sql-path.md`](./design/fip/0002-sql-path.md) — SQL path / SQL 路径
+- [`design/fip/0003-rest-path.md`](./design/fip/0003-rest-path.md) — REST / direct path / REST 与 direct 路径
+
+Supporting design notes remain available for implementation details and cross-repo contracts:
+
+补充性的实现细化与跨仓契约文档仍保留：
+
+- [`design/core-session.md`](./design/core-session.md) — legacy split note for core/session details / 旧的 core-session 拆分稿
+- [`design/sql-path.md`](./design/sql-path.md) — legacy split note for SQL details / 旧的 SQL 路径拆分稿
+- [`design/direct-path.md`](./design/direct-path.md) — legacy split note for direct-path details / 旧的 direct-path 拆分稿
 - [`design/infra.md`](./design/infra.md) — backend, connection, auth, module layout
 - [`design/datafusion-contract.md`](./design/datafusion-contract.md) — gateway ↔ fluss-datafusion contract
 
