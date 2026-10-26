@@ -182,21 +182,29 @@ public final class NettyClient implements RpcClient {
 
     private ServerConnection getOrCreateConnection(ServerNode node) {
         String serverId = node.uid();
-        return connections.computeIfAbsent(
-                serverId,
-                ignored -> {
-                    LOG.debug("Creating connection to server {}.", node);
-                    return new ServerConnection(
-                            bootstrap,
-                            node,
-                            clientMetricGroup,
-                            authenticatorSupplier.get(),
-                            (con, ignore) -> connections.remove(serverId, con));
-                });
+        ServerConnection connection =
+                connections.computeIfAbsent(
+                        serverId,
+                        ignored -> {
+                            LOG.debug("Creating connection to server {}.", node);
+                            return new ServerConnection(
+                                    node,
+                                    clientMetricGroup,
+                                    authenticatorSupplier.get(),
+                                    (con, ignore) -> connections.remove(serverId, con));
+                        });
+        // A connection can fail synchronously, so register it before starting to connect.
+        connection.connect(bootstrap);
+        return connection;
     }
 
     @VisibleForTesting
     Map<String, ServerConnection> connections() {
         return connections;
+    }
+
+    @VisibleForTesting
+    Bootstrap bootstrap() {
+        return bootstrap;
     }
 }
