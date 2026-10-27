@@ -42,6 +42,7 @@ import org.apache.fluss.rpc.netty.server.NettyServer;
 import org.apache.fluss.rpc.netty.server.RequestsMetrics;
 import org.apache.fluss.rpc.protocol.ApiKeys;
 import org.apache.fluss.shaded.netty4.io.netty.channel.EventLoop;
+import org.apache.fluss.shaded.netty4.io.netty.channel.EventLoopGroup;
 import org.apache.fluss.shaded.netty4.io.netty.resolver.AbstractAddressResolver;
 import org.apache.fluss.shaded.netty4.io.netty.resolver.AddressResolver;
 import org.apache.fluss.shaded.netty4.io.netty.resolver.AddressResolverGroup;
@@ -53,6 +54,8 @@ import org.apache.fluss.utils.concurrent.FutureUtils;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.net.ConnectException;
 import java.net.InetSocketAddress;
@@ -635,14 +638,21 @@ final class NettyClientTest {
         retry(Duration.ofSeconds(10), () -> assertThat(nettyClient.connections()).isEmpty());
     }
 
-    @Test
-    void testReconnectAfterImmediateResolutionFailureOnEventLoop() throws Exception {
+    @ParameterizedTest
+    @ValueSource(ints = {1, 4})
+    void testReconnectAfterImmediateResolutionFailureOnEventLoop(int networkThreads)
+            throws Exception {
+        nettyClient.close();
+        conf.setInt(ConfigOptions.NETTY_CLIENT_NUM_NETWORK_THREADS, networkThreads);
+        nettyClient = new NettyClient(conf, TestingClientMetricGroup.newInstance());
         InetSocketAddress resolvedAddress =
                 new InetSocketAddress(serverNode.host(), serverNode.port());
         try (TestingAddressResolverGroup resolver =
                 new TestingAddressResolverGroup(resolvedAddress)) {
             nettyClient.bootstrap().resolver(resolver);
-            EventLoop eventLoop = nettyClient.bootstrap().config().group().next();
+            EventLoopGroup eventLoopGroup = nettyClient.bootstrap().config().group();
+            // Preserve the chooser so connect() selects the caller's loop and fails synchronously.
+            EventLoop eventLoop = (EventLoop) eventLoopGroup.iterator().next();
             ApiVersionsRequest request =
                     new ApiVersionsRequest()
                             .setClientSoftwareName("testing_client")
@@ -658,7 +668,7 @@ final class NettyClientTest {
             assertThatThrownBy(failedRequest::get)
                     .rootCause()
                     .isInstanceOfAny(UnknownHostException.class, DisconnectException.class);
-            eventLoop.submit(() -> assertThat(nettyClient.connections()).isEmpty()).get();
+            retry(Duration.ofSeconds(10), () -> assertThat(nettyClient.connections()).isEmpty());
 
             resolver.failResolution = false;
             CompletableFuture<ApiMessage> recoveredRequest =
