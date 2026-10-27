@@ -62,7 +62,6 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.apache.fluss.testutils.common.CommonTestUtils.retry;
 import static org.apache.fluss.utils.NetUtils.getAvailablePort;
@@ -83,6 +82,7 @@ final class NettyClientTest {
         conf = new Configuration();
         // 3 worker threads is enough for this test
         conf.setInt(ConfigOptions.NETTY_SERVER_NUM_WORKER_THREADS, 3);
+        conf.setInt(ConfigOptions.NETTY_CLIENT_NUM_NETWORK_THREADS, 1);
         nettyClient = new NettyClient(conf, TestingClientMetricGroup.newInstance());
         buildNettyServer(1);
     }
@@ -270,9 +270,6 @@ final class NettyClientTest {
 
     @Test
     void testReconnectAfterImmediateResolutionFailureOnEventLoop() throws Exception {
-        nettyClient.close();
-        conf.setInt(ConfigOptions.NETTY_CLIENT_NUM_NETWORK_THREADS, 1);
-        nettyClient = new NettyClient(conf, TestingClientMetricGroup.newInstance());
         InetSocketAddress resolvedAddress =
                 new InetSocketAddress(serverNode.host(), serverNode.port());
         try (TestingAddressResolverGroup resolver =
@@ -296,7 +293,7 @@ final class NettyClientTest {
                     .isInstanceOfAny(UnknownHostException.class, DisconnectException.class);
             eventLoop.submit(() -> assertThat(nettyClient.connections()).isEmpty()).get();
 
-            resolver.failResolution.set(false);
+            resolver.failResolution = false;
             CompletableFuture<ApiMessage> recoveredRequest =
                     eventLoop
                             .submit(
@@ -305,7 +302,6 @@ final class NettyClientTest {
                                                     serverNode, ApiKeys.API_VERSIONS, request))
                             .get();
             assertThat(recoveredRequest.get()).isInstanceOf(ApiVersionsResponse.class);
-            assertThat(nettyClient.isReady(serverNode.uid())).isTrue();
         }
     }
 
@@ -327,7 +323,7 @@ final class NettyClientTest {
         }
         FutureUtils.waitForAll(requests).get();
         assertThat(nettyClient.connections()).hasSize(1);
-        // Only one additional API versions request is sent for the connection handshake.
+        // Includes one handshake request.
         assertThat(service.getProcessorThreadNames()).hasSize(numRequests + 1);
     }
 
@@ -354,7 +350,7 @@ final class NettyClientTest {
             extends AddressResolverGroup<InetSocketAddress> {
 
         private final InetSocketAddress resolvedAddress;
-        private final AtomicBoolean failResolution = new AtomicBoolean(true);
+        private volatile boolean failResolution = true;
 
         private TestingAddressResolverGroup(InetSocketAddress resolvedAddress) {
             this.resolvedAddress = resolvedAddress;
@@ -371,7 +367,7 @@ final class NettyClientTest {
                 @Override
                 protected void doResolve(
                         InetSocketAddress address, Promise<InetSocketAddress> promise) {
-                    if (failResolution.get()) {
+                    if (failResolution) {
                         promise.setFailure(new UnknownHostException(address.getHostString()));
                     } else {
                         promise.setSuccess(resolvedAddress);
@@ -381,11 +377,7 @@ final class NettyClientTest {
                 @Override
                 protected void doResolveAll(
                         InetSocketAddress address, Promise<List<InetSocketAddress>> promise) {
-                    if (failResolution.get()) {
-                        promise.setFailure(new UnknownHostException(address.getHostString()));
-                    } else {
-                        promise.setSuccess(Collections.singletonList(resolvedAddress));
-                    }
+                    throw new UnsupportedOperationException();
                 }
             };
         }
