@@ -227,7 +227,7 @@ public final class NettyClient implements RpcClient {
                                     authenticatorSupplier.get(),
                                     (con, ignore) -> connections.remove(connectionKey, con));
                         });
-        // A connection can fail synchronously, so register it before starting to connect.
+        // Register first: connection failure callbacks may run synchronously.
         connection.connect(bootstrap);
         return connection;
     }

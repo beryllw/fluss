@@ -112,17 +112,6 @@ final class ServerConnection {
     @GuardedBy("lock")
     private int retryAuthCount = 0;
 
-    @VisibleForTesting
-    ServerConnection(
-            Bootstrap bootstrap,
-            ServerNode node,
-            ClientMetricGroup clientMetricGroup,
-            ClientAuthenticator authenticator,
-            BiConsumer<ServerConnection, Throwable> closeCallback) {
-        this(node, clientMetricGroup, authenticator, closeCallback);
-        connect(bootstrap);
-    }
-
     ServerConnection(
             ServerNode node,
             ClientMetricGroup clientMetricGroup,
@@ -138,7 +127,6 @@ final class ServerConnection {
         whenClose(closeCallback);
     }
 
-    /** Starts connecting once, after this connection has been registered in the client. */
     void connect(Bootstrap bootstrap) {
         synchronized (lock) {
             if (connectStarted || state.isDisconnected()) {
