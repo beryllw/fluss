@@ -24,6 +24,7 @@ import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.DisconnectException;
 import org.apache.fluss.metrics.groups.MetricGroup;
+import org.apache.fluss.metrics.registry.NOPMetricRegistry;
 import org.apache.fluss.metrics.util.NOPMetricsGroup;
 import org.apache.fluss.rpc.TestingGatewayService;
 import org.apache.fluss.rpc.messages.ApiMessage;
@@ -32,6 +33,8 @@ import org.apache.fluss.rpc.messages.ApiVersionsResponse;
 import org.apache.fluss.rpc.messages.GetTableInfoRequest;
 import org.apache.fluss.rpc.messages.LookupRequest;
 import org.apache.fluss.rpc.messages.PbLookupReqForBucket;
+import org.apache.fluss.rpc.metrics.ClientMetricGroup;
+import org.apache.fluss.rpc.metrics.ConnectionMetrics;
 import org.apache.fluss.rpc.metrics.TestingClientMetricGroup;
 import org.apache.fluss.rpc.netty.NettyUtils;
 import org.apache.fluss.rpc.netty.server.NettyServer;
@@ -62,8 +65,11 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.apache.fluss.testutils.common.CommonTestUtils.retry;
+import static org.apache.fluss.utils.IOUtils.closeQuietly;
 import static org.apache.fluss.utils.NetUtils.getAvailablePort;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -160,7 +166,7 @@ final class NettyClientTest {
                         .setClientSoftwareVersion("1.0");
         nettyClient.sendRequest(serverNode, ApiKeys.API_VERSIONS, request).get();
         assertThat(nettyClient.connections().size()).isEqualTo(1);
-        assertThat(nettyClient.connections().get(serverNode.uid()).getServerNode())
+        assertThat(nettyClient.connections().get(serverNode.uid()).get().getServerNode())
                 .isEqualTo(serverNode);
 
         // close the netty server.
@@ -181,7 +187,7 @@ final class NettyClientTest {
         buildNettyServer(1);
         nettyClient.sendRequest(serverNode, ApiKeys.API_VERSIONS, request).get();
         assertThat(nettyClient.connections().size()).isEqualTo(1);
-        assertThat(nettyClient.connections().get(serverNode.uid()).getServerNode())
+        assertThat(nettyClient.connections().get(serverNode.uid()).get().getServerNode())
                 .isEqualTo(serverNode);
     }
 
@@ -284,14 +290,18 @@ final class NettyClientTest {
             CompletableFuture<ApiMessage> failedRequest =
                     eventLoop
                             .submit(
-                                    () ->
-                                            nettyClient.sendRequest(
-                                                    serverNode, ApiKeys.API_VERSIONS, request))
+                                    () -> {
+                                        CompletableFuture<ApiMessage> response =
+                                                nettyClient.sendRequest(
+                                                        serverNode, ApiKeys.API_VERSIONS, request);
+                                        assertThat(response).isCompletedExceptionally();
+                                        assertThat(nettyClient.connections()).isEmpty();
+                                        return response;
+                                    })
                             .get();
             assertThatThrownBy(failedRequest::get)
                     .rootCause()
                     .isInstanceOfAny(UnknownHostException.class, DisconnectException.class);
-            eventLoop.submit(() -> assertThat(nettyClient.connections()).isEmpty()).get();
 
             resolver.failResolution = false;
             CompletableFuture<ApiMessage> recoveredRequest =
@@ -303,6 +313,105 @@ final class NettyClientTest {
                             .get();
             assertThat(recoveredRequest.get()).isInstanceOf(ApiVersionsResponse.class);
         }
+    }
+
+    @Test
+    void testConcurrentRequestsShareConnectionCreation() throws Exception {
+        TestingConnectionMetricGroup metrics = new TestingConnectionMetricGroup();
+        nettyClient.close();
+        nettyClient = new NettyClient(conf, metrics);
+        CompletableFuture<ApiMessage> first =
+                CompletableFuture.supplyAsync(this::sendApiVersionsRequest).thenCompose(f -> f);
+        try {
+            metrics.creationStarted.get(10, TimeUnit.SECONDS);
+            assertThat(nettyClient.connect(serverNode)).isFalse();
+            assertThat(nettyClient.isReady(serverNode.uid())).isFalse();
+            CompletableFuture<ApiMessage> second = sendApiVersionsRequest();
+            assertThat(second).isNotDone();
+            assertThat(metrics.creations.get()).isEqualTo(1);
+
+            metrics.continueCreation.complete(null);
+            assertThat(first.get(10, TimeUnit.SECONDS)).isInstanceOf(ApiVersionsResponse.class);
+            assertThat(second.get(10, TimeUnit.SECONDS)).isInstanceOf(ApiVersionsResponse.class);
+            assertThat(nettyClient.isReady(serverNode.uid())).isTrue();
+        } finally {
+            metrics.continueCreation.complete(null);
+        }
+    }
+
+    @Test
+    void testDisconnectDuringConnectionCreation() throws Exception {
+        TestingConnectionMetricGroup metrics = new TestingConnectionMetricGroup();
+        nettyClient.close();
+        nettyClient = new NettyClient(conf, metrics);
+        CompletableFuture<ApiMessage> request =
+                CompletableFuture.supplyAsync(this::sendApiVersionsRequest).thenCompose(f -> f);
+        try {
+            metrics.creationStarted.get(10, TimeUnit.SECONDS);
+            CompletableFuture<Void> disconnected = nettyClient.disconnect(serverNode.uid());
+            assertThat(disconnected).isNotDone();
+            CompletableFuture<ApiMessage> concurrentRequest = sendApiVersionsRequest();
+            assertThat(concurrentRequest).isNotDone();
+            assertThat(metrics.creations.get()).isEqualTo(1);
+            metrics.continueCreation.complete(null);
+            disconnected.get(10, TimeUnit.SECONDS);
+            assertThatThrownBy(() -> request.get(10, TimeUnit.SECONDS))
+                    .hasRootCauseInstanceOf(DisconnectException.class);
+            assertThatThrownBy(() -> concurrentRequest.get(10, TimeUnit.SECONDS))
+                    .hasRootCauseInstanceOf(DisconnectException.class);
+            assertThat(nettyClient.connections()).isEmpty();
+            assertThat(sendApiVersionsRequest().get(10, TimeUnit.SECONDS))
+                    .isInstanceOf(ApiVersionsResponse.class);
+            assertThat(nettyClient.isReady(serverNode.uid())).isTrue();
+        } finally {
+            metrics.continueCreation.complete(null);
+        }
+    }
+
+    @Test
+    void testCloseDuringConnectionCreation() throws Exception {
+        TestingConnectionMetricGroup metrics = new TestingConnectionMetricGroup();
+        nettyClient.close();
+        nettyClient = new NettyClient(conf, metrics);
+        CompletableFuture<ApiMessage> request =
+                CompletableFuture.supplyAsync(this::sendApiVersionsRequest).thenCompose(f -> f);
+        try {
+            metrics.creationStarted.get(10, TimeUnit.SECONDS);
+            CompletableFuture<Void> closed =
+                    CompletableFuture.runAsync(() -> closeQuietly(nettyClient));
+            retry(Duration.ofSeconds(10), () -> assertThat(nettyClient.connections()).isEmpty());
+            assertThat(closed).isNotDone();
+            metrics.continueCreation.complete(null);
+            closed.get(10, TimeUnit.SECONDS);
+            assertThatThrownBy(() -> request.get(10, TimeUnit.SECONDS))
+                    .isInstanceOf(ExecutionException.class);
+            assertThat(nettyClient.connections()).isEmpty();
+        } finally {
+            metrics.continueCreation.complete(null);
+        }
+    }
+
+    @Test
+    void testConnectionCreationFailure() throws Exception {
+        TestingConnectionMetricGroup metrics = new TestingConnectionMetricGroup();
+        nettyClient.close();
+        nettyClient = new NettyClient(conf, metrics);
+        RuntimeException failure = new RuntimeException("Connection creation failed");
+        metrics.continueCreation.completeExceptionally(failure);
+        assertThatThrownBy(() -> sendApiVersionsRequest().get(10, TimeUnit.SECONDS))
+                .hasRootCause(failure);
+        assertThat(nettyClient.connections()).isEmpty();
+        assertThat(sendApiVersionsRequest().get(10, TimeUnit.SECONDS))
+                .isInstanceOf(ApiVersionsResponse.class);
+    }
+
+    private CompletableFuture<ApiMessage> sendApiVersionsRequest() {
+        return nettyClient.sendRequest(
+                serverNode,
+                ApiKeys.API_VERSIONS,
+                new ApiVersionsRequest()
+                        .setClientSoftwareName("testing_client")
+                        .setClientSoftwareVersion("1.0"));
     }
 
     private void buildNettyServer(int serverId) throws Exception {
@@ -321,6 +430,25 @@ final class NettyClientTest {
                             metricGroup,
                             RequestsMetrics.createCoordinatorServerRequestMetrics(metricGroup));
             nettyServer.start();
+        }
+    }
+
+    private static final class TestingConnectionMetricGroup extends ClientMetricGroup {
+        private final CompletableFuture<Void> creationStarted = new CompletableFuture<>();
+        private final CompletableFuture<Void> continueCreation = new CompletableFuture<>();
+        private final AtomicInteger creations = new AtomicInteger();
+
+        private TestingConnectionMetricGroup() {
+            super(NOPMetricRegistry.INSTANCE, "test");
+        }
+
+        @Override
+        public ConnectionMetrics createConnectionMetricGroup(String serverId) {
+            if (creations.incrementAndGet() == 1) {
+                creationStarted.complete(null);
+                continueCreation.join();
+            }
+            return super.createConnectionMetricGroup(serverId);
         }
     }
 

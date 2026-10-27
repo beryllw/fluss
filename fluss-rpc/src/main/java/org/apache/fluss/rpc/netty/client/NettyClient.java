@@ -21,6 +21,8 @@ import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.cluster.ServerNode;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.exception.DisconnectException;
+import org.apache.fluss.exception.NetworkException;
 import org.apache.fluss.rpc.RpcClient;
 import org.apache.fluss.rpc.messages.ApiMessage;
 import org.apache.fluss.rpc.metrics.ClientMetricGroup;
@@ -33,6 +35,7 @@ import org.apache.fluss.shaded.netty4.io.netty.bootstrap.Bootstrap;
 import org.apache.fluss.shaded.netty4.io.netty.buffer.PooledByteBufAllocator;
 import org.apache.fluss.shaded.netty4.io.netty.channel.ChannelOption;
 import org.apache.fluss.shaded.netty4.io.netty.channel.EventLoopGroup;
+import org.apache.fluss.utils.ExceptionUtils;
 import org.apache.fluss.utils.concurrent.FutureUtils;
 
 import org.slf4j.Logger;
@@ -67,9 +70,9 @@ public final class NettyClient implements RpcClient {
 
     /**
      * Managed connections to Netty servers. The key is the server uid (e.g., "cs-2", "ts-3"), the
-     * value is the connection.
+     * value is the result of creating the connection, which may still be connecting.
      */
-    private final Map<String, ServerConnection> connections;
+    private final Map<String, CompletableFuture<ServerConnection>> connections;
 
     /** Metric groups for client. */
     private final ClientMetricGroup clientMetricGroup;
@@ -116,7 +119,7 @@ public final class NettyClient implements RpcClient {
     @Override
     public boolean connect(ServerNode node) {
         checkArgument(!isClosed, "Netty client is closed.");
-        return getOrCreateConnection(node).isReady();
+        return isReady(getOrCreateConnection(node));
     }
 
     /**
@@ -130,11 +133,26 @@ public final class NettyClient implements RpcClient {
     public CompletableFuture<Void> disconnect(String serverUid) {
         LOG.debug("Disconnecting from server {}.", serverUid);
         checkArgument(!isClosed, "Netty client is closed.");
-        ServerConnection connection = connections.remove(serverUid);
-        if (connection != null) {
-            return connection.close();
+        CompletableFuture<ServerConnection> closing = new CompletableFuture<>();
+        while (true) {
+            CompletableFuture<ServerConnection> connection = connections.get(serverUid);
+            if (connection == null) {
+                return FutureUtils.completedVoidFuture();
+            }
+            // Reserve the slot until construction and cleanup finish before allowing a replacement.
+            if (connections.replace(serverUid, connection, closing)) {
+                return closeConnection(connection)
+                        .whenComplete(
+                                (ignored, error) -> {
+                                    connections.remove(serverUid, closing);
+                                    closing.completeExceptionally(
+                                            new NetworkException(
+                                                    new DisconnectException(
+                                                            "Disconnected from node "
+                                                                    + serverUid)));
+                                });
+            }
         }
-        return FutureUtils.completedVoidFuture();
     }
 
     /**
@@ -146,11 +164,7 @@ public final class NettyClient implements RpcClient {
     @Override
     public boolean isReady(String serverUid) {
         checkArgument(!isClosed, "Netty client is closed.");
-        ServerConnection connection = connections.get(serverUid);
-        if (connection == null) {
-            return false;
-        }
-        return connection.isReady();
+        return isReady(connections.get(serverUid));
     }
 
     /** Send an RPC request to the given server and return a future for the response. */
@@ -158,7 +172,11 @@ public final class NettyClient implements RpcClient {
     public CompletableFuture<ApiMessage> sendRequest(
             ServerNode node, ApiKeys apiKey, ApiMessage request) {
         checkArgument(!isClosed, "Netty client is closed.");
-        return getOrCreateConnection(node).send(apiKey, request);
+        CompletableFuture<ServerConnection> connection = getOrCreateConnection(node);
+        if (connection.isDone() && !connection.isCompletedExceptionally()) {
+            return connection.getNow(null).send(apiKey, request);
+        }
+        return connection.thenCompose(con -> con.send(apiKey, request));
     }
 
     @Override
@@ -166,9 +184,10 @@ public final class NettyClient implements RpcClient {
         try {
             isClosed = true;
             final List<CompletableFuture<Void>> shutdownFutures = new ArrayList<>();
-            for (Map.Entry<String, ServerConnection> conn : connections.entrySet()) {
+            for (Map.Entry<String, CompletableFuture<ServerConnection>> conn :
+                    connections.entrySet()) {
                 if (connections.remove(conn.getKey(), conn.getValue())) {
-                    shutdownFutures.add(conn.getValue().close());
+                    shutdownFutures.add(closeConnection(conn.getValue()));
                 }
             }
             shutdownFutures.add(NettyUtils.shutdownGroup(eventGroup));
@@ -180,25 +199,60 @@ public final class NettyClient implements RpcClient {
         }
     }
 
-    private ServerConnection getOrCreateConnection(ServerNode node) {
+    private CompletableFuture<ServerConnection> getOrCreateConnection(ServerNode node) {
         String serverId = node.uid();
-        return connections.computeIfAbsent(
-                serverId,
-                ignored -> {
-                    LOG.debug("Creating connection to server {}.", node);
-                    return new ServerConnection(
+        CompletableFuture<ServerConnection> existing = connections.get(serverId);
+        if (existing != null) {
+            return existing;
+        }
+
+        CompletableFuture<ServerConnection> connectionFuture = new CompletableFuture<>();
+        existing = connections.putIfAbsent(serverId, connectionFuture);
+        if (existing != null) {
+            return existing;
+        }
+
+        try {
+            checkArgument(!isClosed, "Netty client is closed.");
+            LOG.debug("Creating connection to server {}.", node);
+            ServerConnection connection =
+                    new ServerConnection(
                             bootstrap,
                             node,
                             clientMetricGroup,
                             authenticatorSupplier.get(),
-                            // Avoid recursive map updates when connecting fails synchronously.
-                            (con, ignore) ->
-                                    eventGroup.execute(() -> connections.remove(serverId, con)));
-                });
+                            (con, ignore) -> connections.remove(serverId, connectionFuture));
+            // A disconnect or shutdown may have removed this attempt during construction.
+            if (isClosed || connections.get(serverId) != connectionFuture) {
+                connection.close();
+            }
+            connectionFuture.complete(connection);
+        } catch (Throwable t) {
+            connections.remove(serverId, connectionFuture);
+            connectionFuture.completeExceptionally(t);
+            ExceptionUtils.rethrowIfFatalError(t);
+        }
+        return connectionFuture;
+    }
+
+    private static boolean isReady(CompletableFuture<ServerConnection> connection) {
+        return connection != null
+                && connection.isDone()
+                && !connection.isCompletedExceptionally()
+                && connection.getNow(null).isReady();
+    }
+
+    private static CompletableFuture<Void> closeConnection(
+            CompletableFuture<ServerConnection> connection) {
+        return connection
+                .handle(
+                        (con, error) ->
+                                error == null ? con.close() : FutureUtils.completedVoidFuture())
+                .thenCompose(future -> future);
     }
 
     @VisibleForTesting
-    Map<String, ServerConnection> connections() {
+    Map<String, CompletableFuture<ServerConnection>> connections() {
         return connections;
     }
 
