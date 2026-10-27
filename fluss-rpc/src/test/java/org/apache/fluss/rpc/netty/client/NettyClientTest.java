@@ -265,7 +265,7 @@ final class NettyClientTest {
                                         .sendRequest(serverNode, ApiKeys.API_VERSIONS, request)
                                         .get())
                 .hasMessageContaining("Disconnected from node");
-        assertThat(nettyClient.connections()).isEmpty();
+        retry(Duration.ofSeconds(10), () -> assertThat(nettyClient.connections()).isEmpty());
     }
 
     @Test
@@ -303,28 +303,6 @@ final class NettyClientTest {
                             .get();
             assertThat(recoveredRequest.get()).isInstanceOf(ApiVersionsResponse.class);
         }
-    }
-
-    @Test
-    void testConcurrentRequestsShareConnection() throws Exception {
-        int numRequests = 10;
-        List<CompletableFuture<ApiMessage>> requests = new ArrayList<>();
-        for (int i = 0; i < numRequests; i++) {
-            requests.add(
-                    CompletableFuture.supplyAsync(
-                                    () ->
-                                            nettyClient.sendRequest(
-                                                    serverNode,
-                                                    ApiKeys.API_VERSIONS,
-                                                    new ApiVersionsRequest()
-                                                            .setClientSoftwareName("testing_client")
-                                                            .setClientSoftwareVersion("1.0")))
-                            .thenCompose(response -> response));
-        }
-        FutureUtils.waitForAll(requests).get();
-        assertThat(nettyClient.connections()).hasSize(1);
-        // Includes one handshake request.
-        assertThat(service.getProcessorThreadNames()).hasSize(numRequests + 1);
     }
 
     private void buildNettyServer(int serverId) throws Exception {

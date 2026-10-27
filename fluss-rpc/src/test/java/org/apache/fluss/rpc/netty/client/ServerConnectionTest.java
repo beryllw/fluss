@@ -135,13 +135,13 @@ public class ServerConnectionTest {
     void testConnectionClose() {
         ServerConnection connection =
                 new ServerConnection(
+                        bootstrap,
                         serverNode,
                         TestingClientMetricGroup.newInstance(),
                         clientAuthenticator,
                         (con, ignore) -> {});
         ConnectionState connectionState = connection.getConnectionState();
         assertThat(connectionState).isEqualTo(ConnectionState.CONNECTING);
-        connection.connect(bootstrap);
 
         GetTableSchemaRequest request =
                 new GetTableSchemaRequest()
@@ -168,11 +168,11 @@ public class ServerConnectionTest {
         MockMetricRegistry metricRegistry = new MockMetricRegistry();
         ClientMetricGroup client = new ClientMetricGroup(metricRegistry, "client");
         ServerConnection connection =
-                new ServerConnection(serverNode, client, clientAuthenticator, (con, ignore) -> {});
-        connection.connect(bootstrap);
+                new ServerConnection(
+                        bootstrap, serverNode, client, clientAuthenticator, (con, ignore) -> {});
         ServerConnection connection2 =
-                new ServerConnection(serverNode2, client, clientAuthenticator, (con, ignore) -> {});
-        connection2.connect(bootstrap);
+                new ServerConnection(
+                        bootstrap, serverNode2, client, clientAuthenticator, (con, ignore) -> {});
         LookupRequest request = new LookupRequest().setTableId(1);
         PbLookupReqForBucket pbLookupReqForBucket = request.addBucketsReq();
         pbLookupReqForBucket.setBucketId(1);
@@ -218,11 +218,11 @@ public class ServerConnectionTest {
                 };
         ServerConnection connection =
                 new ServerConnection(
+                        delayedBootstrap,
                         serverNode,
                         TestingClientMetricGroup.newInstance(),
                         clientAuthenticator,
                         (con, ignore) -> {});
-        connection.connect(delayedBootstrap);
         try {
             OutOfMemoryError error = new OutOfMemoryError("Direct buffer memory");
             ApiMessage request = mock(ApiMessage.class);
@@ -268,11 +268,11 @@ public class ServerConnectionTest {
                 };
         ServerConnection connection =
                 new ServerConnection(
+                        mockBootstrap,
                         wrongServerTypeNode,
                         TestingClientMetricGroup.newInstance(),
                         clientAuthenticator,
                         (con, ignore) -> {});
-        connection.connect(mockBootstrap);
 
         // Pending request will be rejected with InvalidServerTypeException which is
         // InvalidRequestException.
@@ -300,11 +300,11 @@ public class ServerConnectionTest {
     void testRejectBucketCountChangeForOldServer() throws Exception {
         ServerConnection connection =
                 new ServerConnection(
+                        bootstrap,
                         serverNode,
                         TestingClientMetricGroup.newInstance(),
                         clientAuthenticator,
                         (con, ignore) -> {});
-        connection.connect(bootstrap);
         try {
             connection.validateVersionCompatibility(
                     ApiKeys.ALTER_TABLE, (short) 0, new AlterTableRequest());
@@ -330,11 +330,11 @@ public class ServerConnectionTest {
 
         ServerConnection connection =
                 new ServerConnection(
+                        bootstrap,
                         serverNode,
                         TestingClientMetricGroup.newInstance(),
                         clientAuthenticator,
                         (con, ignore) -> {});
-        connection.connect(bootstrap);
         try {
             assertThat(connection.send(ApiKeys.PUT_KV, putKvRequest(null)).get())
                     .isInstanceOf(PutKvResponse.class);
