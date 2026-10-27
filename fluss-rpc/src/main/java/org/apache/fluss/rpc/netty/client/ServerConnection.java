@@ -92,9 +92,6 @@ final class ServerConnection {
     private final ArrayDeque<PendingRequest> pendingRequests = new ArrayDeque<>();
 
     @GuardedBy("lock")
-    private boolean connectStarted;
-
-    @GuardedBy("lock")
     private Channel channel;
 
     /** Current request number used to assign unique request IDs. */
@@ -113,6 +110,7 @@ final class ServerConnection {
     private int retryAuthCount = 0;
 
     ServerConnection(
+            Bootstrap bootstrap,
             ServerNode node,
             ClientMetricGroup clientMetricGroup,
             ClientAuthenticator authenticator,
@@ -125,22 +123,12 @@ final class ServerConnection {
         this.authenticator = authenticator;
         this.backoff = new ExponentialBackoff(100L, 2, 5000L, 0.2);
         whenClose(closeCallback);
-    }
 
-    void connect(Bootstrap bootstrap) {
-        synchronized (lock) {
-            if (connectStarted || state.isDisconnected()) {
-                return;
-            }
-            connectStarted = true;
-            try {
-                bootstrap
-                        .connect(node.host(), node.port())
-                        .addListener(future -> establishConnection((ChannelFuture) future));
-            } catch (Exception e) {
-                close(e);
-            }
-        }
+        // connect and handle should be last in case of other variables are nullable and close
+        // callback is not registered when connection established.
+        bootstrap
+                .connect(node.host(), node.port())
+                .addListener(future -> establishConnection((ChannelFuture) future));
     }
 
     public ServerNode getServerNode() {
