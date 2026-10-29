@@ -93,7 +93,6 @@ final class NettyClientTest {
         conf = new Configuration();
         // 3 worker threads is enough for this test
         conf.setInt(ConfigOptions.NETTY_SERVER_NUM_WORKER_THREADS, 3);
-        conf.setInt(ConfigOptions.NETTY_CLIENT_NUM_NETWORK_THREADS, 1);
         clientMetrics = TestingClientMetricGroup.newInstance();
         nettyClient = new NettyClient(conf, clientMetrics);
         buildNettyServer(1);
@@ -664,8 +663,8 @@ final class NettyClientTest {
                                     () ->
                                             nettyClient.sendRequest(
                                                     serverNode, ApiKeys.API_VERSIONS, request))
-                            .get();
-            assertThatThrownBy(failedRequest::get)
+                            .get(10, TimeUnit.SECONDS);
+            assertThatThrownBy(() -> failedRequest.get(10, TimeUnit.SECONDS))
                     .rootCause()
                     .isInstanceOfAny(UnknownHostException.class, DisconnectException.class);
             retry(Duration.ofSeconds(10), () -> assertThat(nettyClient.connections()).isEmpty());
@@ -677,8 +676,9 @@ final class NettyClientTest {
                                     () ->
                                             nettyClient.sendRequest(
                                                     serverNode, ApiKeys.API_VERSIONS, request))
-                            .get();
-            assertThat(recoveredRequest.get()).isInstanceOf(ApiVersionsResponse.class);
+                            .get(10, TimeUnit.SECONDS);
+            assertThat(recoveredRequest.get(10, TimeUnit.SECONDS))
+                    .isInstanceOf(ApiVersionsResponse.class);
         }
     }
 

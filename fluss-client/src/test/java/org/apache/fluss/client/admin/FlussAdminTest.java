@@ -51,18 +51,22 @@ class FlussAdminTest {
 
     private static final ServerNode OLD_COORDINATOR =
             new ServerNode(0, "old-coordinator", 9123, ServerType.COORDINATOR);
-    private static final ServerNode NEW_COORDINATOR =
-            new ServerNode(0, "new-coordinator", 9123, ServerType.COORDINATOR);
 
     @ParameterizedTest
     @CsvSource({
-        "NETWORK_EXCEPTION, true",
-        "NETWORK_EXCEPTION, false",
-        "NOT_COORDINATOR_LEADER_EXCEPTION, true",
-        "NOT_COORDINATOR_LEADER_EXCEPTION, false"
+        "NETWORK_EXCEPTION, true, new-coordinator, 9123",
+        "NETWORK_EXCEPTION, false, new-coordinator, 9123",
+        "NOT_COORDINATOR_LEADER_EXCEPTION, true, new-coordinator, 9123",
+        "NOT_COORDINATOR_LEADER_EXCEPTION, false, new-coordinator, 9123",
+        "NETWORK_EXCEPTION, true, old-coordinator, 9124",
+        "NETWORK_EXCEPTION, false, old-coordinator, 9124",
+        "NOT_COORDINATOR_LEADER_EXCEPTION, true, old-coordinator, 9124",
+        "NOT_COORDINATOR_LEADER_EXCEPTION, false, old-coordinator, 9124"
     })
-    void testDescribeClusterRefreshesAndRetriesOnce(Errors error, boolean retrySucceeds)
-            throws Exception {
+    void testDescribeClusterRefreshesAndRetriesOnce(
+            Errors error, boolean retrySucceeds, String host, int port) throws Exception {
+        ServerNode newCoordinator =
+                new ServerNode(OLD_COORDINATOR.id(), host, port, ServerType.COORDINATOR);
         RuntimeException failure = error.exception("coordinator unavailable");
         AtomicInteger refreshes = new AtomicInteger();
         List<ServerNode> contactedNodes = new ArrayList<>();
@@ -85,7 +89,7 @@ class FlussAdminTest {
                 new MetadataUpdater(client, new Configuration(), Cluster.empty()) {
                     @Override
                     public ServerNode getCoordinatorServer() {
-                        return refreshes.get() == 0 ? OLD_COORDINATOR : NEW_COORDINATOR;
+                        return refreshes.get() == 0 ? OLD_COORDINATOR : newCoordinator;
                     }
 
                     @Override
@@ -96,13 +100,13 @@ class FlussAdminTest {
         try (FlussAdmin admin = new FlussAdmin(client, updater)) {
             if (retrySucceeds) {
                 assertThat(admin.describeCluster().get(10, TimeUnit.SECONDS).getCoordinatorServer())
-                        .contains(NEW_COORDINATOR);
+                        .contains(newCoordinator);
             } else {
                 assertThatThrownBy(() -> admin.describeCluster().get(10, TimeUnit.SECONDS))
                         .rootCause()
                         .isSameAs(failure);
             }
-            assertThat(contactedNodes).containsExactly(OLD_COORDINATOR, NEW_COORDINATOR);
+            assertThat(contactedNodes).containsExactly(OLD_COORDINATOR, newCoordinator);
             assertThat(refreshes).hasValue(1);
         }
     }
