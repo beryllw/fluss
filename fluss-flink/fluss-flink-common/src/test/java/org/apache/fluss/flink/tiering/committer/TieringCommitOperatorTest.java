@@ -20,6 +20,7 @@ package org.apache.fluss.flink.tiering.committer;
 import org.apache.fluss.client.metadata.LakeSnapshot;
 import org.apache.fluss.client.tiering.FlussTableLakeSnapshotCommitter;
 import org.apache.fluss.client.tiering.TableBucketWriteResult;
+import org.apache.fluss.client.tiering.TieringLogSplit;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.LakeTableSnapshotNotExistException;
@@ -369,6 +370,51 @@ class TieringCommitOperatorTest extends FlinkTestBase {
         assertThat(factory.release).isCompleted();
         awaitCommitEvent();
         assertThat(output).hasSize(2);
+    }
+
+    @Test
+    void testRangeReplayAndPartialPrefix() throws Exception {
+        TablePath path = TablePath.of("fluss", "partial_range_commit");
+        long id = createTable(path, DEFAULT_PK_TABLE_DESCRIPTOR);
+        TableBucket bucket = new TableBucket(id, 0);
+        committerOperator.processElement(
+                createTableBucketWriteResultStreamRecord(path, bucket, 0, 10, 1L, 1));
+        verifyLakeSnapshot(path, id, 1, Collections.singletonMap(bucket, 10L));
+        TieringLogSplit prefix = TieringLogSplit.range(path, bucket, null, 10, 20, 10);
+        TieringLogSplit suffix = TieringLogSplit.range(path, bucket, null, 20, 30, 10);
+        StreamRecord<TableBucketWriteResult<TestingWriteResult>> later =
+                new StreamRecord<>(
+                        new TableBucketWriteResult<>(
+                                path,
+                                bucket,
+                                null,
+                                new TestingWriteResult(2),
+                                30,
+                                2,
+                                2,
+                                5,
+                                suffix));
+        committerOperator.processElement(later);
+        committerOperator.processElement(later);
+        committerOperator.processElement(
+                new StreamRecord<>(
+                        new TableBucketWriteResult<>(
+                                path,
+                                bucket,
+                                null,
+                                new TestingWriteResult(1),
+                                15,
+                                1,
+                                2,
+                                5,
+                                prefix)));
+        verifyLakeSnapshot(path, id, 2, Collections.singletonMap(bucket, 15L));
+        assertThat(output.get(1).committable().writeResults()).containsExactly(1);
+
+        committerOperator.processElement(later);
+        committerOperator.processElement(
+                createTableBucketWriteResultStreamRecord(path, bucket, 3, 30, 3L, 1));
+        verifyLakeSnapshot(path, id, 3, Collections.singletonMap(bucket, 30L));
     }
 
     @Test

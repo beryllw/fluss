@@ -50,7 +50,7 @@ public class TieringSplitSerializer implements SimpleVersionedSerializer<FlinkTi
     private static final ThreadLocal<DataOutputSerializer> SERIALIZER_CACHE =
             ThreadLocal.withInitial(() -> new DataOutputSerializer(64));
 
-    private static final int CURRENT_VERSION = VERSION_0;
+    private static final int CURRENT_VERSION = 1;
 
     @Override
     public int getVersion() {
@@ -107,6 +107,7 @@ public class TieringSplitSerializer implements SimpleVersionedSerializer<FlinkTi
             out.writeLong(tieringLogSplit.getStartingOffset());
             // write stopping offset
             out.writeLong(tieringLogSplit.getStoppingOffset());
+            out.writeLong(tieringLogSplit.getBucketStartOffset());
         }
 
         final byte[] result = out.getCopyOfBuffer();
@@ -116,7 +117,7 @@ public class TieringSplitSerializer implements SimpleVersionedSerializer<FlinkTi
 
     @Override
     public FlinkTieringSplit deserialize(int version, byte[] serialized) throws IOException {
-        if (version != VERSION_0) {
+        if (version != VERSION_0 && version != CURRENT_VERSION) {
             throw new IOException("Unknown version " + version);
         }
         final DataInputDeserializer in = new DataInputDeserializer(serialized);
@@ -171,6 +172,7 @@ public class TieringSplitSerializer implements SimpleVersionedSerializer<FlinkTi
             long startingOffset = in.readLong();
             // deserialize starting offset
             long stoppingOffset = in.readLong();
+            long bucketStart = version == VERSION_0 ? -1 : in.readLong();
             tieringSplit =
                     new TieringLogSplit(
                             tablePath,
@@ -181,7 +183,8 @@ public class TieringSplitSerializer implements SimpleVersionedSerializer<FlinkTi
                             numberOfSplits,
                             skipCurrentRound,
                             splitIndex,
-                            tieringRoundTimestamp);
+                            tieringRoundTimestamp,
+                            bucketStart);
         } else {
             throw new IOException("Unknown split kind " + splitKind);
         }

@@ -160,7 +160,7 @@ class TableBucketWriteResultSerializerTest {
     }
 
     @ParameterizedTest
-    @ValueSource(ints = {0, 3})
+    @ValueSource(ints = {0, 4})
     void testDeserializeUnknownVersion(int version) {
         assertThatThrownBy(() -> tableBucketWriteResultSerializer.deserialize(version, new byte[0]))
                 .isInstanceOf(IOException.class)

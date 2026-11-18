@@ -17,8 +17,11 @@
 
 package org.apache.fluss.lake.paimon.tiering;
 
+import org.apache.fluss.client.FlussConnection;
 import org.apache.fluss.client.metadata.LakeSnapshot;
 import org.apache.fluss.client.table.getter.PartitionGetter;
+import org.apache.fluss.client.tiering.TieringSplit;
+import org.apache.fluss.client.tiering.TieringSplitGenerator;
 import org.apache.fluss.config.AutoPartitionTimeUnit;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
@@ -52,8 +55,10 @@ import org.apache.paimon.CoreOptions;
 import org.apache.paimon.Snapshot;
 import org.apache.paimon.catalog.Catalog;
 import org.apache.paimon.catalog.Identifier;
+import org.apache.paimon.io.DataFileMeta;
 import org.apache.paimon.reader.RecordReader;
 import org.apache.paimon.table.FileStoreTable;
+import org.apache.paimon.table.source.DataSplit;
 import org.apache.paimon.utils.CloseableIterator;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -72,10 +77,12 @@ import java.time.LocalTime;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.stream.Stream;
 
 import static org.apache.fluss.flink.source.testutils.FlinkRowAssertionsUtils.collectRowsUntilEndWithTimeout;
@@ -93,7 +100,11 @@ class PaimonTieringITCase extends FlinkPaimonTieringTestBase {
     @RegisterExtension
     public static final FlussClusterExtension FLUSS_CLUSTER_EXTENSION =
             FlussClusterExtension.builder()
-                    .setClusterConf(initConfig())
+                    .setClusterConf(
+                            initConfig()
+                                    .set(
+                                            ConfigOptions.REMOTE_LOG_TASK_INTERVAL_DURATION,
+                                            Duration.ofSeconds(1)))
                     .setNumOfTabletServers(3)
                     .build();
 
@@ -110,6 +121,81 @@ class PaimonTieringITCase extends FlinkPaimonTieringTestBase {
         execEnv.setParallelism(2);
         execEnv.enableCheckpointing(1000);
         paimonCatalog = getPaimonCatalog();
+    }
+
+    @Test
+    void testSegmentAlignedTieringOfOneBucket() throws Exception {
+        TablePath path = TablePath.of(DEFAULT_DB, "parallel_log_ranges");
+        Map<String, String> options = new HashMap<>();
+        options.put(ConfigOptions.TABLE_DATALAKE_TIERING_MAX_SPLITS_PER_BUCKET.key(), "3");
+        options.put(ConfigOptions.TABLE_DATALAKE_TIERING_TARGET_SPLIT_SIZE.key(), "1b");
+        options.put(ConfigOptions.TABLE_DATALAKE_FRESHNESS.key(), "5s");
+        TableBucket bucket =
+                new TableBucket(createLogTable(path, 1, false, options, Collections.emptyMap()), 0);
+        writeRows(path, Collections.singletonList(row(0, "v0")), true);
+        JobClient bootstrap = buildTieringJob(execEnv);
+        try {
+            assertReplicaStatus(bucket, 1);
+        } finally {
+            bootstrap.cancel().get();
+        }
+        getLeaderReplica(bucket).getLogTablet().roll(Optional.empty());
+        writeRows(path, Collections.singletonList(row(1, "v1")), true);
+        getLeaderReplica(bucket).getLogTablet().roll(Optional.empty());
+        writeRows(path, Arrays.asList(row(2, "v2"), row(3, "v3")), true);
+        getLeaderReplica(bucket).getLogTablet().roll(Optional.empty());
+        writeRows(path, Arrays.asList(row(4, "v4"), row(5, "v5"), row(6, "v6")), true);
+        retry(
+                Duration.ofMinutes(2),
+                () ->
+                        assertThat(admin.listRemoteLogManifests(bucket.getTableId(), null).get())
+                                .anyMatch(
+                                        info ->
+                                                info.getTableBucket().equals(bucket)
+                                                        && info.getRemoteLogEndOffset() == 4));
+        List<TieringSplit> splits =
+                new TieringSplitGenerator((FlussConnection) conn, table -> true)
+                        .generateTableSplits(admin.getTableInfo(path).get());
+        assertThat(splits)
+                .extracting(split -> split.asTieringLogSplit().getStartingOffset())
+                .containsExactly(1L, 2L, 4L);
+        assertThat(splits)
+                .extracting(split -> split.asTieringLogSplit().getStoppingOffset())
+                .containsExactly(2L, 4L, 7L);
+        JobClient job = buildTieringJob(execEnv);
+        try {
+            assertReplicaStatus(bucket, 7);
+            writeRows(path, Collections.singletonList(row(7, "v7")), true);
+            assertReplicaStatus(bucket, 8);
+            checkFlussOffsetsInSnapshot(path, Collections.singletonMap(bucket, 8L));
+            FileStoreTable lake =
+                    (FileStoreTable)
+                            paimonCatalog.getTable(
+                                    Identifier.create(path.getDatabaseName(), path.getTableName()));
+            List<DataFileMeta> files = new ArrayList<>();
+            lake.newReadBuilder()
+                    .newScan()
+                    .plan()
+                    .splits()
+                    .forEach(split -> files.addAll(((DataSplit) split).dataFiles()));
+            files.sort(Comparator.comparingLong(DataFileMeta::minSequenceNumber));
+            assertThat(files)
+                    .extracting(DataFileMeta::minSequenceNumber)
+                    .containsExactly(0L, 1L, 2L, 4L, 7L);
+            assertThat(files)
+                    .extracting(DataFileMeta::maxSequenceNumber)
+                    .containsExactly(0L, 1L, 3L, 6L, 7L);
+            List<Integer> actual = new ArrayList<>();
+            try (CloseableIterator<org.apache.paimon.data.InternalRow> reader =
+                    getPaimonRowCloseableIterator(path)) {
+                while (reader.hasNext()) {
+                    actual.add(reader.next().getInt(0));
+                }
+            }
+            assertThat(actual).containsExactly(0, 1, 2, 3, 4, 5, 6, 7);
+        } finally {
+            job.cancel().get();
+        }
     }
 
     @Test

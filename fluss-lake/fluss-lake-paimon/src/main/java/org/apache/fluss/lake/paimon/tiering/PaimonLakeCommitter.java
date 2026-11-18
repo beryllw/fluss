@@ -273,8 +273,11 @@ public class PaimonLakeCommitter
 
     @Override
     public void abort(PaimonCommittable committable) throws IOException {
-        tableCommit = fileStoreTable.newCommit(commitUser);
-        tableCommit.abort(committable.manifestCommittable().fileCommittables());
+        try (TableCommitImpl abortCommit = fileStoreTable.newCommit(commitUser)) {
+            abortCommit.abort(committable.manifestCommittable().fileCommittables());
+        } catch (Exception e) {
+            throw new IOException("Failed to abort Paimon tiering files for " + tablePath, e);
+        }
     }
 
     @Nullable

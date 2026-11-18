@@ -93,8 +93,18 @@ The following `table.datalake.*` options are configured per table when creating 
 |--------|------|---------|-------------|
 | `table.datalake.enabled` | Boolean | false | Enable lakehouse storage for this table |
 | `table.datalake.freshness` | Duration | 3min | Maximum lag between Fluss and lake data |
+| `table.datalake.tiering.max-splits-per-bucket` | Integer | 1 | Upper bound on parallel WAL ranges per bucket per round. Values greater than 1 enable splitting for eligible tables. |
+| `table.datalake.tiering.target-split-size` | Memory size | 128 MiB | Target WAL input bytes per split, estimated over the pending range only. |
 | `table.datalake.auto-compaction` | Boolean | false | Auto-trigger compaction in the data lake |
 | `table.datalake.auto-expire-snapshot` | Boolean | false | Auto-expire snapshots in the data lake |
+
+## Splitting a large bucket
+
+Flink tiering can split incremental WAL reads for fixed-bucket, append-only Paimon tables with writer compaction, row tracking and data evolution disabled. Other tables, historical partitions and the first tiering round use one split per bucket. Tiering groups consecutive remote WAL segments by their estimated pending bytes and assigns the unarchived tail to one split. The committed offset and the round's high watermark bound every split. For an eligible table or partition with pending incremental reads, the planner lists manifest handles once. It opens a bucket's manifest only when the archived range can use more than one split. If the manifest file is unavailable, the archived range stays together. If the handle lookup fails, the bucket keeps its original split.
+
+For example, consider a bucket with six pending archived 64 MiB segments. With a 128 MiB target and a maximum of four splits, it produces three splits of two segments each. With the same target and a maximum of two splits, it produces two splits of three segments each. The target applies to the pending WAL bytes and does not change when the server rolls a segment. The planner considers at most 64 splits per bucket.
+
+At the round deadline the service publishes only the contiguous range starting at the previously committed offset. Later completed ranges beyond a gap are discarded and read again in the next round.
 
 ## Partition Mark-Done
 

@@ -34,6 +34,8 @@ import org.apache.fluss.lake.writer.LakeTieringFactory;
 import org.apache.fluss.lake.writer.LakeWriter;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.shaded.guava32.com.google.common.cache.Cache;
+import org.apache.fluss.shaded.guava32.com.google.common.cache.CacheBuilder;
 import org.apache.fluss.utils.ExceptionUtils;
 import org.apache.fluss.utils.concurrent.ExecutorThreadFactory;
 
@@ -106,6 +108,8 @@ public class TieringCommitOperator<WriteResult, Committable>
     private final int commitThreads;
     // Mailbox-thread confined, including completed commits whose callbacks have not run yet.
     private final Set<Long> committingTables = new HashSet<>();
+    // The mailbox can receive a replay after handing a complete range round to the commit pool.
+    private transient Cache<Long, Long> lastDispatchedRangeRound;
     private ExecutorService commitExecutor;
     private boolean closed;
     private TieringCommitter<WriteResult, Committable> tieringCommitter;
@@ -150,6 +154,7 @@ public class TieringCommitOperator<WriteResult, Committable>
 
     @Override
     public void open() {
+        lastDispatchedRangeRound = CacheBuilder.newBuilder().maximumSize(10_000).build();
         flussTableLakeSnapshotCommitter.open();
         connection = ConnectionFactory.createConnection(flussConfig);
         admin = connection.getAdmin();
@@ -172,12 +177,19 @@ public class TieringCommitOperator<WriteResult, Committable>
         TableBucketWriteResult<WriteResult> tableBucketWriteResult = streamRecord.getValue();
         TableBucket tableBucket = tableBucketWriteResult.tableBucket();
         long tableId = tableBucket.getTableId();
+        if (tableBucketWriteResult.range() != null) {
+            Long lastRound = lastDispatchedRangeRound.getIfPresent(tableId);
+            if (lastRound != null && lastRound == tableBucketWriteResult.roundTimestamp()) {
+                return;
+            }
+        }
         TableWriteResultAccumulator<WriteResult> accumulator =
                 tableWriteResultAccumulators.computeIfAbsent(
                         tableId,
                         ignored ->
                                 new TableWriteResultAccumulator<>(
-                                        tableBucketWriteResult.numberOfWriteResults()));
+                                        tableBucketWriteResult.numberOfWriteResults(),
+                                        tableBucketWriteResult.roundTimestamp()));
         accumulator.add(tableBucketWriteResult);
 
         if (accumulator.isComplete()) {
@@ -187,6 +199,9 @@ public class TieringCommitOperator<WriteResult, Committable>
             }
             tableWriteResultAccumulators.remove(tableId);
             checkState(committingTables.add(tableId), "Table %s is already committing.", tableId);
+            if (!accumulator.collectedRanges.isEmpty()) {
+                lastDispatchedRangeRound.put(tableId, accumulator.roundTimestamp);
+            }
             commitAsync(
                     tableId, tableBucketWriteResult.tablePath(), accumulator.bucketWriteResults);
         }
@@ -292,20 +307,22 @@ public class TieringCommitOperator<WriteResult, Committable>
     /** Collects one table's tiering round with constant-time validation of each result. */
     private static final class TableWriteResultAccumulator<WriteResult> {
         private final int expectedNumberOfWriteResults;
+        private final long roundTimestamp;
+        private final Map<TableBucket, Set<Long>> collectedRanges = new HashMap<>();
         private final Set<TableBucket> collectedBuckets = new HashSet<>();
         private final List<TableBucketWriteResult<WriteResult>> bucketWriteResults =
                 new ArrayList<>();
 
-        private TableWriteResultAccumulator(int expectedNumberOfWriteResults) {
+        private TableWriteResultAccumulator(int expectedNumberOfWriteResults, long roundTimestamp) {
+            this.roundTimestamp = roundTimestamp;
             this.expectedNumberOfWriteResults = expectedNumberOfWriteResults;
         }
 
         private void add(TableBucketWriteResult<WriteResult> bucketWriteResult) {
             TableBucket tableBucket = bucketWriteResult.tableBucket();
             checkState(
-                    !collectedBuckets.contains(tableBucket),
-                    "Found duplicate write results for bucket %s of table %s.",
-                    tableBucket,
+                    roundTimestamp == bucketWriteResult.roundTimestamp(),
+                    "Mixed tiering rounds for table %s",
                     tableBucket.getTableId());
             checkState(
                     expectedNumberOfWriteResults == bucketWriteResult.numberOfWriteResults(),
@@ -313,7 +330,24 @@ public class TieringCommitOperator<WriteResult, Committable>
                     tableBucket.getTableId(),
                     expectedNumberOfWriteResults,
                     bucketWriteResult.numberOfWriteResults());
-            collectedBuckets.add(tableBucket);
+            if (bucketWriteResult.range() == null) {
+                checkState(
+                        !collectedRanges.containsKey(tableBucket)
+                                && collectedBuckets.add(tableBucket),
+                        "Found duplicate write results for bucket %s of table %s.",
+                        tableBucket,
+                        tableBucket.getTableId());
+            } else {
+                checkState(
+                        !collectedBuckets.contains(tableBucket),
+                        "Mixed whole bucket and range results for %s",
+                        tableBucket);
+                if (!collectedRanges
+                        .computeIfAbsent(tableBucket, key -> new HashSet<>())
+                        .add(bucketWriteResult.range().getStartingOffset())) {
+                    return;
+                }
+            }
             bucketWriteResults.add(bucketWriteResult);
         }
 

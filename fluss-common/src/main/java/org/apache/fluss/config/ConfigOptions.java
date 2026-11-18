@@ -2335,6 +2335,19 @@ public class ConfigOptions {
                             "Specifies the table name of the datalake table. This option is currently supported only for Paimon and Iceberg. "
                                     + "If not set, the Fluss table name is used. The option may be configured before the lake table is created and cannot be changed after creation.");
 
+    public static final ConfigOption<Integer> TABLE_DATALAKE_TIERING_MAX_SPLITS_PER_BUCKET =
+            key("table.datalake.tiering.max-splits-per-bucket")
+                    .intType()
+                    .defaultValue(1)
+                    .withDescription(
+                            "Maximum number of parallel WAL splits per bucket per tiering round. A value of 1 disables splitting.");
+    public static final ConfigOption<MemorySize> TABLE_DATALAKE_TIERING_TARGET_SPLIT_SIZE =
+            key("table.datalake.tiering.target-split-size")
+                    .memoryType()
+                    .defaultValue(MemorySize.parse("128mb"))
+                    .withDescription(
+                            "Target archived WAL bytes per tiering split. Consecutive remote segments can share a split.");
+
     public static final ConfigOption<Duration> TABLE_DATALAKE_FRESHNESS =
             key("table.datalake.freshness")
                     .durationType()

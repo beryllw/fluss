@@ -57,6 +57,9 @@ public class TableBucketWriteResult<WriteResult> implements Serializable {
     // for the round of tiering is finished
     private final int numberOfWriteResults;
 
+    @Nullable private final TieringLogSplit range;
+    private final long roundTimestamp;
+
     public TableBucketWriteResult(
             TablePath tablePath,
             TableBucket tableBucket,
@@ -65,6 +68,31 @@ public class TableBucketWriteResult<WriteResult> implements Serializable {
             long logEndOffset,
             long maxTimestamp,
             int numberOfWriteResults) {
+        this(
+                tablePath,
+                tableBucket,
+                partitionName,
+                writeResult,
+                logEndOffset,
+                maxTimestamp,
+                numberOfWriteResults,
+                -1,
+                null);
+    }
+
+    /** Captures actual progress and the planned range for one result in a tiering round. */
+    public TableBucketWriteResult(
+            TablePath tablePath,
+            TableBucket tableBucket,
+            @Nullable String partitionName,
+            @Nullable WriteResult writeResult,
+            long logEndOffset,
+            long maxTimestamp,
+            int numberOfWriteResults,
+            long roundTimestamp,
+            @Nullable TieringLogSplit range) {
+        this.roundTimestamp = roundTimestamp;
+        this.range = range;
         this.tablePath = tablePath;
         this.tableBucket = tableBucket;
         this.partitionName = partitionName;
@@ -72,6 +100,17 @@ public class TableBucketWriteResult<WriteResult> implements Serializable {
         this.logEndOffset = logEndOffset;
         this.maxTimestamp = maxTimestamp;
         this.numberOfWriteResults = numberOfWriteResults;
+    }
+
+    /** Returns the range for a bucket split into concurrent writers. */
+    @Nullable
+    public TieringLogSplit range() {
+        return range;
+    }
+
+    /** Returns the planning round timestamp, or -1 for results from older writers. */
+    public long roundTimestamp() {
+        return roundTimestamp;
     }
 
     public TablePath tablePath() {

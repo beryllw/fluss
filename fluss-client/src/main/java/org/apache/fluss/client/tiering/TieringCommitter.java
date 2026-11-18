@@ -38,7 +38,9 @@ import org.slf4j.LoggerFactory;
 import javax.annotation.Nullable;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -98,6 +100,12 @@ public class TieringCommitter<WriteResult, Committable> {
             TablePath tablePath,
             List<TableBucketWriteResult<WriteResult>> committableWriteResults)
             throws Exception {
+        List<WriteResult> unpublished = new ArrayList<>();
+        List<TableBucketWriteResult<WriteResult>> plannedResults = committableWriteResults;
+        boolean hasRanges = plannedResults.stream().anyMatch(result -> result.range() != null);
+        if (hasRanges) {
+            committableWriteResults = selectContiguousRanges(plannedResults, unpublished);
+        }
         // filter down to buckets that actually produced data
         List<TableBucketWriteResult<WriteResult>> nonEmptyResults =
                 committableWriteResults.stream()
@@ -160,7 +168,29 @@ public class TieringCommitter<WriteResult, Committable> {
                             lakeCommitter,
                             committable,
                             knownSnapshotId,
-                            hasTieringProgress);
+                            hasTieringProgress,
+                            hasRanges);
+            if (hasRanges) {
+                // Replayed results can reference files already published in a lake snapshot.
+                // Establish ownership of the offset interval before deleting any staged files.
+                Map<TableBucket, Long> committedOffsets =
+                        flussCurrentLakeSnapshot == null
+                                ? Collections.emptyMap()
+                                : flussCurrentLakeSnapshot.getTableBucketsOffset();
+                for (TableBucketWriteResult<WriteResult> result : plannedResults) {
+                    TieringLogSplit range = result.range();
+                    if (range != null) {
+                        checkState(
+                                Long.valueOf(range.getBucketStartOffset())
+                                        .equals(committedOffsets.get(result.tableBucket())),
+                                "Stale tiering range for %s",
+                                result.tableBucket());
+                    }
+                }
+                if (!unpublished.isEmpty()) {
+                    lakeCommitter.abort(lakeCommitter.toCommittable(unpublished));
+                }
+            }
             boolean hasLakeSnapshot = knownSnapshotId != null || recoveredSnapshot != null;
             boolean markDoneSupported =
                     lakeTieringConfig.get(ConfigOptions.LAKE_TIERING_PARTITION_MARK_DONE_ENABLED)
@@ -210,6 +240,51 @@ public class TieringCommitter<WriteResult, Committable> {
                     hasTieringProgress ? committable : null,
                     hasTieringProgress ? lakeCommitResult.getTieringStats() : null);
         }
+    }
+
+    /** Only files before the first hole can be made visible with a single bucket offset. */
+    static <T> List<TableBucketWriteResult<T>> selectContiguousRanges(
+            List<TableBucketWriteResult<T>> results, List<T> unpublished) {
+        List<TableBucketWriteResult<T>> accepted = new ArrayList<>();
+        Map<TableBucket, List<TableBucketWriteResult<T>>> byBucket = new HashMap<>();
+        for (TableBucketWriteResult<T> result : results) {
+            if (result.range() == null) {
+                accepted.add(result);
+            } else {
+                byBucket.computeIfAbsent(result.tableBucket(), ignored -> new ArrayList<>())
+                        .add(result);
+            }
+        }
+        for (List<TableBucketWriteResult<T>> children : byBucket.values()) {
+            children.sort(Comparator.comparingLong(result -> result.range().getStartingOffset()));
+            long bucketStart = children.get(0).range().getBucketStartOffset();
+            long nextPlanned = bucketStart;
+            long nextCommitted = bucketStart;
+            for (TableBucketWriteResult<T> child : children) {
+                TieringLogSplit range = child.range();
+                long end = child.logEndOffset();
+                checkState(
+                        range.getBucketStartOffset() == bucketStart
+                                && range.getStartingOffset() == nextPlanned
+                                && range.getStoppingOffset() > nextPlanned,
+                        "Invalid planned tiering range for %s",
+                        child.tableBucket());
+                checkState(
+                        (end == -1 && child.writeResult() == null)
+                                || (end >= nextPlanned && end <= range.getStoppingOffset()),
+                        "Invalid tiering progress %s for %s",
+                        end,
+                        child.tableBucket());
+                if (nextPlanned == nextCommitted && end > nextPlanned) {
+                    accepted.add(child);
+                    nextCommitted = end;
+                } else if (child.writeResult() != null) {
+                    unpublished.add(child.writeResult());
+                }
+                nextPlanned = range.getStoppingOffset();
+            }
+        }
+        return accepted;
     }
 
     private TableInfo getAndValidateTableInfo(TablePath tablePath, long tableId) throws Exception {
@@ -264,7 +339,8 @@ public class TieringCommitter<WriteResult, Committable> {
             LakeCommitter<WriteResult, Committable> lakeCommitter,
             Committable committable,
             @Nullable Long knownSnapshotId,
-            boolean hasTieringProgress)
+            boolean hasTieringProgress,
+            boolean hasRanges)
             throws Exception {
         // get Fluss missing lake snapshot in Lake
         CommittedLakeSnapshot missingCommittedSnapshot =
@@ -331,13 +407,13 @@ public class TieringCommitter<WriteResult, Committable> {
                 Collections.emptyMap(),
                 Collections.emptyMap(),
                 LakeCommitResult.KEEP_ALL_PREVIOUS);
-        if (hasTieringProgress) {
+        if (hasTieringProgress || hasRanges) {
             // Fluss's known snapshot is older than the lake snapshot committed by Fluss.
             // This round read from stale offsets, so its data has already been committed to
             // the lake. Fail the commit to avoid writing duplicate data.
-            // Abort this committable to delete the written files before retrying from the
-            // recovered snapshot.
-            lakeCommitter.abort(committable);
+            if (!hasRanges) {
+                lakeCommitter.abort(committable);
+            }
             throw new IllegalStateException(
                     String.format(
                             "The current Fluss's lake snapshot %d is less than"

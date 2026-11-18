@@ -27,6 +27,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
+import java.util.Arrays;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -96,6 +97,26 @@ class TieringSplitSerializerTest {
                 serializer.deserialize(serializer.getVersion(), serialized);
         TieringLogSplit deserializedSplit = deserializedFlinkSplit.unwrap().asTieringLogSplit();
         assertThat(deserializedSplit).isEqualTo(tieringSplit);
+    }
+
+    @Test
+    void testRangeIdentityAndLegacyWholeBucket() throws Exception {
+        TieringLogSplit child =
+                TieringLogSplit.range(tablePath, tableBucket, null, 120, 200, 100).copy(2, 1, 42);
+        byte[] bytes = serializer.serialize(new FlinkTieringSplit(child));
+        TieringLogSplit restored =
+                serializer.deserialize(serializer.getVersion(), bytes).unwrap().asTieringLogSplit();
+        assertThat(restored).isEqualTo(child);
+        assertThat(restored.splitId()).isEqualTo("tiering-log-split-1-2-42-120-200");
+
+        // Version 0 ended after stoppingOffset and had one split per bucket.
+        TieringLogSplit legacy =
+                serializer
+                        .deserialize(0, Arrays.copyOf(bytes, bytes.length - Long.BYTES))
+                        .unwrap()
+                        .asTieringLogSplit();
+        assertThat(legacy.getBucketStartOffset()).isEqualTo(-1);
+        assertThat(legacy.splitId()).isEqualTo("tiering-log-split-1-2");
     }
 
     @Test

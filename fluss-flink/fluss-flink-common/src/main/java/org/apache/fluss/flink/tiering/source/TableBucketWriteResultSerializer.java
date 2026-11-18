@@ -18,6 +18,7 @@
 package org.apache.fluss.flink.tiering.source;
 
 import org.apache.fluss.client.tiering.TableBucketWriteResult;
+import org.apache.fluss.client.tiering.TieringLogSplit;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
 
@@ -35,9 +36,10 @@ import java.io.IOException;
  * <ul>
  *   <li><b>Version 1:</b> Initial version. The version of the lake write result serializer was not
  *       persisted; the write result was deserialized with this serializer's version instead.
- *   <li><b>Version 2 (Current):</b> Persists the version of the lake write result serializer before
- *       the write result bytes and passes it to the lake serializer on deserialization, so that
- *       lake formats can evolve their write result format independently.
+ *   <li><b>Version 2:</b> Persists the version of the lake write result serializer before the write
+ *       result bytes and passes it to the lake serializer on deserialization, so that lake formats
+ *       can evolve their write result format independently.
+ *   <li><b>Version 3:</b> Adds the round timestamp and optional WAL range offsets.
  * </ul>
  */
 public class TableBucketWriteResultSerializer<WriteResult>
@@ -49,7 +51,7 @@ public class TableBucketWriteResultSerializer<WriteResult>
     private static final int VERSION_1 = 1;
     private static final int VERSION_2 = 2;
 
-    private static final int CURRENT_VERSION = VERSION_2;
+    private static final int CURRENT_VERSION = 3;
 
     private final org.apache.fluss.lake.serializer.SimpleVersionedSerializer<WriteResult>
             writeResultSerializer;
@@ -108,6 +110,14 @@ public class TableBucketWriteResultSerializer<WriteResult>
 
         // serialize number of write results
         out.writeInt(tableBucketWriteResult.numberOfWriteResults());
+        out.writeLong(tableBucketWriteResult.roundTimestamp());
+        TieringLogSplit range = tableBucketWriteResult.range();
+        out.writeBoolean(range != null);
+        if (range != null) {
+            out.writeLong(range.getBucketStartOffset());
+            out.writeLong(range.getStartingOffset());
+            out.writeLong(range.getStoppingOffset());
+        }
 
         final byte[] result = out.getCopyOfBuffer();
         out.clear();
@@ -117,7 +127,7 @@ public class TableBucketWriteResultSerializer<WriteResult>
     @Override
     public TableBucketWriteResult<WriteResult> deserialize(int version, byte[] serialized)
             throws IOException {
-        if (version != VERSION_1 && version != VERSION_2) {
+        if (version < VERSION_1 || version > CURRENT_VERSION) {
             throw new IOException("Unknown version " + version);
         }
         final DataInputDeserializer in = new DataInputDeserializer(serialized);
@@ -157,6 +167,19 @@ public class TableBucketWriteResultSerializer<WriteResult>
         long maxTimestamp = in.readLong();
         // deserialize number of write results
         int numberOfWriteResults = in.readInt();
+        long round = version >= 3 ? in.readLong() : -1;
+        TieringLogSplit range = null;
+        if (version >= 3 && in.readBoolean()) {
+            long bucketStart = in.readLong();
+            range =
+                    TieringLogSplit.range(
+                            tablePath,
+                            tableBucket,
+                            partitionName,
+                            in.readLong(),
+                            in.readLong(),
+                            bucketStart);
+        }
         return new TableBucketWriteResult<>(
                 tablePath,
                 tableBucket,
@@ -164,6 +187,8 @@ public class TableBucketWriteResultSerializer<WriteResult>
                 writeResult,
                 logEndOffset,
                 maxTimestamp,
-                numberOfWriteResults);
+                numberOfWriteResults,
+                round,
+                range);
     }
 }

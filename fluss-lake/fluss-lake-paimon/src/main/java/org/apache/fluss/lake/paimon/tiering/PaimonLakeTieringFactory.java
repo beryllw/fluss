@@ -21,15 +21,17 @@ import org.apache.fluss.config.Configuration;
 import org.apache.fluss.lake.committer.CommitterInitContext;
 import org.apache.fluss.lake.committer.PartitionMarkDoneCommitter;
 import org.apache.fluss.lake.serializer.SimpleVersionedSerializer;
-import org.apache.fluss.lake.writer.LakeTieringFactory;
 import org.apache.fluss.lake.writer.LakeWriter;
+import org.apache.fluss.lake.writer.ParallelLogTieringFactory;
 import org.apache.fluss.lake.writer.WriterInitContext;
+import org.apache.fluss.metadata.TableInfo;
 
 import java.io.IOException;
+import java.util.Map;
 
 /** Implementation of {@link LakeTieringFactory} for Paimon . */
 public class PaimonLakeTieringFactory
-        implements LakeTieringFactory<PaimonWriteResult, PaimonCommittable> {
+        implements ParallelLogTieringFactory<PaimonWriteResult, PaimonCommittable> {
 
     private static final long serialVersionUID = 1L;
 
@@ -42,7 +44,7 @@ public class PaimonLakeTieringFactory
     @Override
     public LakeWriter<PaimonWriteResult> createLakeWriter(WriterInitContext writerInitContext)
             throws IOException {
-        return new PaimonLakeWriter(paimonCatalogProvider, writerInitContext);
+        return new PaimonLakeWriter(paimonCatalogProvider, writerInitContext, -1);
     }
 
     @Override
@@ -54,6 +56,22 @@ public class PaimonLakeTieringFactory
     public PartitionMarkDoneCommitter<PaimonWriteResult, PaimonCommittable> createLakeCommitter(
             CommitterInitContext committerInitContext) throws IOException {
         return new PaimonLakeCommitter(paimonCatalogProvider, committerInitContext);
+    }
+
+    @Override
+    public LakeWriter<PaimonWriteResult> createRangeWriter(
+            WriterInitContext context, long offsetDisplacement) throws IOException {
+        return new PaimonLakeWriter(paimonCatalogProvider, context, offsetDisplacement);
+    }
+
+    @Override
+    public boolean supportsParallelLogSplits(TableInfo table) {
+        // Fixed buckets restore the previous maximum file sequence number on the next write.
+        Map<String, String> options = table.getCustomProperties().toMap();
+        return !table.getBucketKeys().isEmpty()
+                && !table.getTableConfig().isDataLakeAutoCompaction()
+                && !Boolean.parseBoolean(options.get("paimon.row-tracking.enabled"))
+                && !Boolean.parseBoolean(options.get("paimon.data-evolution.enabled"));
     }
 
     @Override

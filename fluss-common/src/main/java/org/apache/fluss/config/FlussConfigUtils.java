@@ -57,6 +57,8 @@ public class FlussConfigUtils {
                         ConfigOptions.TABLE_DATALAKE_DATABASE_NAME.key(),
                         ConfigOptions.TABLE_DATALAKE_TABLE_NAME.key(),
                         ConfigOptions.TABLE_DATALAKE_FRESHNESS.key(),
+                        ConfigOptions.TABLE_DATALAKE_TIERING_MAX_SPLITS_PER_BUCKET.key(),
+                        ConfigOptions.TABLE_DATALAKE_TIERING_TARGET_SPLIT_SIZE.key(),
                         ConfigOptions.TABLE_DATALAKE_AUTO_COMPACTION.key(),
                         ConfigOptions.TABLE_LOG_TTL.key(),
                         ConfigOptions.TABLE_TIERED_LOG_LOCAL_SEGMENTS.key(),

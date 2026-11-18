@@ -20,6 +20,7 @@ package org.apache.fluss.flink.tiering.source.enumerator;
 import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.client.Connection;
 import org.apache.fluss.client.ConnectionFactory;
+import org.apache.fluss.client.FlussConnection;
 import org.apache.fluss.client.admin.Admin;
 import org.apache.fluss.client.metadata.MetadataUpdater;
 import org.apache.fluss.client.tiering.TieringLogSplit;
@@ -36,6 +37,7 @@ import org.apache.fluss.flink.tiering.source.split.FlinkTieringSplit;
 import org.apache.fluss.flink.tiering.source.state.TieringSourceEnumeratorState;
 import org.apache.fluss.lake.committer.TieringStats;
 import org.apache.fluss.lake.writer.LakeTieringFactory;
+import org.apache.fluss.lake.writer.ParallelLogTieringFactory;
 import org.apache.fluss.lake.writer.TieringTableValidator;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
@@ -67,6 +69,7 @@ import javax.annotation.Nullable;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -209,7 +212,15 @@ public class TieringSourceEnumerator
         CoordinatorGateway gateway =
                 GatewayClientProxy.createGatewayProxy(
                         metadataUpdater::getCoordinatorServer, rpcClient, CoordinatorGateway.class);
-        start(gateway, admin, new TieringSplitGenerator(admin));
+        start(
+                gateway,
+                admin,
+                new TieringSplitGenerator(
+                        (FlussConnection) connection,
+                        table ->
+                                lakeTieringFactory instanceof ParallelLogTieringFactory
+                                        && ((ParallelLogTieringFactory<?, ?>) lakeTieringFactory)
+                                                .supportsParallelLogSplits(table)));
     }
 
     @VisibleForTesting
@@ -537,6 +548,15 @@ public class TieringSourceEnumerator
             // shuffle tiering split to avoid splits tiering skew
             // after introduce tiering max duration
             Collections.shuffle(tieringSplits);
+            if (tieringSplits.stream().anyMatch(TieringLogSplit::isRange)) {
+                // Schedule the contiguous prefix before later ranges of the same bucket.
+                tieringSplits.sort(
+                        Comparator.comparingLong(
+                                split ->
+                                        split.isTieringLogSplit()
+                                                ? split.asTieringLogSplit().getOffsetDisplacement()
+                                                : 0L));
+            }
             List<TieringSplit> splitsWithMetadata = populateTieringRoundMetadata(tieringSplits);
             LOG.info(
                     "Generate Tiering {} splits for table {} with cost {}ms.",

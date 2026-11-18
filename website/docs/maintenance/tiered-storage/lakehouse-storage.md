@@ -55,6 +55,8 @@ For format-specific configuration, see:
 |--------|------|---------|-------------|
 | `table.datalake.enabled` | Boolean | false | Enable lakehouse storage for this table |
 | `table.datalake.freshness` | Duration | 3min | Maximum lag between Fluss and data lake table |
+| `table.datalake.tiering.max-splits-per-bucket` | Integer | 1 | Maximum parallel WAL splits per bucket for eligible Flink tiering tables. See [Splitting a large bucket](../../streaming-lakehouse/tiering-service.md#splitting-a-large-bucket). |
+| `table.datalake.tiering.target-split-size` | Memory size | 128 MiB | Target pending bytes per archived WAL split. Tiering groups remote segments and places any unarchived tail in one split. |
 | `table.datalake.format` | String | - | Data lake format (paimon, iceberg, hudi, lance). Inherits from cluster config |
 | `table.datalake.auto-compaction` | Boolean | false | Auto-trigger compaction in the data lake |
 | `table.datalake.auto-expire-snapshot` | Boolean | false | Auto-expire snapshots in the data lake |

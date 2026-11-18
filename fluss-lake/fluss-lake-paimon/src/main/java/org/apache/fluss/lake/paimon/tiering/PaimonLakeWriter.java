@@ -31,11 +31,16 @@ import org.apache.fluss.types.RowType;
 
 import org.apache.paimon.CoreOptions;
 import org.apache.paimon.catalog.Catalog;
+import org.apache.paimon.io.DataFileMeta;
+import org.apache.paimon.io.DataIncrement;
 import org.apache.paimon.table.FileStoreTable;
+import org.apache.paimon.table.sink.CommitMessage;
+import org.apache.paimon.table.sink.CommitMessageImpl;
 
 import javax.annotation.Nullable;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -46,12 +51,17 @@ import static org.apache.fluss.utils.PartitionUtils.HISTORICAL_PARTITION_VALUE;
 /** Implementation of {@link LakeWriter} for Paimon. */
 public class PaimonLakeWriter implements LakeWriter<PaimonWriteResult>, SupportsRecordBatchWrite {
 
+    private final long offsetDisplacement;
+    private final boolean supportsOrderedRanges;
     private final Catalog paimonCatalog;
     private final RecordWriter<?> recordWriter;
 
     public PaimonLakeWriter(
-            PaimonCatalogProvider paimonCatalogProvider, WriterInitContext writerInitContext)
+            PaimonCatalogProvider paimonCatalogProvider,
+            WriterInitContext writerInitContext,
+            long offsetDisplacement)
             throws IOException {
+        this.offsetDisplacement = offsetDisplacement;
         this.paimonCatalog = paimonCatalogProvider.get();
         // Only Fixed Bucket tables (bucket keys non-empty) carry a positive BUCKET in Paimon.
         // Overriding on an Unaware Bucket table (BUCKET = -1) would change its bucket mode.
@@ -67,6 +77,16 @@ public class PaimonLakeWriter implements LakeWriter<PaimonWriteResult>, Supports
                         writerInitContext.tableInfo().getTableConfig().isDataLakeAutoCompaction(),
                         bucketOverride);
 
+        this.supportsOrderedRanges =
+                offsetDisplacement >= 0
+                        && fileStoreTable.primaryKeys().isEmpty()
+                        && !fileStoreTable.schema().bucketKeys().isEmpty()
+                        && !writerInitContext
+                                .tableInfo()
+                                .getTableConfig()
+                                .isDataLakeAutoCompaction()
+                        && !fileStoreTable.coreOptions().rowTrackingEnabled()
+                        && !fileStoreTable.coreOptions().dataEvolutionEnabled();
         List<String> partitionKeys = fileStoreTable.partitionKeys();
         RowType flussRowType = writerInitContext.tableInfo().getRowType();
         boolean historicalPartition =
@@ -128,11 +148,51 @@ public class PaimonLakeWriter implements LakeWriter<PaimonWriteResult>, Supports
 
     @Override
     public PaimonWriteResult complete() throws IOException {
+        if (offsetDisplacement >= 0 && !supportsOrderedRanges) {
+            throw new IOException(
+                    "Parallel WAL ranges require an append-only fixed-bucket Paimon table without writer compaction, row tracking or data evolution.");
+        }
         try {
-            return new PaimonWriteResult(recordWriter.complete());
+            List<CommitMessage> messages = recordWriter.complete();
+            return offsetDisplacement > 0
+                    ? orderRangeFiles(messages)
+                    : new PaimonWriteResult(messages);
         } catch (Exception e) {
             throw new IOException("Failed to complete Paimon write.", e);
         }
+    }
+
+    private PaimonWriteResult orderRangeFiles(List<CommitMessage> messages) {
+        List<CommitMessage> ordered = new ArrayList<>();
+        for (CommitMessage message : messages) {
+            CommitMessageImpl original = (CommitMessageImpl) message;
+            DataIncrement data = original.newFilesIncrement();
+            List<DataFileMeta> files = new ArrayList<>();
+            for (DataFileMeta file : data.newFiles()) {
+                // Sibling writers restored the same previous maximum. Leave one sequence
+                // position per WAL offset so Paimon's batch scan preserves bucket order.
+                files.add(
+                        file.assignSequenceNumber(
+                                Math.addExact(file.minSequenceNumber(), offsetDisplacement),
+                                Math.addExact(file.maxSequenceNumber(), offsetDisplacement)));
+            }
+            DataIncrement increment =
+                    new DataIncrement(
+                            files,
+                            data.deletedFiles(),
+                            data.changelogFiles(),
+                            data.newIndexFiles(),
+                            data.deletedIndexFiles());
+            ordered.add(
+                    new CommitMessageImpl(
+                            original.partition(),
+                            original.bucket(),
+                            original.totalBuckets(),
+                            increment,
+                            original.compactIncrement(),
+                            original.checkFromSnapshot()));
+        }
+        return new PaimonWriteResult(ordered);
     }
 
     @Override

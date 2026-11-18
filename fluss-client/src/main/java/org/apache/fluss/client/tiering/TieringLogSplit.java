@@ -33,6 +33,43 @@ public class TieringLogSplit extends TieringSplit {
 
     private final long startingOffset;
     private final long stoppingOffset;
+    @Nullable private final Long bucketStartOffset;
+
+    /** Creates a child range of a bucket's bounded WAL interval. */
+    public static TieringLogSplit range(
+            TablePath path,
+            TableBucket bucket,
+            @Nullable String partition,
+            long from,
+            long to,
+            long bucketStart) {
+        return new TieringLogSplit(
+                path,
+                bucket,
+                partition,
+                from,
+                to,
+                UNKNOWN_NUMBER_OF_SPLITS,
+                false,
+                UNKNOWN_SPLIT_INDEX,
+                UNKNOWN_TIERING_ROUND_TIMESTAMP,
+                bucketStart);
+    }
+
+    /** Whether this split is one of several ranges of the same bucket. */
+    public static boolean isRange(TieringSplit split) {
+        return split.isTieringLogSplit() && split.asTieringLogSplit().bucketStartOffset != null;
+    }
+
+    /** Returns the distance from the beginning of the bucket's work in this round. */
+    public long getOffsetDisplacement() {
+        return bucketStartOffset == null ? 0 : startingOffset - bucketStartOffset;
+    }
+
+    /** Returns the committed offset at planning time, or -1 for an unsplit bucket. */
+    public long getBucketStartOffset() {
+        return bucketStartOffset == null ? -1 : bucketStartOffset;
+    }
 
     public TieringLogSplit(
             TablePath tablePath,
@@ -84,7 +121,8 @@ public class TieringLogSplit extends TieringSplit {
                 numberOfSplits,
                 false,
                 splitIndex,
-                tieringRoundTimestamp);
+                tieringRoundTimestamp,
+                -1);
     }
 
     public TieringLogSplit(
@@ -104,9 +142,11 @@ public class TieringLogSplit extends TieringSplit {
                 numberOfSplits,
                 skipCurrentRound,
                 UNKNOWN_SPLIT_INDEX,
-                UNKNOWN_TIERING_ROUND_TIMESTAMP);
+                UNKNOWN_TIERING_ROUND_TIMESTAMP,
+                -1);
     }
 
+    /** Restores a bounded WAL split, including the committed bucket offset for child ranges. */
     public TieringLogSplit(
             TablePath tablePath,
             TableBucket tableBucket,
@@ -116,7 +156,8 @@ public class TieringLogSplit extends TieringSplit {
             int numberOfSplits,
             boolean skipCurrentRound,
             int splitIndex,
-            long tieringRoundTimestamp) {
+            long tieringRoundTimestamp,
+            long bucketStartOffset) {
         super(
                 tablePath,
                 tableBucket,
@@ -127,11 +168,15 @@ public class TieringLogSplit extends TieringSplit {
                 tieringRoundTimestamp);
         this.startingOffset = startingOffset;
         this.stoppingOffset = stoppingOffset;
+        this.bucketStartOffset = bucketStartOffset < 0 ? null : bucketStartOffset;
     }
 
     @Override
     public String splitId() {
-        return toSplitId(TIERING_LOG_SPLIT_PREFIX, this.tableBucket);
+        String id = toSplitId(TIERING_LOG_SPLIT_PREFIX, this.tableBucket);
+        return bucketStartOffset == null
+                ? id
+                : id + "-" + tieringRoundTimestamp + "-" + startingOffset + "-" + stoppingOffset;
     }
 
     public long getStartingOffset() {
@@ -178,7 +223,8 @@ public class TieringLogSplit extends TieringSplit {
                 numberOfSplits,
                 skipCurrentRound,
                 splitIndex,
-                tieringRoundTimestamp);
+                tieringRoundTimestamp,
+                getBucketStartOffset());
     }
 
     @Override
@@ -190,11 +236,13 @@ public class TieringLogSplit extends TieringSplit {
             return false;
         }
         TieringLogSplit that = (TieringLogSplit) object;
-        return startingOffset == that.startingOffset && stoppingOffset == that.stoppingOffset;
+        return startingOffset == that.startingOffset
+                && stoppingOffset == that.stoppingOffset
+                && Objects.equals(bucketStartOffset, that.bucketStartOffset);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(super.hashCode(), startingOffset, stoppingOffset);
+        return Objects.hash(super.hashCode(), startingOffset, stoppingOffset, bucketStartOffset);
     }
 }

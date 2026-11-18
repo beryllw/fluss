@@ -320,6 +320,7 @@ When using SET to modify [Storage Options](engine-flink/options.md#storage-optio
     [historical partition access](../table-design/data-distribution/partitioning.md#historical-partition-access).
   - `table.datalake.historical-partition.lookup-mode`: Switch historical partition lookups between `SST` and `SCAN`.
   - `table.datalake.freshness`: Set the data freshness for lakehouse storage.
+  - `table.datalake.tiering.max-splits-per-bucket` and `table.datalake.tiering.target-split-size` control how the Flink tiering service [splits a large bucket](../streaming-lakehouse/tiering-service.md#splitting-a-large-bucket).
   - `table.log.tiered.local-segments`: Set the number of log segments to retain locally when tiered storage is enabled.
   - `table.auto-partition.num-retention`: Set the number of historical partitions to retain for auto partitioning.
   - `table.auto-partition.num-precreate`: Set the number of future partitions to pre-create for auto partitioning.

@@ -39,7 +39,9 @@ import org.apache.fluss.flink.tiering.source.split.FlinkTieringSplit;
 import org.apache.fluss.lake.batch.ArrowRecordBatch;
 import org.apache.fluss.lake.writer.LakeTieringFactory;
 import org.apache.fluss.lake.writer.LakeWriter;
+import org.apache.fluss.lake.writer.ParallelLogTieringFactory;
 import org.apache.fluss.lake.writer.SupportsRecordBatchWrite;
+import org.apache.fluss.lake.writer.WriterInitContext;
 import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.PartitionInfo;
@@ -65,6 +67,7 @@ import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -114,11 +117,12 @@ public class TieringSplitReader<WriteResult>
     private final Queue<TieringSnapshotSplit> currentPendingSnapshotSplits;
     @Nullable private BoundedSplitReader currentSnapshotSplitReader;
     @Nullable private TieringSnapshotSplit currentSnapshotSplit;
-    @Nullable private Integer currentTableNumberOfSplits;
     // whether the current table uses the Arrow record batch path for tiering
     @Nullable private Boolean currentTableUseRecordBatchPath;
 
-    // map from table bucket to split id
+    // A scanner has one cursor per bucket. Two children assigned to one reader must
+    // run separately, even when Flink delivers them in the same SplitsAddition.
+    private final Deque<TieringLogSplit> pendingRanges = new ArrayDeque<>();
     private final Map<TableBucket, TieringSplit> currentTableSplitsByBucket;
     private final Map<TableBucket, Long> currentTableStoppingOffsets;
 
@@ -190,10 +194,18 @@ public class TieringSplitReader<WriteResult>
             LOG.info("Empty split(s) {} finished.", currentEmptySplits);
             TableBucketWriteResultWithSplitIds records = forEmptySplits(currentEmptySplits);
             currentEmptySplits.forEach(
-                    split -> currentTableSplitsByBucket.remove(split.getTableBucket()));
+                    split -> currentTableSplitsByBucket.remove(split.getTableBucket(), split));
             mayFinishCurrentTable();
             currentEmptySplits.clear();
             return records;
+        }
+        if (currentTableId == null && !pendingRanges.isEmpty()) {
+            TieringLogSplit range = pendingRanges.removeFirst();
+            if (range.shouldSkipCurrentRound()) {
+                return forEmptySplits(Collections.singleton(range));
+            }
+            getOrMoveToTable(range);
+            addSplitToCurrentTable(range);
         }
         checkSplitOrStartNext();
 
@@ -207,8 +219,7 @@ public class TieringSplitReader<WriteResult>
                 LOG.info("Split {} is finished", currentSnapshotSplit.splitId());
                 return finishCurrentSnapshotSplit();
             } else {
-                return forSnapshotSplitRecords(
-                        currentSnapshotSplit.getTableBucket(), recordIterator);
+                return forSnapshotSplitRecords(recordIterator);
             }
         } else {
             if (currentLogScanner != null) {
@@ -250,6 +261,10 @@ public class TieringSplitReader<WriteResult>
         for (FlinkTieringSplit flinkSplit : splitsChange.splits()) {
             TieringSplit split = flinkSplit.unwrap();
             LOG.info("add split {}", split.splitId());
+            if (TieringLogSplit.isRange(split)) {
+                pendingRanges.addLast(split.asTieringLogSplit());
+                continue;
+            }
             if (split.shouldSkipCurrentRound()) {
                 // if the split is forced to ignore,
                 // mark it as empty
@@ -331,7 +346,6 @@ public class TieringSplitReader<WriteResult>
             currentTable = connection.getTable(tablePath);
             currentTablePath = tablePath;
             currentTableId = split.getTableBucket().getTableId();
-            currentTableNumberOfSplits = split.getNumberOfSplits();
             TableInfo currentTableInfo = checkNotNull(currentTable).getTableInfo();
             // check currentTable's id for the table path is same with table id of the tiering
             // split, if not, it means the tiering split is for a previous dropped table. let's fail
@@ -397,8 +411,7 @@ public class TieringSplitReader<WriteResult>
                                 ? UNKNOWN_BUCKET_TIMESTAMP
                                 : logOffsetAndTimestamp.timestamp;
                 TableBucketWriteResult<WriteResult> bucketWriteResult =
-                        completeLakeWriter(
-                                bucket, split.getPartitionName(), logEndOffset, timestamp);
+                        completeLakeWriter(split, logEndOffset, timestamp);
 
                 if (logEndOffset == UNKNOWN_BUCKET_OFFSET) {
                     // when the log end offset is unknown, the write result must be
@@ -494,15 +507,9 @@ public class TieringSplitReader<WriteResult>
             long lastWrittenTimestamp =
                     handler.handleRecords(
                             records,
-                            () -> {
-                                TieringSplit split =
-                                        checkNotNull(currentTableSplitsByBucket.get(bucket));
-                                return getOrCreateLakeWriter(
-                                        bucket,
-                                        split.getPartitionName(),
-                                        split.getSplitIndex(),
-                                        split.getTieringRoundTimestamp());
-                            },
+                            () ->
+                                    getOrCreateLakeWriter(
+                                            checkNotNull(currentTableSplitsByBucket.get(bucket))),
                             stoppingOffset);
 
             // The split owns offsets before stoppingOffset only. If the scanner consumed past
@@ -537,11 +544,7 @@ public class TieringSplitReader<WriteResult>
             String currentSplitId = currentTieringSplit.splitId();
             writeResults.put(
                     bucket,
-                    completeLakeWriter(
-                            bucket,
-                            currentTieringSplit.getPartitionName(),
-                            stoppingOffset,
-                            tieredTimestamp));
+                    completeLakeWriter(currentTieringSplit, stoppingOffset, tieredTimestamp));
             finishedSplitIds.put(bucket, currentSplitId);
             LOG.info(
                     "Finish tier bucket {} for table {}, split: {}.",
@@ -638,40 +641,41 @@ public class TieringSplitReader<WriteResult>
         return lastWrittenTimestamp;
     }
 
-    private LakeWriter<WriteResult> getOrCreateLakeWriter(
-            TableBucket bucket,
-            @Nullable String partitionName,
-            int splitIndex,
-            long tieringRoundTimestamp)
-            throws IOException {
+    private LakeWriter<WriteResult> getOrCreateLakeWriter(TieringSplit split) throws IOException {
+        TableBucket bucket = split.getTableBucket();
         LakeWriter<WriteResult> lakeWriter = lakeWriters.get(bucket);
         if (lakeWriter == null) {
             Integer partitionBucketCount =
                     bucket.getPartitionId() != null
                             ? currentTablePartitionBucketCounts.get(bucket.getPartitionId())
                             : null;
-            lakeWriter =
-                    lakeTieringFactory.createLakeWriter(
-                            new TieringWriterInitContext(
-                                    currentTablePath,
-                                    bucket,
-                                    partitionName,
-                                    currentTable.getTableInfo(),
-                                    splitIndex,
-                                    tieringRoundTimestamp,
-                                    partitionBucketCount,
-                                    ioTmpDirs));
+            WriterInitContext context =
+                    new TieringWriterInitContext(
+                            currentTablePath,
+                            bucket,
+                            split.getPartitionName(),
+                            currentTable.getTableInfo(),
+                            split.getSplitIndex(),
+                            split.getTieringRoundTimestamp(),
+                            partitionBucketCount,
+                            ioTmpDirs);
+            if (TieringLogSplit.isRange(split)) {
+                ParallelLogTieringFactory<WriteResult, ?> factory =
+                        (ParallelLogTieringFactory<WriteResult, ?>) lakeTieringFactory;
+                lakeWriter =
+                        factory.createRangeWriter(
+                                context, split.asTieringLogSplit().getOffsetDisplacement());
+            } else {
+                lakeWriter = lakeTieringFactory.createLakeWriter(context);
+            }
             lakeWriters.put(bucket, lakeWriter);
         }
         return lakeWriter;
     }
 
     private TableBucketWriteResult<WriteResult> completeLakeWriter(
-            TableBucket bucket,
-            @Nullable String partitionName,
-            long logEndOffset,
-            long maxTimestamp)
-            throws IOException {
+            TieringSplit split, long logEndOffset, long maxTimestamp) throws IOException {
+        TableBucket bucket = split.getTableBucket();
         LakeWriter<WriteResult> lakeWriter = lakeWriters.remove(bucket);
         WriteResult writeResult = null;
         if (lakeWriter != null) {
@@ -685,14 +689,7 @@ public class TieringSplitReader<WriteResult>
             }
             lakeWriter.close();
         }
-        return toTableBucketWriteResult(
-                currentTablePath,
-                bucket,
-                partitionName,
-                writeResult,
-                logEndOffset,
-                maxTimestamp,
-                checkNotNull(currentTableNumberOfSplits));
+        return toTableBucketWriteResult(split, writeResult, logEndOffset, maxTimestamp);
     }
 
     private TableBucketWriteResultWithSplitIds forEmptySplits(Set<TieringSplit> emptySplits) {
@@ -704,13 +701,7 @@ public class TieringSplitReader<WriteResult>
             writeResults.put(
                     tableBucket,
                     toTableBucketWriteResult(
-                            tieringSplit.getTablePath(),
-                            tableBucket,
-                            tieringSplit.getPartitionName(),
-                            null,
-                            UNKNOWN_BUCKET_OFFSET,
-                            UNKNOWN_BUCKET_TIMESTAMP,
-                            tieringSplit.getNumberOfSplits()));
+                            tieringSplit, null, UNKNOWN_BUCKET_OFFSET, UNKNOWN_BUCKET_TIMESTAMP));
         }
         return new TableBucketWriteResultWithSplitIds(writeResults, finishedSplitIds);
     }
@@ -727,11 +718,7 @@ public class TieringSplitReader<WriteResult>
         long logEndOffset = currentSnapshotSplit.getLogOffsetOfSnapshot();
         String splitId = currentTableSplitsByBucket.remove(tableBucket).splitId();
         TableBucketWriteResult<WriteResult> writeResult =
-                completeLakeWriter(
-                        tableBucket,
-                        currentSnapshotSplit.getPartitionName(),
-                        logEndOffset,
-                        UNKNOWN_BUCKET_TIMESTAMP);
+                completeLakeWriter(currentSnapshotSplit, logEndOffset, UNKNOWN_BUCKET_TIMESTAMP);
         LOG.info(
                 "Finish tier bucket {} for table {}, split: {}.",
                 tableBucket,
@@ -745,17 +732,12 @@ public class TieringSplitReader<WriteResult>
     }
 
     private TableBucketWriteResultWithSplitIds forSnapshotSplitRecords(
-            TableBucket bucket, CloseableIterator<RecordAndPos> recordIterator) throws IOException {
+            CloseableIterator<RecordAndPos> recordIterator) throws IOException {
         LakeWriter<WriteResult> lakeWriter = null;
         while (recordIterator.hasNext()) {
             ScanRecord scanRecord = recordIterator.next().record();
             if (lakeWriter == null) {
-                lakeWriter =
-                        getOrCreateLakeWriter(
-                                bucket,
-                                checkNotNull(currentSnapshotSplit).getPartitionName(),
-                                currentSnapshotSplit.getSplitIndex(),
-                                currentSnapshotSplit.getTieringRoundTimestamp());
+                lakeWriter = getOrCreateLakeWriter(checkNotNull(currentSnapshotSplit));
             }
             lakeWriter.write(scanRecord);
             if (scanRecord.getSizeInBytes() > 0) {
@@ -807,7 +789,6 @@ public class TieringSplitReader<WriteResult>
         // before switch to a new table, mark all as empty or null
         currentTableId = null;
         currentTablePath = null;
-        currentTableNumberOfSplits = null;
         currentTableUseRecordBatchPath = null;
         currentPendingSnapshotSplits.clear();
         currentTableStoppingOffsets.clear();
@@ -825,6 +806,11 @@ public class TieringSplitReader<WriteResult>
                 "handleTableReachTieringMaxDuration, currentTableId: {}, pendingTieringSplits: {}",
                 currentTableId,
                 pendingTieringSplits);
+        for (TieringLogSplit range : pendingRanges) {
+            if (range.getTableBucket().getTableId() == tableId) {
+                range.skipCurrentRound();
+            }
+        }
         if ((currentTableId != null && currentTableId.equals(tableId))
                 || pendingTieringSplits.containsKey(tableId)) {
             LOG.info("Table {} reach tiering max duration, will force to complete.", tableId);
@@ -904,21 +890,21 @@ public class TieringSplitReader<WriteResult>
     }
 
     private TableBucketWriteResult<WriteResult> toTableBucketWriteResult(
-            TablePath tablePath,
-            TableBucket tableBucket,
-            @Nullable String partitionName,
+            TieringSplit split,
             @Nullable WriteResult writeResult,
             long endLogOffset,
-            long maxTimestamp,
-            int numberOfSplits) {
+            long maxTimestamp) {
+        TieringLogSplit range = TieringLogSplit.isRange(split) ? split.asTieringLogSplit() : null;
         return new TableBucketWriteResult<>(
-                tablePath,
-                tableBucket,
-                partitionName,
+                split.getTablePath(),
+                split.getTableBucket(),
+                split.getPartitionName(),
                 writeResult,
                 endLogOffset,
                 maxTimestamp,
-                numberOfSplits);
+                split.getNumberOfSplits(),
+                split.getTieringRoundTimestamp(),
+                range);
     }
 
     private class TableBucketWriteResultWithSplitIds

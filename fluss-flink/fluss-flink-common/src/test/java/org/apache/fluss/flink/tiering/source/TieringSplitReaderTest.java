@@ -72,6 +72,34 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class TieringSplitReaderTest extends FlinkTestBase {
 
     @Test
+    void testOneReaderReportsAllSkippedChildrenOfSameBucket() throws Exception {
+        TablePath path = TablePath.of("fluss", "sibling_ranges");
+        TableBucket bucket = new TableBucket(100, 0);
+        TieringLogSplit first = TieringLogSplit.range(path, bucket, null, 5, 10, 5).copy(2, 0, 70);
+        TieringLogSplit second =
+                TieringLogSplit.range(path, bucket, null, 10, 15, 5).copy(2, 1, 70);
+        try (Connection connection =
+                        ConnectionFactory.createConnection(
+                                FLUSS_CLUSTER_EXTENSION.getClientConfig());
+                TieringSplitReader<TestingWriteResult> reader = createTieringReader(connection)) {
+            reader.handleSplitsChanges(
+                    new SplitsAddition<>(
+                            Arrays.asList(
+                                    new FlinkTieringSplit(first), new FlinkTieringSplit(second))));
+            reader.handleTableReachTieringMaxDuration(100);
+            for (TieringLogSplit expected : Arrays.asList(first, second)) {
+                RecordsWithSplitIds<TableBucketWriteResult<TestingWriteResult>> result =
+                        reader.fetch();
+                assertThat(result.nextSplit()).isEqualTo(expected.splitId());
+                TableBucketWriteResult<TestingWriteResult> next = result.nextRecordFromSplit();
+                assertThat(next.logEndOffset()).isEqualTo(-1);
+                assertThat(next.range()).isEqualTo(expected);
+                assertThat(result.finishedSplits()).containsExactly(expected.splitId());
+            }
+        }
+    }
+
+    @Test
     void testTieringTable() throws Exception {
         TablePath tablePath = TablePath.of("fluss", "fluss_test_tiering_one_table");
         long tableId = createTable(tablePath, DEFAULT_PK_TABLE_DESCRIPTOR);
